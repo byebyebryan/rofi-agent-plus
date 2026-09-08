@@ -1,10 +1,11 @@
 # Rofi Agent Plus Suite Integration
 
-Status: P6 discovery/correlation/cache, contract-backed open/create, and
-fail-closed Rofi callbacks are implemented. Agent Plus consumes Host Mesh v1 and Tmux Session v1 through public process contracts when
-both capability executables are available; the complete legacy backend remains
-the rollback path when zero or one is present. Tmux Plus retains generic
-rename/kill ownership; Agent Plus has no rename/kill action.
+Status: P6 discovery/correlation/cache, contract-backed open/create,
+fail-closed Rofi callbacks, deployment, and operator acceptance are complete.
+Agent Plus consumes Host Mesh v1 and Tmux Session v1 through public process
+contracts when both capability executables are available; the complete legacy
+backend remains the rollback path when zero or one is present. Tmux Plus
+retains generic rename/kill ownership; Agent Plus has no rename/kill action.
 
 ## Target ownership
 
@@ -68,9 +69,9 @@ After migration, Agent Plus no longer owns:
 - generic local or SSH tmux attachment; or
 - raw tmux session creation and option-setting mechanics.
 
-The current implementation keeps legacy lifecycle paths until contract
-open/create has deployed and received live acceptance. Compatibility code is
-removed only after equivalent behavior has contract tests and live acceptance.
+The P6 implementation kept legacy lifecycle paths while contract open/create
+deployed and received live acceptance. Removing that compatibility code is a
+separate reviewed follow-up; acceptance does not make cleanup automatic.
 
 ## Discovery flow
 
@@ -265,9 +266,10 @@ Mod+Shift+G  tmux cheatsheet
 
 The managed Niri source assigns `Mod+G` to the Rofi Tmux Plus script mode and
 keeps `Mod+Shift+G` for the DMS tmux cheatsheet. The source-level binding is
-validated by Chezmoi's materialization checks; live focus, attach, and remote
-acceptance remain host-specific rollout checks. `Mod+T` and `Mod+Return` both
-launch Ghostty.
+validated by Chezmoi's materialization checks. P6 completed live focus,
+attach, and remote acceptance for the exercised local and remote paths; these
+remain host-specific rollout checks for later changes. `Mod+T` and
+`Mod+Return` both launch Ghostty.
 
 After the data and lifecycle contracts are stable, SSH Plus may add contextual
 actions that launch Tmux Plus or Agent Plus already scoped to the selected
@@ -301,11 +303,12 @@ provider-specific actions or icons merely to create a reverse dependency.
 4. Run legacy and contract-backed discovery side by side against deterministic
    fixtures and compare host/session identity, activity, and lifecycle
    decisions (open-existing, create, and active-outside-tmux refusal).
+   (Complete in P6.)
 5. Keep all three public commands and Rofi modes on the managed `PATH` and
    verify local plus remote discovery, focus, create, and resume on each
-   intended host. (Binding/configuration source is complete; live acceptance
-   remains an operator gate.)
-6. Remove legacy host-route and generic tmux code in a later reviewed change.
+   intended host. (Complete in P6 through automated and operator acceptance.)
+6. Remove legacy host-route and generic tmux code in a later reviewed change
+   after the accepted rollback boundary is deliberately retired.
 
 Acceptance requires that the same logical machine has the same host ID and
 display label in all three pickers, that a provider session maps to the same
@@ -318,3 +321,37 @@ configuration/model/callback data leaves every picker closable: root Escape and
 Ctrl+G close unconditionally, while nested Escape returns to a safe root. The
 Rofi bindings must preserve native Tab row navigation and must not capture
 Ctrl+G as a script callback.
+
+## P6 acceptance and performance follow-up
+
+P6 functional acceptance is complete. The unattended gate passed from the two
+exercised managed host perspectives and covered Host Mesh identity, Agent
+contract refresh, headless navigation and Escape behavior, exact-reference
+lifecycle operations, stale guards, cleanup, and preservation of pre-existing
+sessions and SSH usage history. Operator acceptance then covered the rendered
+pickers, local and remote SSH/Tmux actions, Agent focus/resume, and a cold
+provider resume. That last path exposed one launch-boundary defect: `systemd-run`
+expanded a stable tmux ID such as `$3` before Ghostty received it. Tmux Plus
+now disables that expansion, has regression coverage, and passed the repeated
+cold-resume check.
+
+Performance is recorded as a non-blocking follow-up rather than hidden inside
+the functional sign-off. Representative warm-path profiling on one managed
+host observed these pre-terminal costs:
+
+| Path | Observed time | Dominant work |
+| --- | ---: | --- |
+| Agent Plus selection before Tmux action | about 2.0 s | authoritative all-host provider refresh followed by live Tmux inventory |
+| Tmux Plus local open | about 0.24 s | process startup, model load, Mesh load, and exact-reference validation |
+| Tmux Plus remote open | about 0.65 s | the local work plus one SSH revalidation |
+| SSH Plus managed selection | about 0.62 s | detached-worker startup and the synchronous pre-launch reachability probe |
+
+Terminal startup is excluded from those measurements. The Agent path is the
+largest target: even a local selection currently waits for remote-host
+activity/provider discovery and then a separate all-host Tmux inventory. The
+follow-up order is to scope lifecycle refresh to the selected host and run
+independent Agent/Tmux discovery concurrently; avoid Tmux Plus's successful
+open-path model reload; then revisit SSH Plus preflight or connection reuse
+without weakening route fallback or successful-connection history semantics.
+These measurements are diagnostic baselines, not an API guarantee or latency
+SLA.
