@@ -1,8 +1,8 @@
 # Rofi Agent Plus Suite Integration
 
-Status: the P7 contract-only cutover is complete in version `0.3.0`; managed
-publication and deployment are coordinated through chezmoi, while operator
-acceptance remains pending. Agent Plus consumes
+Status: the P7 contract-only cutover and guarded-open performance follow-up are
+complete in version `0.3.0`; managed publication, Starship deployment, and
+operator acceptance are complete. Agent Plus consumes
 Tmux Session v1 through its public process contract on every product path; Tmux
 Plus is mandatory. It consumes Host Mesh v1 when SSH Plus is available and
 otherwise uses the shared local-only identity with a `null` Mesh revision. A
@@ -342,7 +342,7 @@ Ctrl+G close unconditionally, while nested Escape returns to a safe root. The
 Rofi bindings must preserve native Tab row navigation and must not capture
 Ctrl+G as a script callback.
 
-## P6 acceptance and P7 performance follow-up
+## P6 acceptance and P7 performance closure
 
 P6 functional acceptance is complete. The unattended gate passed from the two
 exercised managed host perspectives and covered Host Mesh identity, Agent
@@ -371,10 +371,13 @@ largest target: even a local selection waited for remote-host activity/provider
 discovery and then a separate all-host Tmux inventory. P7 now scopes lifecycle
 refresh to the selected host and starts provider discovery plus Tmux inventory
 concurrently under one deadline, while retaining stage-level failures and
-stable-reference checks. Tmux Plus now avoids the unnecessary model reload on
-a successful exact-reference open, and SSH Plus's managed prelaunch path is
-implemented without weakening route fallback or successful-connection history
-semantics. The remaining follow-up is measurement: re-profile end-to-end
-selection with actual remote revalidation and record the new observed costs.
-These measurements are diagnostic baselines, not an API guarantee or latency
-SLA.
+stable-reference checks. Option-backed rows can then take a guarded direct-open
+path whose complete tmux reference, expected name, Mesh revision, and provider
+option are revalidated before any action. Tmux Plus avoids the unnecessary
+model reload on a successful exact-reference open, and SSH Plus's managed
+prelaunch path is implemented without weakening route fallback or
+successful-connection history semantics. The coordinated sources passed their
+automated gates, were pinned and deployed to Starship, and passed operator
+acceptance for the exercised local and remote paths. The table remains a
+diagnostic pre-P7 baseline rather than an API guarantee or latency SLA; there
+is no open P7 performance gate.
