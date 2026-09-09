@@ -17,7 +17,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.3.0` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.4.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -31,41 +31,33 @@ The executable can be run directly from a checkout:
 ./bin/rofi-agent-plus list | jq
 rofi -show agent-plus -modes "agent-plus:$(pwd)/bin/rofi-agent-plus" \
   -kb-custom-1 Alt+r -kb-custom-2 Right -kb-custom-3 Left \
-  -kb-custom-6 Escape \
-  -kb-cancel Control+g \
+  -kb-cancel Escape,Control+g \
   -kb-move-char-forward Control+f -kb-move-char-back Control+b \
   -eh 2
 ```
 
 The normal Rofi invocation is configured as the `agent-plus` script mode.
 `Mod+A` or a similar Niri binding can invoke it with `rofi -show agent-plus`.
-The picker opens
-in `Agents › Recent`, a mixed newest-first list.  Left and Right cycle the
-top-level `Recent`, `Hosts`, and `Providers` views; `Enter` enters a
-host/provider group or opens a session.  `Escape` returns to a view root when
-nested and exits from a root; `Ctrl+G` always exits.  `Tab` and `Shift+Tab`
-use Rofi's normal next/previous row navigation.  Navigation transitions clear
-the filter and selection.  `Alt+R` performs a bounded foreground refresh.
-Custom input and deletion remain disabled.  Rofi must be launched with `-eh 2`
-so each list element reserves height for both display lines.
+The picker opens in `Agents › All`, a mixed newest-first list.  Left and Right
+cycle `All`, `Local`, and the remote hosts in stable Host Mesh order.  Enter
+opens the selected session.  Escape and `Ctrl+G` use Rofi's native cancel
+path and always close; `Tab` and `Shift+Tab` use Rofi's normal row navigation.
+View changes preserve the filter and reset the selection.  `Alt+R` performs a
+bounded foreground refresh. Custom input and deletion remain disabled. Rofi
+must be launched with `-eh 2` so each list element reserves height for both
+display lines.
 
 The Rofi callback boundary fails closed: configuration, model, and callback
-errors become bounded notices, while root Escape still returns no rows even
-when setup fails. If a nested Escape callback cannot reload its model, it
-renders the enclosing root with a safe error notice so the next Escape closes
-the dialog. Ctrl+G remains Rofi's native unconditional cancel binding and is
-never handled as a script callback.
+errors become bounded notices. Left and Right read only the cached snapshot;
+they do not prepare Host Mesh or provider clients. Empty or unavailable hosts
+remain in the view ring as non-actionable status rows, and a local-only Mesh
+collapses the redundant `All` view into `Local`.
 
-The `Hosts` view groups sessions by their logical displayed host and orders
-hosts by the newest session they contain.  The `Providers` view uses the
-stable Codex, Claude Code, and OpenCode order and omits empty providers.
-Group rows show the session count, any active count, and newest age.  Their
-metadata is typed JSON, so opening a session never depends on parsing visible
-text.  A trailing `›` and host/provider icon make drill-down groups easy to
-recognize; groups containing active sessions receive the same active styling as
-session rows.  Breadcrumb prompts identify the current root or nested group,
-for example `Agents › Hosts › host-a` or
-`Agents › Providers › Codex`.
+The host catalog is authoritative and ordered by Host Mesh, while provider
+groups are not navigation scopes. Provider icons remain visible, and provider
+names and aliases remain in filter metadata, so searching for `codex`,
+`claude`, `Claude Code`, or `opencode` still works. Every selectable row is a
+leaf session with typed JSON metadata; forged group metadata is rejected.
 
 Rows use a two-line layout: the session title is primary, while a smaller
 secondary line shows the display host, shortened working directory, age, and

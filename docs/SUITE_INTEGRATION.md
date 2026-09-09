@@ -1,8 +1,9 @@
 # Rofi Agent Plus Suite Integration
 
 Status: the P7 contract-only cutover and guarded-open performance follow-up are
-complete in version `0.3.0`; managed publication, Starship deployment, and
-operator acceptance are complete. Agent Plus consumes
+complete in version `0.3.0`; the P8 flat-scope navigation implementation is
+complete in source version `0.4.0`. Managed publication, Starship deployment,
+and operator acceptance for P8 remain a coordinated follow-up. Agent Plus consumes
 Tmux Session v1 through its public process contract on every product path; Tmux
 Plus is mandatory. It consumes Host Mesh v1 when SSH Plus is available and
 otherwise uses the shared local-only identity with a `null` Mesh revision. A
@@ -10,8 +11,9 @@ present malformed or unsupported companion is visible and never enables a
 fallback. Tmux Plus retains generic rename/kill ownership; Agent Plus has no
 rename/kill action.
 
-P8 flat-scope navigation is an accepted suite design target, not an implemented
-runtime claim.
+The managed runtime remains on P7 until the coordinated P8 cutover; this
+document describes the P8 source contract and implementation without claiming
+deployment.
 
 ## Target ownership
 
@@ -41,7 +43,7 @@ The integration boundaries are versioned process contracts:
 Agent Plus does not import another repository's Python modules or read its
 private configuration, history, health, or cache files.
 
-## P8 flat-scope navigation target
+## P8 flat-scope navigation (implemented in source)
 
 P8 removes Agent Plus's `Hosts` and `Providers` browsing roots and all group
 rows. The normal picker contains only agent-session leaves in a flat host-scope
@@ -74,9 +76,9 @@ cancel action. Neither cancellation key is a script callback.
 
 P8 changes only presentation and interaction. Agent discovery and correlation,
 Host Mesh v1, Tmux Session v1, stable typed selection identity, and guarded
-lifecycle operations remain unchanged. The later P7 interaction description in
-this document remains authoritative for the deployed runtime until the
-coordinated P8 cutover.
+lifecycle operations remain unchanged. The managed P7 interaction description
+below remains authoritative for the deployed runtime until the coordinated P8
+cutover.
 
 The canonical `rofi-ssh-plus`, `rofi-tmux-plus`, and `rofi-agent-plus`
 commands are resolved through `PATH`. A suite deployment installs public
@@ -95,8 +97,8 @@ Agent Plus remains authoritative for:
 - correlation between native provider sessions and tmux panes/options;
 - waiting-session reuse and title-derived, collision-free provider wrapper
   names; and
-- the currently deployed P7 `Recent`, `Hosts`, and `Providers` presentation,
-  followed by the accepted P8 flat host-scope presentation at cutover.
+- the P8 flat host-scope presentation in source; the managed runtime remains on
+  the P7 `Recent`, `Hosts`, and `Providers` presentation until cutover.
 
 SSH Plus must not know provider commands. Tmux Plus may carry generic pane
 metadata and requested tmux `@` options but must not assign meaning to them.
@@ -247,20 +249,19 @@ inferred independently. This prevents the same machine appearing under a
 native hostname, route alias, and friendly name in different pickers. The
 shared fallback rule below applies only while the executable is absent.
 
-The existing Rofi interaction contract remains unchanged:
+The implemented P8 Rofi interaction contract is:
 
 - Tab and Shift+Tab navigate rows;
-- Left and Right switch `Recent`, `Hosts`, and `Providers`;
-- Enter drills into a group or opens a session;
-- Escape returns one layer and exits at a root; and
-- Ctrl+G exits unconditionally.
+- Left and Right switch `All`, `Local`, and stable remote host scopes;
+- Enter opens a selected leaf session;
+- Escape closes through Rofi's native cancel path; and
+- Ctrl+G closes unconditionally through Rofi's native cancel path.
 
 The callback boundary is fail closed. Configuration, capability/model, and
 selection errors render bounded diagnostics without turning a callback failure
-into a process crash. Root Escape returns no rows before configuration or
-model setup, and nested Escape falls back to the enclosing view root when its
-snapshot cannot be loaded. Ctrl+G remains Rofi's native cancel binding and is
-not assigned to a script callback.
+into a process crash. The retained custom-6 callback migration guard returns
+immediately without rendering or loading the model; normal Escape and Ctrl+G
+are native Rofi cancellation paths and are not assigned to a script callback.
 
 ## Clean product rename
 
@@ -378,10 +379,10 @@ alter SSH usage ranking. It also requires that each public command resolves
 from the Niri session's `PATH`, stale mesh observations are rejected rather
 than merged, and an external tmux rename cannot redirect an open or destructive
 action to a different session. P6 additionally requires that malformed
-configuration/model/callback data leaves every picker closable: root Escape and
-Ctrl+G close unconditionally, while nested Escape returns to a safe root. The
-Rofi bindings must preserve native Tab row navigation and must not capture
-Ctrl+G as a script callback.
+configuration/model/callback data leaves every picker closable: Escape and
+Ctrl+G close unconditionally through Rofi's native cancel path. P8 preserves
+native Tab row navigation, uses Left and Right only for cached host-scope
+changes, and rejects forged group rows.
 
 ## P6 acceptance and P7 performance closure
 

@@ -757,6 +757,44 @@ class ContractBackendAssemblyTest(unittest.TestCase):
         events = backend._once(PickerConfig())
         self.assertTrue(inventory_started.is_set())
         self.assertEqual("refresh-finished", events[-1]["event"])
+        self.assertEqual(
+            [
+                {"hostId": "alpha", "display": "Alpha", "local": True},
+                {"hostId": "beta", "display": "Beta", "local": False},
+            ],
+            events[0]["hostCatalog"],
+        )
+
+    def test_selected_refresh_emits_the_full_ordered_host_catalog(self) -> None:
+        mesh = parse_mesh(fixture("mesh-v1.json"))
+        inventory = copy.deepcopy(fixture("tmux-inventory-v1.json"))
+        hosts = inventory["hosts"]
+        assert isinstance(hosts, list)
+        inventory["hosts"] = [hosts[1]]
+        backend = ContractBackend(
+            "rofi-ssh-plus",
+            "rofi-tmux-plus",
+            runner=lambda argv, **_kwargs: output(argv, inventory),
+        )
+        backend.mesh = mesh
+        active = {
+            "nativeHostname": "native",
+            "active": {},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        backend._active = lambda _host, _deadline: (None, active)  # type: ignore[method-assign]
+
+        events = backend._once(PickerConfig(), host_ids=("beta",))
+
+        self.assertEqual(["beta"], events[0]["hosts"])
+        self.assertEqual(
+            [
+                {"hostId": "alpha", "display": "Alpha", "local": True},
+                {"hostId": "beta", "display": "Beta", "local": False},
+            ],
+            events[0]["hostCatalog"],
+        )
 
     def test_outside_tmux_active_is_preserved_and_inventory_is_subordinate(self) -> None:
         mesh_payload = fixture("mesh-v1.json")
@@ -804,7 +842,14 @@ class ContractBackendAssemblyTest(unittest.TestCase):
     def test_stale_mesh_retries_once_before_any_events_escape(self) -> None:
         backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=lambda *_a, **_k: None)
         backend.mesh = parse_mesh(fixture("mesh-v1.json"))
-        events = [{"event": "refresh-started", "hosts": ["alpha"], "backend": backend.identity}]
+        events = [
+            {
+                "event": "refresh-started",
+                "hosts": ["alpha"],
+                "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                "backend": backend.identity,
+            }
+        ]
         backend._once = mock.Mock(side_effect=[StaleMeshError("changed"), events])  # type: ignore[method-assign]
         backend.prepare = mock.Mock()  # type: ignore[method-assign]
         self.assertEqual(events, backend.stream(PickerConfig()))
@@ -984,6 +1029,10 @@ class ContractCacheTest(unittest.TestCase):
             "fingerprint": self.config.fingerprint,
             "generatedAt": stale_at,
             "backend": backend,
+            "hostCatalog": [
+                {"hostId": "alpha", "display": "Alpha", "local": True},
+                {"hostId": "beta", "display": "Beta", "local": False},
+            ],
             "hosts": {
                 "alpha": {
                     "generatedAt": stale_at,
@@ -1006,6 +1055,7 @@ class ContractCacheTest(unittest.TestCase):
                     {
                         "event": "refresh-started",
                         "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
                         "backend": backend,
                     },
                     {
@@ -1028,6 +1078,7 @@ class ContractCacheTest(unittest.TestCase):
         self.assertEqual(stale_at, scoped["generatedAt"])
         self.assertEqual(selected_at, scoped["hosts"]["alpha"]["generatedAt"])
         self.assertEqual(previous["hosts"]["beta"], scoped["hosts"]["beta"])
+        self.assertEqual(previous["hostCatalog"], scoped["hostCatalog"])
 
         with tempfile.TemporaryDirectory() as temporary:
             store = CacheStore(Path(temporary) / "cache")
@@ -1044,6 +1095,10 @@ class ContractCacheTest(unittest.TestCase):
                         {
                             "event": "refresh-started",
                             "hosts": ["alpha", "beta"],
+                            "hostCatalog": [
+                                {"hostId": "alpha", "display": "Alpha", "local": True},
+                                {"hostId": "beta", "display": "Beta", "local": False},
+                            ],
                             "backend": backend,
                         },
                         {
@@ -1071,7 +1126,12 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                        "backend": backend,
+                    },
                     {
                         "event": "host-complete",
                         "host": "alpha",
@@ -1112,6 +1172,7 @@ class ContractCacheTest(unittest.TestCase):
                 {
                     "event": "refresh-started",
                     "hosts": ["alpha"],
+                    "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
                     "backend": {
                         "kind": "contract",
                         "capability": CONTRACT_CAPABILITY,
@@ -1152,6 +1213,7 @@ class ContractCacheTest(unittest.TestCase):
                     {
                         "event": "refresh-started",
                         "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
                         "backend": {
                             "kind": "contract",
                             "capability": CONTRACT_CAPABILITY,
@@ -1181,7 +1243,11 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"]},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                    },
                     {
                         "event": "host-complete",
                         "host": "alpha",
@@ -1200,7 +1266,11 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"]},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                    },
                     {
                         "event": "host-complete",
                         "host": "alpha",
@@ -1242,7 +1312,12 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                        "backend": backend,
+                    },
                     {"event": "host-complete", "host": "alpha", "sessions": [old], "errors": []},
                     {"event": "refresh-finished", "backend": backend},
                 ]
@@ -1263,7 +1338,12 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                        "backend": backend,
+                    },
                     {
                         "event": "host-complete",
                         "host": "alpha",
@@ -1304,7 +1384,12 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                        "backend": backend,
+                    },
                     {"event": "host-complete", "host": "alpha", "sessions": [old], "errors": []},
                     {"event": "refresh-finished", "backend": backend},
                 ]
@@ -1326,7 +1411,12 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                        "backend": backend,
+                    },
                     {
                         "event": "host-complete",
                         "host": "alpha",
@@ -1363,7 +1453,12 @@ class ContractCacheTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                        "backend": backend,
+                    },
                     {"event": "host-complete", "host": "alpha", "sessions": [old], "errors": []},
                     {"event": "refresh-finished", "backend": backend},
                 ]
@@ -1384,7 +1479,14 @@ class ContractCacheTest(unittest.TestCase):
                     self.config,
                     iter(
                         [
-                            {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                            {
+                                "event": "refresh-started",
+                                "hosts": ["alpha"],
+                                "hostCatalog": [
+                                    {"hostId": "alpha", "display": "Alpha", "local": True}
+                                ],
+                                "backend": backend,
+                            },
                             {
                                 "event": "host-complete",
                                 "host": "alpha",
@@ -1474,7 +1576,12 @@ class ContractCacheTest(unittest.TestCase):
                 return None
 
             def stream(self, _config: PickerConfig):
-                yield {"event": "refresh-started", "hosts": ["alpha"], "backend": old}
+                yield {
+                    "event": "refresh-started",
+                    "hosts": ["alpha"],
+                    "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                    "backend": old,
+                }
                 yield {
                     "event": "host-complete",
                     "host": "alpha",
@@ -1517,7 +1624,7 @@ class ContractCacheTest(unittest.TestCase):
                 self.assertEqual(
                     0,
                     run_rofi(
-                        {"ROFI_RETV": str(11), "ROFI_INFO": "host-selection"},
+                        {"ROFI_RETV": "0"},
                         store=store,
                         config=self.config,
                     ),
@@ -1543,7 +1650,12 @@ class ContractCacheTest(unittest.TestCase):
 
             def stream(self, _config: PickerConfig):
                 self.streamed += 1
-                yield {"event": "refresh-started", "hosts": ["alpha"], "backend": identity}
+                yield {
+                    "event": "refresh-started",
+                    "hosts": ["alpha"],
+                    "hostCatalog": [{"hostId": "alpha", "display": "Alpha", "local": True}],
+                    "backend": identity,
+                }
                 yield {"event": "host-complete", "host": "alpha", "sessions": [], "errors": []}
                 yield {"event": "refresh-finished", "backend": identity}
 

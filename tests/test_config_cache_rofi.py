@@ -22,7 +22,6 @@ from rofi_agent_plus.rofi import (
     ERROR_NOTICE_DATA_PREFIX,
     ERROR_NOTICE_SECONDS,
     FALLBACK_ICON_PATH,
-    HOST_GROUP_ICON,
     PROVIDER_ICON_PATHS,
     PROVIDER_LABELS,
     PROVIDER_SEARCH_TERMS,
@@ -31,8 +30,6 @@ from rofi_agent_plus.rofi import (
     ROFI_RETV_CUSTOM_1,
     ROFI_RETV_CUSTOM_2,
     ROFI_RETV_CUSTOM_3,
-    ROFI_RETV_CUSTOM_4,
-    ROFI_RETV_CUSTOM_5,
     ROFI_RETV_CUSTOM_6,
     ROFI_RETV_CUSTOM_19,
     ROW_SEPARATOR,
@@ -188,7 +185,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.3.0", engine.VERSION)
+        self.assertEqual("0.4.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -204,12 +201,11 @@ class ProjectMetadataTest(unittest.TestCase):
     def test_readme_keeps_tab_for_rows_and_left_right_for_views(self) -> None:
         readme = (self.root / "README.md").read_text()
         self.assertIn("-kb-custom-2 Right -kb-custom-3 Left", readme)
-        self.assertIn(
-            "`Tab` and `Shift+Tab`\nuse Rofi's normal next/previous row navigation",
-            readme,
-        )
+        self.assertIn("-kb-cancel Escape,Control+g", readme)
+        self.assertIn("`Tab` and `Shift+Tab` use Rofi's normal row navigation", readme)
         self.assertNotIn("-kb-custom-4 Tab", readme)
         self.assertNotIn("-kb-custom-5 ISO_Left_Tab", readme)
+        self.assertNotIn("-kb-custom-6 Escape", readme)
         self.assertNotIn("-kb-element-next", readme)
         self.assertNotIn("-kb-element-prev", readme)
         self.assertNotIn("compatibility aliases for next/previous view", readme)
@@ -233,7 +229,11 @@ class CacheTest(unittest.TestCase):
 
     @staticmethod
     def events(*sessions: dict[str, object], errors: list[dict[str, str]] | None = None):
-        yield {"event": "refresh-started", "hosts": ["local"]}
+        yield {
+            "event": "refresh-started",
+            "hosts": ["local"],
+            "hostCatalog": [{"hostId": "local", "display": "Local", "local": True}],
+        }
         yield {
             "event": "host-complete",
             "host": "local",
@@ -267,6 +267,96 @@ class CacheTest(unittest.TestCase):
             }
         )
         self.assertIsNone(self.store.load(self.config.fingerprint))
+
+    def test_cache_requires_a_valid_host_catalog(self) -> None:
+        snapshot = build_snapshot(self.config, self.events(session()), now=100)
+        for mutation in (
+            lambda value: value.pop("hostCatalog"),
+            lambda value: value.update(
+                {"hostCatalog": [{"hostId": "local", "display": "Local", "local": False}]}
+            ),
+            lambda value: value.update(
+                {
+                    "hostCatalog": [
+                        {"hostId": "local", "display": "Local", "local": True},
+                        {"hostId": "local", "display": "Duplicate", "local": False},
+                    ]
+                }
+            ),
+            lambda value: value.update({"hostCatalog": []}),
+            lambda value: value.update(
+                {"hostCatalog": [{"hostId": "local", "display": "Local\u200b", "local": True}]}
+            ),
+        ):
+            with self.subTest(mutation=mutation):
+                candidate = json.loads(json.dumps(snapshot))
+                mutation(candidate)
+                self.store.write(candidate)
+                self.assertIsNone(self.store.load(self.config.fingerprint))
+
+    def test_missing_refresh_catalog_fails_closed_and_retains_compatible_catalog(self) -> None:
+        previous = build_snapshot(self.config, self.events(session()), now=100)
+        missing = list(self.events(session()))
+        missing[0].pop("hostCatalog")
+        current = build_snapshot(self.config, iter(missing), previous, now=200)
+        self.assertEqual(previous["hostCatalog"], current["hostCatalog"])
+        self.assertEqual(previous["generatedAt"], current["generatedAt"])
+        self.assertIn("invalid refresh host catalog", json.dumps(current["errors"]))
+
+    def test_selected_remote_refresh_retains_the_full_compatible_catalog(self) -> None:
+        remote = session(host="Beta", hostId="beta", recencyAt=200)
+        previous = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["local", "beta"],
+                        "hostCatalog": [
+                            {"hostId": "local", "display": "Local", "local": True},
+                            {"hostId": "beta", "display": "Beta", "local": False},
+                        ],
+                    },
+                    {"event": "host-complete", "host": "local", "sessions": [], "errors": []},
+                    {
+                        "event": "host-complete",
+                        "host": "beta",
+                        "sessions": [remote],
+                        "errors": [],
+                    },
+                    {"event": "refresh-finished"},
+                ]
+            ),
+            now=100,
+        )
+        current = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["beta"],
+                        "hostCatalog": [
+                            {"hostId": "local", "display": "Local", "local": True},
+                            {"hostId": "beta", "display": "Beta", "local": False},
+                        ],
+                    },
+                    {
+                        "event": "host-complete",
+                        "host": "beta",
+                        "sessions": [remote],
+                        "errors": [],
+                    },
+                    {"event": "refresh-finished"},
+                ]
+            ),
+            previous,
+            now=200,
+            retain_unselected_hosts=True,
+        )
+        self.assertEqual(previous["hostCatalog"], current["hostCatalog"])
+        self.assertEqual(previous["hosts"]["local"], current["hosts"]["local"])
+        self.assertEqual(100, current["generatedAt"])
 
     def test_partial_provider_failure_preserves_old_rows(self) -> None:
         old = session("codex", recencyAt=100)
@@ -467,14 +557,21 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual({"nonselectable": "true", "urgent": "true"}, options)
         self.assertEqual(1, row.count("\x00"))
 
-    def test_views_group_counts_order_and_bundled_icons(self) -> None:
+    def test_flat_scope_views_use_catalog_order_and_provider_icons(self) -> None:
         sessions = [
-            session(name="zulu", host="zeta", recencyAt=300, active=True),
+            session(
+                name="zulu",
+                host="zeta",
+                hostId="zeta",
+                recencyAt=300,
+                active=True,
+            ),
             session(
                 "claude",
                 "00000000-0000-0000-0000-000000000002",
                 name="alpha",
                 host="Alpha",
+                hostId="alpha",
                 recencyAt=300,
             ),
             session(
@@ -482,36 +579,59 @@ class RofiProtocolTest(unittest.TestCase):
                 OPENCODE_ID,
                 name="older",
                 host="zeta",
+                hostId="zeta",
                 recencyAt=100,
             ),
         ]
-        output = render_snapshot(
-            {"sessions": sessions}, navigation=NavigationState("hosts"), now=300
-        )
+        catalog = [
+            {"hostId": "workstation", "display": "Workstation", "local": True},
+            {"hostId": "zeta", "display": "Zeta", "local": False},
+            {"hostId": "alpha", "display": "Alpha", "local": False},
+        ]
+        snapshot = {
+            "sessions": sessions,
+            "hostCatalog": catalog,
+            "hosts": {
+                "workstation": {"sessions": [], "errors": []},
+                "zeta": {"sessions": [sessions[0], sessions[2]], "errors": []},
+                "alpha": {"sessions": [sessions[1]], "errors": []},
+            },
+            "errors": [],
+        }
+        output = render_snapshot(snapshot, navigation=NavigationState(), now=300)
         _, rows = parse_rendered_records(output)
         parsed = [parse_row_options(row) for row in rows]
-        self.assertEqual(["Alpha", "zeta"], [visible for visible, _ in parsed])
-        alpha_options = parsed[0][1]
-        zeta_options = parsed[1][1]
-        self.assertEqual(HOST_GROUP_ICON, alpha_options["icon"])
-        self.assertIn("1 session", alpha_options["display"])
-        self.assertIn("›", alpha_options["display"])
-        self.assertNotIn("active", alpha_options)
-        self.assertIn("2 sessions  ·  1 active  ·  newest 0s", zeta_options["display"])
-        self.assertEqual("true", zeta_options["active"])
-        group = json.loads(zeta_options["info"])
-        self.assertEqual({"type": "group", "groupType": "host", "value": "zeta"}, group)
+        self.assertEqual(
+            ["alpha", "zulu", "older"],
+            [visible.split("  ·  ")[0] for visible, _ in parsed],
+        )
+        self.assertEqual(str(PROVIDER_ICON_PATHS["claude"]), parsed[0][1]["icon"])
+        self.assertNotIn("›", parsed[0][1]["display"])
+        self.assertEqual("true", parsed[1][1]["active"])
+        self.assertEqual("alpha", json.loads(parsed[0][1]["info"])["hostId"])
+
+        output = render_snapshot(snapshot, navigation=NavigationState("local"), now=300)
+        _, rows = parse_rendered_records(output)
+        parsed = [parse_row_options(row) for row in rows]
+        self.assertEqual(["No agent sessions on Local"], [visible for visible, _ in parsed])
+
+        output = render_snapshot(snapshot, navigation=NavigationState("host", "alpha"), now=300)
+        _, rows = parse_rendered_records(output)
+        parsed = [parse_row_options(row) for row in rows]
+        self.assertEqual(["alpha"], [visible.split("  ·  ")[0] for visible, _ in parsed])
+        self.assertIn("Agents › Alpha", output)
 
         output = render_snapshot(
-            {"sessions": sessions}, navigation=NavigationState("providers"), now=300
+            {
+                **snapshot,
+                "hostCatalog": [*catalog, {"hostId": "empty", "display": "Empty", "local": False}],
+            },
+            navigation=NavigationState("host", "empty"),
         )
         _, rows = parse_rendered_records(output)
-        parsed = [parse_row_options(row) for row in rows]
-        self.assertEqual(["Codex", "Claude Code", "OpenCode"], [visible for visible, _ in parsed])
-        for kind, (_, options) in zip(PROVIDER_LABELS, parsed, strict=True):
-            self.assertEqual(str(PROVIDER_ICON_PATHS[kind]), options["icon"])
-            self.assertIn("›", options["display"])
-            self.assertEqual(kind == "codex", options.get("active") == "true")
+        visible, options = parse_row_options(rows[0])
+        self.assertEqual("No agent sessions on Empty", visible)
+        self.assertEqual("true", options["nonselectable"])
 
     def test_recent_and_nested_sessions_sort_valid_recency_then_identity(self) -> None:
         sessions = [
@@ -533,10 +653,10 @@ class RofiProtocolTest(unittest.TestCase):
 
     def test_navigation_state_round_trips_and_legacy_data_is_accepted(self) -> None:
         states = (
-            NavigationState("recent"),
-            NavigationState("hosts"),
-            NavigationState("hosts", "host", "unsafe host › label"),
-            NavigationState("providers", "provider", "claude"),
+            NavigationState(),
+            NavigationState("local"),
+            NavigationState("host", "alpha"),
+            NavigationState("host", "unsafe host › label"),
         )
         for state in states:
             with self.subTest(state=state):
@@ -556,7 +676,7 @@ class RofiProtocolTest(unittest.TestCase):
         )
 
     def test_continuation_state_keeps_live_components_and_expires_them_independently(self) -> None:
-        navigation = NavigationState("hosts", "host", "workstation")
+        navigation = NavigationState("host", "workstation")
         data = _refresh_data(1010, 1003, "offline", navigation=navigation)
         state = parse_continuation_state(data)
         self.assertEqual(navigation, state.navigation)
@@ -570,7 +690,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertFalse(state.active(now=1010).has_lifecycle)
 
     def test_config_error_custom19_clears_expired_notice_without_restarting_it(self) -> None:
-        navigation = NavigationState("hosts", "host", "workstation")
+        navigation = NavigationState()
         data = _refresh_data(None, 999, "old config error", navigation=navigation)
         output = io.StringIO()
         with (
@@ -586,13 +706,13 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertNotIn("old config error", rendered)
         self.assertNotIn("\x00message\x1fconfig", rendered)
         self.assertNotIn("error-notice:", rendered)
-        self.assertIn("Agents › Hosts › workstation", rendered)
+        self.assertIn("Agents › All", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }', rendered
         )
 
     def test_config_error_custom19_keeps_refresh_and_shows_new_error(self) -> None:
-        navigation = NavigationState("providers", "provider", "codex")
+        navigation = NavigationState()
         data = _refresh_data(1010, navigation=navigation)
         output = io.StringIO()
         with (
@@ -609,14 +729,22 @@ class RofiProtocolTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("config offline", rendered)
         self.assertIn("background-refresh:1010;error-notice:", rendered)
-        self.assertIn("Agents › Providers › Codex", rendered)
+        self.assertIn("Agents › All", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 1; action: "kb-custom-19"; } }',
             rendered,
         )
 
-    def test_navigation_callbacks_preserve_mixed_lifecycle_and_clear_filter(self) -> None:
-        snapshot = {"sessions": [session()], "errors": []}
+    def test_navigation_callbacks_are_cache_only_and_preserve_filter_only(self) -> None:
+        snapshot = {
+            "sessions": [session()],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {"workstation": {"sessions": [session()], "errors": []}},
+            "errors": [],
+        }
         store = mock.Mock(spec=CacheStore)
         store.load.return_value = snapshot
         notice = "Refresh errors: local/threads: offline"
@@ -638,9 +766,9 @@ class RofiProtocolTest(unittest.TestCase):
                 )
             return output.getvalue()
 
-        root = NavigationState("hosts")
-        cycled = invoke(ROFI_RETV_CUSTOM_4, root)
-        self.assertIn("Agents › Providers", cycled)
+        root = NavigationState()
+        cycled = invoke(ROFI_RETV_CUSTOM_2, root)
+        self.assertIn("Agents › Local", cycled)
         self.assertIn(notice, cycled)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 1; action: "kb-custom-19"; } }',
@@ -648,60 +776,63 @@ class RofiProtocolTest(unittest.TestCase):
         )
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled)
         self.assertIn("navigation:", cycled)
-        self.assertNotIn("\x00keep-filter\x1ftrue", cycled)
+        self.assertIn("\x00keep-filter\x1ftrue", cycled)
+        self.assertNotIn("\x00keep-selection\x1ftrue", cycled)
 
-        provider_root = NavigationState("providers")
-        cycled_right = invoke(ROFI_RETV_CUSTOM_2, provider_root)
-        self.assertIn("Agents › Recent", cycled_right)
+        local = NavigationState("local")
+        cycled_right = invoke(ROFI_RETV_CUSTOM_2, local)
+        self.assertIn("Agents › Alpha", cycled_right)
         self.assertIn(notice, cycled_right)
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled_right)
-        self.assertNotIn("\x00keep-filter\x1ftrue", cycled_right)
+        self.assertIn("\x00keep-filter\x1ftrue", cycled_right)
+        self.assertNotIn("\x00keep-selection\x1ftrue", cycled_right)
 
-        nested = NavigationState("providers", "provider", "codex")
-        cycled_left = invoke(ROFI_RETV_CUSTOM_3, nested)
-        self.assertIn("Agents › Hosts", cycled_left)
+        remote = NavigationState("host", "alpha")
+        cycled_left = invoke(ROFI_RETV_CUSTOM_3, remote)
+        self.assertIn("Agents › Local", cycled_left)
         self.assertIn(notice, cycled_left)
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled_left)
-        self.assertNotIn("\x00keep-filter\x1ftrue", cycled_left)
+        self.assertIn("\x00keep-filter\x1ftrue", cycled_left)
+        self.assertNotIn("\x00keep-selection\x1ftrue", cycled_left)
+        store.presentation_context.assert_not_called()
 
-        backed = invoke(ROFI_RETV_CUSTOM_6, nested)
-        self.assertIn("Agents › Providers\t", backed)
-        self.assertIn(notice, backed)
-        self.assertIn("background-refresh:1010;error-notice:1003:", backed)
-        self.assertNotIn("\x00keep-filter\x1ftrue", backed)
-
-        cycled_left = invoke(ROFI_RETV_CUSTOM_3, provider_root)
-        self.assertIn("Agents › Hosts", cycled_left)
-        self.assertIn(notice, cycled_left)
-        self.assertNotIn("\x00keep-filter\x1ftrue", cycled_left)
-        cycled_right = invoke(ROFI_RETV_CUSTOM_2, provider_root)
-        self.assertIn("Agents › Recent", cycled_right)
-        self.assertIn(notice, cycled_right)
-        self.assertNotIn("\x00keep-selection\x1ftrue", cycled_right)
-        self.assertIn("background-refresh:1010;error-notice:1003:", cycled_right)
-
-    def test_nested_lists_filter_scope_and_sort_newest_first(self) -> None:
+    def test_flat_host_lists_filter_scope_and_sort_newest_first(self) -> None:
         sessions = [
-            session(name="older", host="alpha", recencyAt=100),
+            session(name="older", host="alpha", hostId="alpha", recencyAt=100),
             session(
                 "claude",
                 "00000000-0000-0000-0000-000000000002",
                 name="claude-old",
                 host="alpha",
+                hostId="alpha",
                 recencyAt=150,
             ),
-            session(name="newer", host="alpha", recencyAt=300),
+            session(name="newer", host="alpha", hostId="alpha", recencyAt=300),
             session(
                 "claude",
                 "00000000-0000-0000-0000-000000000003",
                 name="claude-new",
                 host="elsewhere",
+                hostId="elsewhere",
                 recencyAt=400,
             ),
         ]
+        snapshot = {
+            "sessions": sessions,
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+                {"hostId": "elsewhere", "display": "Elsewhere", "local": False},
+            ],
+            "hosts": {
+                "alpha": {"sessions": sessions[:3], "errors": []},
+                "elsewhere": {"sessions": [sessions[3]], "errors": []},
+            },
+            "errors": [],
+        }
         output = render_snapshot(
-            {"sessions": sessions},
-            navigation=NavigationState("hosts", "host", "alpha"),
+            snapshot,
+            navigation=NavigationState("host", "alpha"),
             now=400,
         )
         _, rows = parse_rendered_records(output)
@@ -711,18 +842,22 @@ class RofiProtocolTest(unittest.TestCase):
         )
         self.assertTrue(all("elsewhere" not in item for item in visible))
 
-        output = render_snapshot(
-            {"sessions": sessions},
-            navigation=NavigationState("providers", "provider", "claude"),
-            now=400,
-        )
+        output = render_snapshot(snapshot, navigation=NavigationState("host", "elsewhere"), now=400)
         _, rows = parse_rendered_records(output)
         visible = [parse_row_options(row)[0] for row in rows]
-        self.assertEqual(["claude-new", "claude-old"], [item.split("  ·  ")[0] for item in visible])
+        self.assertEqual(["claude-new"], [item.split("  ·  ")[0] for item in visible])
 
-    def test_open_failure_in_nested_view_keeps_background_polling(self) -> None:
-        nested = NavigationState("hosts", "host", "workstation")
-        snapshot = {"sessions": [session()], "errors": []}
+    def test_open_failure_in_host_view_keeps_background_polling(self) -> None:
+        nested = NavigationState("host", "alpha")
+        snapshot = {
+            "sessions": [session(host="alpha", hostId="alpha")],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {"alpha": {"sessions": [session(host="alpha", hostId="alpha")], "errors": []}},
+            "errors": [],
+        }
         store = mock.Mock(spec=CacheStore)
         store.load.return_value = snapshot
         data = _refresh_data(1010, 1003, "old notice", navigation=nested)
@@ -745,16 +880,25 @@ class RofiProtocolTest(unittest.TestCase):
                 )
         rendered = output.getvalue()
         self.assertIn("Unable to open session", rendered)
-        self.assertIn("Agents › Hosts › workstation", rendered)
+        self.assertIn("Agents › Alpha", rendered)
         self.assertIn("background-refresh:1010;error-notice:", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 1; action: "kb-custom-19"; } }',
             rendered,
         )
 
-    def test_forced_refresh_retains_nested_navigation_state(self) -> None:
-        nested = NavigationState("providers", "provider", "claude")
-        snapshot = {"sessions": [session("claude", THREAD_ID)], "errors": []}
+    def test_forced_refresh_retains_host_navigation_state(self) -> None:
+        nested = NavigationState("host", "alpha")
+        selected = session("claude", THREAD_ID, host="alpha", hostId="alpha")
+        snapshot = {
+            "sessions": [selected],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {"alpha": {"sessions": [selected], "errors": []}},
+            "errors": [],
+        }
         store = mock.Mock(spec=CacheStore)
         store.refresh.return_value = snapshot
         store.is_fresh.return_value = True
@@ -769,22 +913,32 @@ class RofiProtocolTest(unittest.TestCase):
                 config=self._config(),
             )
         rendered = output.getvalue()
-        self.assertIn("Agents › Providers › Claude Code", rendered)
+        self.assertIn("Agents › Alpha", rendered)
         self.assertIn("navigation:", rendered)
         self.assertIn("claude", rendered)
 
-    def test_left_right_cycle_from_roots_and_nested_and_wrap_in_both_directions(self) -> None:
+    def test_left_right_cycle_host_scope_ring_and_wrap_in_both_directions(self) -> None:
         store = mock.Mock(spec=CacheStore)
-        store.load.return_value = {"sessions": [session()], "errors": []}
+        snapshot = {
+            "sessions": [session()],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+                {"hostId": "beta", "display": "Beta", "local": False},
+            ],
+            "hosts": {"workstation": {"sessions": [session()], "errors": []}},
+            "errors": [],
+        }
+        store.load.return_value = snapshot
         for retv, state, expected in (
-            (ROFI_RETV_CUSTOM_2, NavigationState("recent"), "Hosts"),
-            (ROFI_RETV_CUSTOM_2, NavigationState("hosts"), "Providers"),
-            (ROFI_RETV_CUSTOM_2, NavigationState("providers"), "Recent"),
-            (ROFI_RETV_CUSTOM_2, NavigationState("hosts", "host", "workstation"), "Providers"),
-            (ROFI_RETV_CUSTOM_3, NavigationState("recent"), "Providers"),
-            (ROFI_RETV_CUSTOM_3, NavigationState("providers"), "Hosts"),
-            (ROFI_RETV_CUSTOM_3, NavigationState("hosts"), "Recent"),
-            (ROFI_RETV_CUSTOM_3, NavigationState("providers", "provider", "codex"), "Hosts"),
+            (ROFI_RETV_CUSTOM_2, NavigationState(), "Local"),
+            (ROFI_RETV_CUSTOM_2, NavigationState("local"), "Alpha"),
+            (ROFI_RETV_CUSTOM_2, NavigationState("host", "alpha"), "Beta"),
+            (ROFI_RETV_CUSTOM_2, NavigationState("host", "beta"), "All"),
+            (ROFI_RETV_CUSTOM_3, NavigationState(), "Beta"),
+            (ROFI_RETV_CUSTOM_3, NavigationState("host", "beta"), "Alpha"),
+            (ROFI_RETV_CUSTOM_3, NavigationState("host", "alpha"), "Local"),
+            (ROFI_RETV_CUSTOM_3, NavigationState("local"), "All"),
         ):
             output = io.StringIO()
             with (
@@ -802,70 +956,32 @@ class RofiProtocolTest(unittest.TestCase):
             rendered = output.getvalue()
             self.assertIn(f"\x00prompt\x1fAgents › {expected}", rendered)
             self.assertIn("background-refresh:1010;error-notice:1003:", rendered)
-            self.assertNotIn("\x00keep-filter\x1ftrue", rendered)
+            self.assertIn("\x00keep-filter\x1ftrue", rendered)
             self.assertNotIn("\x00keep-selection\x1ftrue", rendered)
 
-    def test_legacy_tab_callbacks_still_cycle_from_nested_and_wrap(self) -> None:
-        store = mock.Mock(spec=CacheStore)
-        store.load.return_value = {"sessions": [session()], "errors": []}
-        for retv, state, expected in (
-            (ROFI_RETV_CUSTOM_4, NavigationState("hosts", "host", "workstation"), "Providers"),
-            (ROFI_RETV_CUSTOM_4, NavigationState("providers"), "Recent"),
-            (ROFI_RETV_CUSTOM_5, NavigationState("recent"), "Providers"),
-            (ROFI_RETV_CUSTOM_5, NavigationState("providers"), "Hosts"),
-            (ROFI_RETV_CUSTOM_5, NavigationState("hosts"), "Recent"),
-            (ROFI_RETV_CUSTOM_5, NavigationState("providers", "provider", "codex"), "Hosts"),
+    def test_escape_migration_guard_always_closes_without_work(self) -> None:
+        for state in (
+            NavigationState(),
+            NavigationState("local"),
+            NavigationState("host", "alpha"),
         ):
-            output = io.StringIO()
-            with mock.patch("sys.stdout", output):
-                run_rofi(
-                    {"ROFI_RETV": str(retv), "ROFI_DATA": _navigation_data(state)},
-                    store=store,
-                    config=self._config(),
-                )
-            rendered = output.getvalue()
-            self.assertIn(f"\x00prompt\x1fAgents › {expected}", rendered)
-            self.assertNotIn("\x00keep-filter\x1ftrue", rendered)
-            self.assertNotIn("\x00keep-selection\x1ftrue", rendered)
-
-    def test_escape_backs_from_nested_and_exits_at_root(self) -> None:
-        store = mock.Mock(spec=CacheStore)
-        store.load.return_value = {"sessions": [session()], "errors": []}
-        nested = NavigationState("hosts", "host", "workstation")
-        output = io.StringIO()
-        with (
-            mock.patch("sys.stdout", output),
-            mock.patch("rofi_agent_plus.rofi.time.time", return_value=1000),
-        ):
-            result = run_rofi(
-                {
-                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
-                    "ROFI_DATA": _refresh_data(1010, 1003, "offline", navigation=nested),
-                },
-                store=store,
-                config=self._config(),
-            )
-        self.assertEqual(0, result)
-        backed = output.getvalue()
-        self.assertIn("\x00prompt\x1fAgents › Hosts", backed)
-        self.assertIn("background-refresh:1010;error-notice:1003:", backed)
-        self.assertNotIn("\x00keep-filter\x1ftrue", backed)
-        self.assertNotIn("\x00keep-selection\x1ftrue", backed)
-
-        output = io.StringIO()
-        with mock.patch("sys.stdout", output):
-            result = run_rofi(
-                {
-                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
-                    "ROFI_DATA": _refresh_data(
-                        1010, 1003, "offline", navigation=NavigationState("hosts")
-                    ),
-                },
-                store=store,
-                config=self._config(),
-            )
-        self.assertEqual(0, result)
-        self.assertEqual("", output.getvalue())
+            with self.subTest(state=state):
+                store = mock.Mock(spec=CacheStore)
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output):
+                    result = run_rofi(
+                        {
+                            "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
+                            "ROFI_DATA": _navigation_data(state),
+                        },
+                        store=store,
+                        config=self._config(),
+                    )
+                self.assertEqual(0, result)
+                self.assertEqual("", output.getvalue())
+                store.load.assert_not_called()
+                store.presentation_context.assert_not_called()
+                store.refresh.assert_not_called()
 
         output = io.StringIO()
         with (
@@ -874,116 +990,14 @@ class RofiProtocolTest(unittest.TestCase):
                 "rofi_agent_plus.rofi.load_config", side_effect=ConfigError("invalid config")
             ),
         ):
-            result = run_rofi(
-                {
-                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
-                    "ROFI_DATA": _navigation_data(NavigationState("providers")),
-                },
-                store=store,
-            )
+            result = run_rofi({"ROFI_RETV": str(ROFI_RETV_CUSTOM_6)}, store=mock.Mock())
         self.assertEqual(0, result)
         self.assertEqual("", output.getvalue())
 
-    def test_escape_recovers_to_root_when_configuration_fails_in_nested_view(self) -> None:
-        nested = NavigationState("hosts", "host", "workstation")
-        output = io.StringIO()
-        with (
-            mock.patch("sys.stdout", output),
-            mock.patch(
-                "rofi_agent_plus.rofi.load_config",
-                side_effect=ConfigError("invalid config"),
-            ),
-        ):
-            result = run_rofi(
-                {
-                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
-                    "ROFI_DATA": _navigation_data(nested),
-                },
-                store=mock.Mock(spec=CacheStore),
-            )
-        self.assertEqual(0, result)
-        rendered = output.getvalue()
-        self.assertIn("Agents › Hosts\t", rendered)
-        self.assertNotIn("Agents › Hosts › workstation", rendered)
-        self.assertIn("Configuration failed: invalid config", rendered)
-        self.assertIn("navigation:", rendered)
-
-    def test_escape_recovers_to_root_when_model_or_snapshot_fails(self) -> None:
-        nested = NavigationState("providers", "provider", "codex")
-        store = mock.Mock(spec=CacheStore)
-        store.presentation_context.side_effect = RuntimeError("model unavailable")
-        output = io.StringIO()
-        with mock.patch("sys.stdout", output):
-            result = run_rofi(
-                {
-                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
-                    "ROFI_DATA": _navigation_data(nested),
-                },
-                store=store,
-                config=PickerConfig(),
-            )
-        self.assertEqual(0, result)
-        rendered = output.getvalue()
-        self.assertIn("Agents › Providers\t", rendered)
-        self.assertNotIn("Agents › Providers › Codex", rendered)
-        self.assertIn("Model setup failed: model unavailable", rendered)
-
-        store = mock.Mock(spec=CacheStore)
-        store.presentation_context.return_value = None
-        store.load.side_effect = RuntimeError("snapshot unavailable")
-        output = io.StringIO()
-        with mock.patch("sys.stdout", output):
-            result = run_rofi(
-                {
-                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
-                    "ROFI_DATA": _navigation_data(nested),
-                },
-                store=store,
-                config=PickerConfig(),
-            )
-        self.assertEqual(0, result)
-        rendered = output.getvalue()
-        self.assertIn("Agents › Providers\t", rendered)
-        self.assertNotIn("Agents › Providers › Codex", rendered)
-        self.assertIn("Unable to return to group root: snapshot unavailable", rendered)
-
-    def test_enter_drills_groups_and_opens_session_leaves(self) -> None:
+    def test_enter_opens_leaf_and_rejects_forged_group_metadata(self) -> None:
         snapshot = {"sessions": [session()], "errors": []}
         store = mock.Mock(spec=CacheStore)
         store.load.return_value = snapshot
-        root = NavigationState("hosts")
-        _, rows = parse_rendered_records(render_snapshot(snapshot, navigation=root))
-        _, options = parse_row_options(rows[0])
-        group_info = options["info"]
-        output = io.StringIO()
-        with mock.patch("sys.stdout", output):
-            run_rofi(
-                {
-                    "ROFI_RETV": "1",
-                    "ROFI_INFO": group_info,
-                    "ROFI_DATA": _navigation_data(root),
-                },
-                store=store,
-                config=self._config(),
-            )
-        entered = output.getvalue()
-        self.assertIn("\x00prompt\x1fAgents › Hosts › workstation", entered)
-        self.assertNotIn("\x00keep-filter\x1ftrue", entered)
-        self.assertIn("\x00data\x1fnavigation:", entered)
-
-        output = io.StringIO()
-        with mock.patch("sys.stdout", output):
-            run_rofi(
-                {
-                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_6),
-                    "ROFI_DATA": _navigation_data(NavigationState("hosts", "host", "workstation")),
-                },
-                store=store,
-                config=self._config(),
-            )
-        self.assertIn("\x00prompt\x1fAgents › Hosts", output.getvalue())
-        self.assertNotIn("\x00keep-filter\x1ftrue", output.getvalue())
-
         with mock.patch("rofi_agent_plus.rofi._open_selection") as opener:
             self.assertEqual(
                 0,
@@ -991,9 +1005,6 @@ class RofiProtocolTest(unittest.TestCase):
                     {
                         "ROFI_RETV": "1",
                         "ROFI_INFO": selection_payload(session()),
-                        "ROFI_DATA": _navigation_data(
-                            NavigationState("hosts", "host", "workstation")
-                        ),
                     },
                     store=store,
                     config=self._config(),
@@ -1001,9 +1012,47 @@ class RofiProtocolTest(unittest.TestCase):
             )
         opener.assert_called_once()
 
-    def test_refresh_and_open_failure_preserve_nested_state_and_disappearing_group(self) -> None:
-        nested = NavigationState("hosts", "host", "gone-host")
-        stale = {"sessions": [session(host="other-host")], "errors": []}
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            run_rofi(
+                {
+                    "ROFI_RETV": "1",
+                    "ROFI_INFO": json.dumps(
+                        {"type": "group", "groupType": "host", "value": "workstation"}
+                    ),
+                },
+                store=store,
+                config=self._config(),
+            )
+        self.assertIn("Unable to open session", output.getvalue())
+        opener.assert_called_once()
+
+        forged = json.loads(selection_payload(session()))
+        forged.update({"type": "group", "groupType": "host", "value": "workstation"})
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            run_rofi(
+                {
+                    "ROFI_RETV": "1",
+                    "ROFI_INFO": json.dumps(forged),
+                },
+                store=store,
+                config=self._config(),
+            )
+        self.assertIn("Unable to open session", output.getvalue())
+        opener.assert_called_once()
+
+    def test_refresh_and_open_failure_preserve_empty_host_scope(self) -> None:
+        nested = NavigationState("host", "gone-host")
+        stale = {
+            "sessions": [session(host="other-host", hostId="other-host")],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "gone-host", "display": "Gone", "local": False},
+            ],
+            "hosts": {},
+            "errors": [],
+        }
         store = mock.Mock(spec=CacheStore)
         store.load.return_value = stale
         store.is_fresh.return_value = True
@@ -1018,8 +1067,8 @@ class RofiProtocolTest(unittest.TestCase):
                 config=self._config(),
             )
         rendered = output.getvalue()
-        self.assertIn("Agents › Hosts › gone-host", rendered)
-        self.assertIn("No agent sessions found", rendered)
+        self.assertIn("Agents › Gone", rendered)
+        self.assertIn("No agent sessions on Gone", rendered)
         self.assertIn("\x00keep-filter\x1ftrue", rendered)
         self.assertIn("\x00data\x1fnavigation:", rendered)
 
@@ -1039,7 +1088,7 @@ class RofiProtocolTest(unittest.TestCase):
                 )
         rendered = output.getvalue()
         self.assertIn("Unable to open session", rendered)
-        self.assertIn("Agents › Hosts › gone-host", rendered)
+        self.assertIn("Agents › Gone", rendered)
         self.assertIn("\x00keep-selection\x1ftrue", rendered)
 
     def test_selection_parser_validates_provider_ids(self) -> None:

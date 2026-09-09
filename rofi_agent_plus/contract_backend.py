@@ -1424,6 +1424,17 @@ class ContractBackend:
             {
                 "event": "refresh-started",
                 "hosts": [host.host_id for host in mesh.hosts],
+                "hostCatalog": [
+                    {
+                        "hostId": host.host_id,
+                        "display": host.display,
+                        "local": host.local,
+                    }
+                    # ``mesh`` may be a selected-host subset for lifecycle
+                    # revalidation.  The presentation ring still needs the
+                    # complete ordered authority from the current Mesh.
+                    for host in self.mesh.hosts
+                ],
                 "backend": self.identity,
             }
         ]

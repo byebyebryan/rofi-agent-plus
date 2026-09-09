@@ -5,11 +5,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,9 +21,9 @@ from typing import Any
 from . import engine
 from .config import PickerConfig
 
-# v2 adds the discovery authority identity.  A Host Mesh revision (or the
-# explicit local-only ``null`` identity) is part of cache validity.
-CACHE_VERSION = 2
+# v3 adds the ordered Host Mesh presentation catalog.  A Host Mesh revision
+# (or the explicit local-only ``null`` identity) is part of cache validity.
+CACHE_VERSION = 3
 DEFAULT_CACHE_DIR = Path("rofi-agent-plus")
 SNAPSHOT_NAME = "snapshot.json"
 LOCK_NAME = "refresh.lock"
@@ -36,6 +38,7 @@ _ROFI_CALLBACK_ENVIRONMENT = (
     "ROFI_RETV",
 )
 _BACKGROUND_OWNER_ENV = "ROFI_AGENT_PLUS_REFRESH_OWNER"
+_HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,57 @@ class PresentationContext:
     backend: dict[str, object]
     error: str | None = None
     selected: object | None = None
+
+
+def _valid_host_catalog(value: object) -> bool:
+    """Validate the private ordered Host Mesh catalog in a cache snapshot."""
+
+    if not isinstance(value, list):
+        return False
+    seen: set[str] = set()
+    local_count = 0
+    for item in value:
+        if not isinstance(item, Mapping):
+            return False
+        host_id = item.get("hostId")
+        display = item.get("display")
+        if (
+            not isinstance(host_id, str)
+            or not host_id
+            or len(host_id) > 256
+            or not _HOST_ID.fullmatch(host_id)
+            or host_id.casefold() in seen
+            or not isinstance(display, str)
+            or not display
+            or len(display) > 16 * 1024
+            or any(unicodedata.category(char).startswith("C") for char in display)
+            or not isinstance(item.get("local"), bool)
+        ):
+            return False
+        if item["local"]:
+            local_count += 1
+        seen.add(host_id.casefold())
+    # A non-empty Host Mesh always has exactly one local host and the Mesh
+    # contract requires it to be first.  Empty catalogs are reserved for the
+    # contract-error/no-authority snapshot.
+    return not value or (local_count == 1 and value[0].get("local") is True)
+
+
+def _host_catalog(value: object) -> list[dict[str, object]] | None:
+    """Copy a valid internal catalog while preserving Host Mesh order."""
+
+    if not _valid_host_catalog(value):
+        return None
+    assert isinstance(value, list)
+    return [
+        {
+            "hostId": str(item["hostId"]).casefold(),
+            "display": item["display"],
+            "local": item["local"],
+        }
+        for item in value
+        if isinstance(item, Mapping)
+    ]
 
 
 def cache_root() -> Path:
@@ -247,12 +301,14 @@ def _failed_contract_snapshot(
         else None
     )
     hosts = dict(prior.get("hosts", {})) if isinstance(prior, Mapping) else {}
+    catalog = _host_catalog(prior.get("hostCatalog")) if isinstance(prior, Mapping) else None
     snapshot = {
         "version": CACHE_VERSION,
         "fingerprint": config.fingerprint,
         # Never bless a partial/stale contract result as freshly generated.
         "generatedAt": int(prior.get("generatedAt", 0)) if isinstance(prior, Mapping) else 0,
         "backend": dict(backend),
+        "hostCatalog": catalog or [],
         "hosts": hosts,
         "sessions": _flatten_hosts(hosts, config.max_sessions),
         "errors": _flatten_errors(hosts) + errors,
@@ -357,6 +413,7 @@ def build_snapshot(
     completed_hosts: set[str] = set()
     finished = False
     contract_aborted = False
+    host_catalog: list[dict[str, object]] = []
 
     def preserve_previous(expected: set[str] | None = None) -> None:
         if not previous or not isinstance(previous.get("hosts"), dict):
@@ -398,6 +455,40 @@ def build_snapshot(
                     contract_aborted = backend["kind"] == "contract"
                     continue
                 expected_hosts = set(names)
+                raw_catalog = event.get("hostCatalog")
+                parsed_catalog = _host_catalog(raw_catalog)
+                catalog_ids = (
+                    {str(item["hostId"]).casefold() for item in parsed_catalog}
+                    if parsed_catalog is not None
+                    else set()
+                )
+                expected_catalog_ids = {name.casefold() for name in expected_hosts}
+                if (
+                    parsed_catalog is None
+                    or not parsed_catalog
+                    or not expected_catalog_ids.issubset(catalog_ids)
+                    or (not retain_unselected_hosts and catalog_ids != expected_catalog_ids)
+                ):
+                    refresh_errors.append(
+                        {
+                            "host": "local",
+                            "stage": "refresh",
+                            "message": "invalid refresh host catalog",
+                        }
+                    )
+                    contract_aborted = backend["kind"] == "contract"
+                elif (
+                    retain_unselected_hosts
+                    and previous is not None
+                    and _backend_identity(previous.get("backend")) == backend
+                ):
+                    # A selected-host lifecycle refresh may update one host,
+                    # but the presentation ring must retain the full catalog
+                    # from the compatible prior authority.
+                    prior_catalog = _host_catalog(previous.get("hostCatalog"))
+                    host_catalog = prior_catalog if prior_catalog is not None else parsed_catalog
+                else:
+                    host_catalog = parsed_catalog
                 # Contract Mesh is authoritative for host membership.  Start
                 # from compatible old rows only for currently declared hosts,
                 # which prunes removed hosts before any cache merge.
@@ -456,6 +547,16 @@ def build_snapshot(
             )
         return _failed_contract_snapshot(config, previous, backend, refresh_errors)
 
+    if (
+        not host_catalog
+        and previous is not None
+        and retain_unselected_hosts
+        and _backend_identity(previous.get("backend")) == backend
+    ):
+        prior_catalog = _host_catalog(previous.get("hostCatalog"))
+        if prior_catalog is not None:
+            host_catalog = prior_catalog
+
     # A lifecycle revalidation only refreshes one host.  Its selected-host
     # snapshot is current, but advancing the top-level timestamp would bless
     # every retained peer as globally fresh and suppress the required next
@@ -473,6 +574,7 @@ def build_snapshot(
         "fingerprint": config.fingerprint,
         "generatedAt": generated_at,
         "backend": backend,
+        "hostCatalog": host_catalog,
         "hosts": hosts,
         "sessions": _flatten_hosts(hosts, config.max_sessions),
         "errors": errors,
@@ -519,10 +621,13 @@ class CacheStore:
             return None
         if backend is not None and stored_backend != _backend_identity(backend):
             return None
+        catalog_valid = _valid_host_catalog(payload.get("hostCatalog"))
         if (
             not isinstance(payload.get("sessions"), list)
             or not isinstance(payload.get("errors", []), list)
             or not isinstance(payload.get("hosts"), dict)
+            or not catalog_valid
+            or (stored_backend["kind"] == "contract" and not payload["hostCatalog"])
         ):
             return None
         for key, host in payload["hosts"].items():
@@ -853,6 +958,7 @@ class CacheStore:
                                 "fingerprint": config.fingerprint,
                                 "generatedAt": 0,
                                 "backend": current_identity,
+                                "hostCatalog": [],
                                 "hosts": {},
                                 "sessions": [],
                                 "errors": [
@@ -1058,6 +1164,7 @@ def _empty_snapshot(config: PickerConfig) -> dict[str, Any]:
             "capability": "host-mesh-v1+tmux-session-v1",
             "meshRevision": None,
         },
+        "hostCatalog": [],
         "hosts": {},
         "sessions": [],
         "errors": [],

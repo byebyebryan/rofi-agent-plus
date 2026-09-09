@@ -137,7 +137,14 @@ class FakeBackend:
         self.streams += 1
         rows = self._rows[index]
         return [
-            {"event": "refresh-started", "hosts": ["alpha"], "backend": dict(self.identity)},
+            {
+                "event": "refresh-started",
+                "hosts": ["alpha"],
+                "hostCatalog": [
+                    {"hostId": "alpha", "display": "Alpha", "local": True},
+                ],
+                "backend": dict(self.identity),
+            },
             {
                 "event": "host-complete",
                 "host": "alpha",
@@ -531,6 +538,13 @@ class ContractLifecycleTest(unittest.TestCase):
                             {
                                 "event": "refresh-started",
                                 "hosts": [host_id],
+                                "hostCatalog": [
+                                    {
+                                        "hostId": host_id,
+                                        "display": host_id.title(),
+                                        "local": True,
+                                    }
+                                ],
                                 "backend": dict(BACKEND),
                             },
                             {
@@ -551,6 +565,13 @@ class ContractLifecycleTest(unittest.TestCase):
                         {
                             "event": "refresh-started",
                             "hosts": [host_id],
+                            "hostCatalog": [
+                                {
+                                    "hostId": host_id,
+                                    "display": host_id.title(),
+                                    "local": True,
+                                }
+                            ],
                             "backend": dict(BACKEND),
                         }
                     ]
@@ -598,7 +619,15 @@ class ContractLifecycleTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha", "beta"], "backend": BACKEND},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha", "beta"],
+                        "hostCatalog": [
+                            {"hostId": "alpha", "display": "Alpha", "local": True},
+                            {"hostId": "beta", "display": "Beta", "local": False},
+                        ],
+                        "backend": BACKEND,
+                    },
                     {
                         "event": "host-complete",
                         "host": "alpha",
@@ -622,7 +651,14 @@ class ContractLifecycleTest(unittest.TestCase):
             self.config,
             iter(
                 [
-                    {"event": "refresh-started", "hosts": ["alpha"], "backend": BACKEND},
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "hostCatalog": [
+                            {"hostId": "alpha", "display": "Alpha", "local": True},
+                        ],
+                        "backend": BACKEND,
+                    },
                     {
                         "event": "host-complete",
                         "host": "alpha",

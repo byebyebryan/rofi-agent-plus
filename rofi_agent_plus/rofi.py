@@ -26,8 +26,9 @@ ROFI_RETV_SELECTED = 1
 ROFI_RETV_CUSTOM_1 = 10
 ROFI_RETV_CUSTOM_2 = 11
 ROFI_RETV_CUSTOM_3 = 12
-ROFI_RETV_CUSTOM_4 = 13
-ROFI_RETV_CUSTOM_5 = 14
+# 15 is retained as a migration guard for an older managed invocation that
+# still routed Escape through a script callback.  It closes immediately in
+# ``run_rofi`` and must never render a replacement list.
 ROFI_RETV_CUSTOM_6 = 15
 ROFI_RETV_CUSTOM_19 = 28
 MAX_MESSAGE_LENGTH = 360
@@ -42,7 +43,7 @@ FAST_OPEN_FALLBACK_CODES = frozenset(
 )
 ERROR_NOTICE_DATA_PREFIX = "error-notice:"
 NAVIGATION_DATA_PREFIX = "navigation:"
-NAVIGATION_DATA_VERSION = 1
+NAVIGATION_DATA_VERSION = 2
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _DISPLAY_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
@@ -51,7 +52,6 @@ PROVIDER_LABELS = {
     "claude": "Claude Code",
     "opencode": "OpenCode",
 }
-PROVIDER_ORDER = ("codex", "claude", "opencode")
 PROVIDER_SEARCH_TERMS = {
     "codex": "codex",
     "claude": "claude claude-code claude code",
@@ -62,10 +62,14 @@ PROVIDER_ICON_PATHS = {
     for kind in PROVIDER_LABELS
 }
 FALLBACK_ICON_PATH = Path(__file__).resolve().parent / "assets" / "providers" / "generic.svg"
-HOST_GROUP_ICON = "network-server-symbolic"
 ROW_SEPARATOR = "\n"
 ROFI_RECORD_SEPARATOR = "\t"
 ROFI_DELIMITER_VALUE = r"\t"
+_HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
+VIEW_ALL = "all"
+VIEW_LOCAL = "local"
+VIEW_HOST = "host"
+_VIEWS = frozenset({VIEW_ALL, VIEW_LOCAL, VIEW_HOST})
 
 
 def sanitize(value: object) -> str:
@@ -86,69 +90,41 @@ def _contract_text(value: object, *, required: bool = True) -> bool:
 
 @dataclass(frozen=True)
 class NavigationState:
-    """The view and optional group scope currently shown by the picker.
+    """One flat scope in the immutable Host Mesh presentation catalog.
 
-    ``view`` is always one of the three top-level views.  A host scope stores
-    the displayed host label, while a provider scope stores its stable provider
-    kind.  The constructor normalizes malformed values so untrusted
-    continuation data can never create an invalid state.
+    ``all`` and ``local`` are typed scopes.  ``host`` carries an authoritative
+    Host Mesh id rather than a display label.  Continuation data is untrusted,
+    so malformed values normalize to the safe mixed scope.
     """
 
-    view: str = "recent"
-    scope_kind: str | None = None
-    scope_value: str | None = None
+    view: str = VIEW_ALL
+    host_id: str | None = None
 
     def __post_init__(self) -> None:
-        view = (
-            self.view
-            if isinstance(self.view, str)
-            and self.view
-            in {
-                "recent",
-                "hosts",
-                "providers",
-            }
-            else "recent"
-        )
-        scope_kind = self.scope_kind
-        scope_value = sanitize(self.scope_value) if self.scope_value is not None else None
-        if view == "recent":
-            scope_kind = None
-            scope_value = None
-        elif not isinstance(scope_kind, str) or scope_kind not in {"host", "provider"}:
-            scope_kind = None
-            scope_value = None
-        elif (view == "hosts" and scope_kind != "host") or (
-            view == "providers" and scope_kind != "provider"
-        ):
-            scope_kind = None
-            scope_value = None
-        elif not scope_value:
-            scope_kind = None
-            scope_value = None
-        elif len(scope_value) > 256:
-            scope_kind = None
-            scope_value = None
-        elif scope_kind == "provider" and scope_value not in PROVIDER_LABELS:
-            scope_kind = None
-            scope_value = None
-
+        view = self.view if isinstance(self.view, str) and self.view in _VIEWS else VIEW_ALL
+        host_id = self.host_id
+        if view != VIEW_HOST:
+            host_id = None
+        elif not isinstance(host_id, str) or not _HOST_ID.fullmatch(host_id) or len(host_id) > 256:
+            view = VIEW_ALL
+            host_id = None
         object.__setattr__(self, "view", view)
-        object.__setattr__(self, "scope_kind", scope_kind)
-        object.__setattr__(self, "scope_value", scope_value)
+        object.__setattr__(self, "host_id", host_id)
 
     @property
     def nested(self) -> bool:
-        return self.scope_kind is not None and self.scope_value is not None
+        """Compatibility spelling; P8 has no nested browsing state."""
+
+        return False
 
     @property
     def is_default(self) -> bool:
-        return self.view == "recent" and not self.nested
+        return self.view == VIEW_ALL
 
     def root(self) -> NavigationState:
-        """Return the current top-level view without its group scope."""
+        """Return the safe root used by stale P7 continuation data."""
 
-        return NavigationState(self.view)
+        return NavigationState()
 
 
 @dataclass(frozen=True)
@@ -329,96 +305,149 @@ def _valid_sessions(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def _session_host(session: Mapping[str, Any]) -> str:
-    return sanitize(session.get("host") or session.get("hostId") or "local") or "local"
+    """Return the stable logical host id for a session row."""
+
+    return sanitize(session.get("hostId") or session.get("host") or "local") or "local"
 
 
-def _newest_session_timestamp(sessions: Sequence[Mapping[str, Any]]) -> float | None:
-    timestamps = [
-        timestamp
-        for timestamp in (_recency_timestamp(item.get("recencyAt")) for item in sessions)
-        if timestamp is not None
-    ]
-    return max(timestamps) if timestamps else None
+def _host_catalog(snapshot: Mapping[str, Any] | None) -> list[dict[str, object]]:
+    """Return the validated, ordered Host Mesh catalog from a snapshot."""
+
+    raw = snapshot.get("hostCatalog", []) if isinstance(snapshot, Mapping) else []
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, Mapping):
+            return []
+        host_id = item.get("hostId")
+        display = item.get("display")
+        if (
+            not isinstance(host_id, str)
+            or not _HOST_ID.fullmatch(host_id)
+            or len(host_id) > 256
+            or host_id.casefold() in seen
+            or not isinstance(display, str)
+            or not display
+            or len(display) > 16 * 1024
+            or any(unicodedata.category(char).startswith("C") for char in display)
+            or not isinstance(item.get("local"), bool)
+        ):
+            return []
+        seen.add(host_id.casefold())
+        result.append({"hostId": host_id, "display": display, "local": item["local"]})
+    if result and (
+        sum(item["local"] is True for item in result) != 1 or result[0]["local"] is not True
+    ):
+        return []
+    return result
 
 
-def _group_secondary(sessions: Sequence[Mapping[str, Any]], now: float | None = None) -> str:
-    count = len(sessions)
-    noun = "session" if count == 1 else "sessions"
-    parts = [f"{count} {noun}"]
-    active_count = sum(1 for item in sessions if item.get("active"))
-    if active_count:
-        parts.append(f"{active_count} active")
-    newest = _newest_session_timestamp(sessions)
-    parts.append(f"newest {_age(newest, now) if newest is not None else 'unknown'}")
-    return "  ·  ".join(parts)
+def _host_record(snapshot: Mapping[str, Any] | None, host_id: str) -> Mapping[str, Any] | None:
+    hosts = snapshot.get("hosts") if isinstance(snapshot, Mapping) else None
+    if not isinstance(hosts, Mapping):
+        return None
+    wanted = host_id.casefold()
+    for key, value in hosts.items():
+        if isinstance(key, str) and key.casefold() == wanted and isinstance(value, Mapping):
+            return value
+    return None
 
 
-def _host_groups(sessions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[str, list[Mapping[str, Any]]] = {}
-    for session in sessions:
-        grouped.setdefault(_session_host(session), []).append(session)
-
-    def sort_key(item: tuple[str, list[Mapping[str, Any]]]) -> tuple[object, ...]:
-        label, members = item
-        newest = _newest_session_timestamp(members)
-        return (
-            0 if newest is not None else 1,
-            -(newest or 0),
-            label.casefold(),
-            label,
-        )
-
-    return [
-        {"groupType": "host", "value": label, "label": label, "sessions": members}
-        for label, members in sorted(grouped.items(), key=sort_key)
-        if members
-    ]
+def _scope_host_id(snapshot: Mapping[str, Any] | None, navigation: NavigationState) -> str | None:
+    if navigation.view == VIEW_HOST:
+        return navigation.host_id
+    if navigation.view == VIEW_LOCAL:
+        local = next((item for item in _host_catalog(snapshot) if item["local"]), None)
+        return str(local["hostId"]) if local is not None else None
+    return None
 
 
-def _provider_groups(sessions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[str, list[Mapping[str, Any]]] = {kind: [] for kind in PROVIDER_ORDER}
-    for session in sessions:
-        kind = session.get("kind")
-        if kind in grouped:
-            grouped[kind].append(session)
-    return [
-        {
-            "groupType": "provider",
-            "value": kind,
-            "label": PROVIDER_LABELS[kind],
-            "sessions": members,
-        }
-        for kind in PROVIDER_ORDER
-        if (members := grouped[kind])
-    ]
+def _canonical_navigation(
+    snapshot: Mapping[str, Any] | None, navigation: NavigationState
+) -> NavigationState:
+    """Normalize a continuation scope against its immutable catalog."""
+
+    catalog = _host_catalog(snapshot)
+    if not catalog:
+        return NavigationState()
+    local = next((item for item in catalog if item["local"]), None)
+    remotes = [item for item in catalog if not item["local"]]
+    if not remotes:
+        return NavigationState(VIEW_LOCAL) if local is not None else NavigationState()
+    if navigation.view == VIEW_LOCAL:
+        return navigation if local is not None else NavigationState()
+    if navigation.view == VIEW_HOST:
+        wanted = (navigation.host_id or "").casefold()
+        match = next((item for item in catalog if str(item["hostId"]).casefold() == wanted), None)
+        if match is not None:
+            return (
+                NavigationState(VIEW_LOCAL)
+                if match["local"]
+                else NavigationState(VIEW_HOST, str(match["hostId"]))
+            )
+    return NavigationState()
+
+
+def _scope_ring(snapshot: Mapping[str, Any] | None) -> list[NavigationState]:
+    """Build the stable All/Local/remote peer ring from Host Mesh order."""
+
+    catalog = _host_catalog(snapshot)
+    if not catalog:
+        return [NavigationState()]
+    local = next((item for item in catalog if item["local"]), None)
+    remotes = [item for item in catalog if not item["local"]]
+    if not remotes:
+        return [NavigationState(VIEW_LOCAL)] if local is not None else [NavigationState()]
+    ring = (
+        [NavigationState(), NavigationState(VIEW_LOCAL)]
+        if local is not None
+        else [NavigationState()]
+    )
+    ring.extend(NavigationState(VIEW_HOST, str(item["hostId"])) for item in remotes)
+    return ring
 
 
 def _sessions_for_navigation(
-    sessions: Sequence[Mapping[str, Any]], navigation: NavigationState
+    sessions: Sequence[Mapping[str, Any]],
+    navigation: NavigationState,
+    snapshot: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if not navigation.nested:
-        return sorted((dict(item) for item in sessions), key=_session_sort_key)
-    if navigation.scope_kind == "host":
-        return sorted(
-            (dict(item) for item in sessions if _session_host(item) == navigation.scope_value),
-            key=_session_sort_key,
+    """Select leaf rows by logical scope and sort them newest-first."""
+
+    host_id = _scope_host_id(snapshot, navigation)
+    if host_id is None:
+        rows = sessions
+    else:
+        host = _host_record(snapshot, host_id)
+        candidate = host.get("sessions") if host is not None else None
+        rows = (
+            (item for item in candidate if _session_host(item).casefold() == host_id.casefold())
+            if isinstance(candidate, list)
+            else ()
         )
-    return sorted(
-        (dict(item) for item in sessions if item.get("kind") == navigation.scope_value),
-        key=_session_sort_key,
-    )
+    # Host records are independently persisted; reapply the same leaf-row
+    # validation as the flattened snapshot before rendering a scoped list.
+    validated = _valid_sessions({"sessions": list(rows)})
+    return sorted(validated, key=_session_sort_key)
 
 
-def _breadcrumb(navigation: NavigationState) -> str:
-    view_label = navigation.view.title()
-    pieces = ["Agents", view_label]
-    if navigation.nested:
-        if navigation.scope_kind == "provider":
-            label = PROVIDER_LABELS.get(navigation.scope_value or "", navigation.scope_value or "")
-        else:
-            label = navigation.scope_value or ""
-        pieces.append(sanitize(label))
-    return " › ".join(sanitize(piece) for piece in pieces)
+def _breadcrumb(navigation: NavigationState, snapshot: Mapping[str, Any] | None = None) -> str:
+    if navigation.view == VIEW_ALL:
+        label = "All"
+    elif navigation.view == VIEW_LOCAL:
+        label = "Local"
+    else:
+        label = next(
+            (
+                str(item["display"])
+                for item in _host_catalog(snapshot)
+                if str(item["hostId"]).casefold() == (navigation.host_id or "").casefold()
+            ),
+            navigation.host_id or "Host",
+        )
+    return "Agents › " + sanitize(label)
 
 
 def _navigation_data(navigation: NavigationState) -> str:
@@ -426,15 +455,14 @@ def _navigation_data(navigation: NavigationState) -> str:
         "version": NAVIGATION_DATA_VERSION,
         "view": navigation.view,
     }
-    if navigation.nested:
-        payload["scopeType"] = navigation.scope_kind
-        payload["scopeValue"] = navigation.scope_value
+    if navigation.view == VIEW_HOST:
+        payload["hostId"] = navigation.host_id
     encoded = quote(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), safe="")
     return NAVIGATION_DATA_PREFIX + encoded
 
 
 def _parse_navigation_state(value: object) -> NavigationState:
-    """Decode navigation state while accepting older refresh-only data."""
+    """Decode P8 state and safely collapse stale P7 state to a flat scope."""
 
     if not isinstance(value, str):
         return NavigationState()
@@ -450,25 +478,26 @@ def _parse_navigation_state(value: object) -> NavigationState:
             return NavigationState()
         if not isinstance(payload, Mapping):
             return NavigationState()
-        version = payload.get("version", NAVIGATION_DATA_VERSION)
-        if (
-            not isinstance(version, int)
-            or isinstance(version, bool)
-            or version != NAVIGATION_DATA_VERSION
-        ):
+        version = payload.get("version", 1)
+        if isinstance(version, bool) or not isinstance(version, int):
             return NavigationState()
         view = payload.get("view")
-        if not isinstance(view, str) or view not in {"recent", "hosts", "providers"}:
+        if version == 1:
+            # P7's Recent root and Providers root have no P8 equivalent.  A
+            # P7 host scope is retained only when its old displayed value is
+            # a safe logical id; the catalog resolves it later.
+            if view == "hosts" and payload.get("scopeType") == "host":
+                old_value = payload.get("scopeValue")
+                return NavigationState(VIEW_HOST, old_value if isinstance(old_value, str) else None)
             return NavigationState()
-        scope_kind = payload.get("scopeType")
-        scope_value = payload.get("scopeValue")
-        if not isinstance(scope_kind, str) or not isinstance(scope_value, str):
+        if version != NAVIGATION_DATA_VERSION or not isinstance(view, str):
+            return NavigationState()
+        if view == VIEW_HOST:
+            host_id = payload.get("hostId")
+            return NavigationState(view, host_id if isinstance(host_id, str) else None)
+        if view in {VIEW_ALL, VIEW_LOCAL} and "hostId" not in payload:
             return NavigationState(view)
-        if scope_kind == "host" and view == "hosts":
-            return NavigationState(view, scope_kind, scope_value)
-        if scope_kind == "provider" and view == "providers":
-            return NavigationState(view, scope_kind, scope_value)
-        return NavigationState(view)
+        return NavigationState()
     return NavigationState()
 
 
@@ -533,21 +562,6 @@ def _row_display(session: Mapping[str, Any], now: float | None = None) -> str:
         f"<b>{_pango_escape(name)}</b>"
         f'{ROW_SEPARATOR}<span size="smaller" alpha="75%">'
         f"{_pango_escape(secondary)}</span>"
-    )
-
-
-def _group_display(group: Mapping[str, Any], now: float | None = None) -> str:
-    """Return the two-line Pango presentation for a host/provider group."""
-
-    label = sanitize(group.get("label") or "Group")
-    members = group.get("sessions", [])
-    if not isinstance(members, Sequence):
-        members = []
-    sessions = [item for item in members if isinstance(item, Mapping)]
-    return (
-        f'<b>{_pango_escape(label)}</b><span alpha="60%">  ›</span>'
-        f'{ROW_SEPARATOR}<span size="smaller" alpha="75%">'
-        f"{_pango_escape(_group_secondary(sessions, now))}</span>"
     )
 
 
@@ -685,6 +699,7 @@ def _render_continuation(
     *,
     navigation: NavigationState | None = None,
     preserve: bool = False,
+    preserve_filter: bool = False,
     clear_message: bool = True,
     continuation: bool = True,
 ) -> str:
@@ -718,6 +733,7 @@ def _render_continuation(
         snapshot,
         message=message,
         preserve=preserve,
+        keep_filter=True if preserve_filter else None,
         timeout=timeout,
         refresh_deadline=active.refresh_deadline,
         error_deadline=active.error_deadline,
@@ -740,23 +756,31 @@ def render_snapshot(
     error_deadline: float | None = None,
     clear_message: bool = False,
     navigation: NavigationState | None = None,
+    keep_filter: bool | None = None,
+    keep_selection: bool | None = None,
 ) -> str:
     """Render a snapshot as Rofi script headers and rows."""
 
     navigation_was_provided = navigation is not None
-    navigation = navigation or NavigationState()
+    navigation = _canonical_navigation(snapshot, navigation or NavigationState())
     sessions = _valid_sessions(snapshot)
     headers = [
-        _protocol("prompt", _breadcrumb(navigation)),
+        _protocol("prompt", _breadcrumb(navigation, snapshot)),
         _protocol("no-custom", "true"),
         _protocol("use-hot-keys", "true"),
         _protocol("markup-rows", "true"),
     ]
-    if preserve or selected is not None:
+    if keep_filter is None:
+        keep_filter = preserve
+    if keep_selection is None:
+        keep_selection = preserve or selected is not None
+    if keep_selection:
         # Rofi preserves the current filter and cursor across a script
         # callback when these headers are present.  This is especially useful
         # when a stale selection failed to open.
-        headers.extend([_protocol("keep-selection", "true"), _protocol("keep-filter", "true")])
+        headers.append(_protocol("keep-selection", "true"))
+    if keep_filter:
+        headers.append(_protocol("keep-filter", "true"))
     effective_message = sanitize(message)
     if not effective_message and isinstance(snapshot, Mapping) and not clear_message:
         effective_message = summarize_errors(snapshot.get("errors", []))
@@ -789,83 +813,54 @@ def render_snapshot(
     elif navigation_was_provided:
         # Continuation callbacks without a timeout (navigation and opening
         # failures) still need to carry the active scope to the next callback.
-        # Explicitly emit ``idle`` for Recent so an older nested value cannot
+        # Explicitly emit ``idle`` for All so stale continuation data cannot
         # leak across a root transition if Rofi retains the previous data.
         headers.append(_protocol("data", _refresh_data(navigation=navigation)))
 
     rendered_rows: list[str] = []
     emitted = 0
-    if navigation.nested or navigation.view == "recent":
-        rows = _sessions_for_navigation(sessions, navigation)
-        for session in rows:
-            kind = str(session.get("kind") or "")
-            info = selection_payload(session)
-            search_metadata = " ".join(
-                (
-                    *(
-                        sanitize(session.get(field) or "")
-                        for field in (
-                            "name",
-                            "kind",
-                            "host",
-                            "windowHost",
-                            "connectHost",
-                            "cwd",
-                            "activityState",
-                        )
-                    ),
-                    PROVIDER_LABELS[kind],
-                    PROVIDER_SEARCH_TERMS[kind],
-                )
+    rows = _sessions_for_navigation(sessions, navigation, snapshot)
+    for session in rows:
+        kind = str(session.get("kind") or "")
+        info = selection_payload(session)
+        search_metadata = " ".join(
+            (
+                *(
+                    sanitize(session.get(field) or "")
+                    for field in (
+                        "name",
+                        "kind",
+                        "host",
+                        "hostId",
+                        "windowHost",
+                        "connectHost",
+                        "cwd",
+                        "activityState",
+                    )
+                ),
+                PROVIDER_LABELS[kind],
+                PROVIDER_SEARCH_TERMS[kind],
             )
-            options: list[tuple[str, object]] = [
-                ("info", info),
-                ("meta", search_metadata),
-                ("icon", _provider_icon(kind)),
-                ("display", _row_display(session, now)),
-            ]
-            if session.get("active"):
-                options.append(("active", "true"))
-            rendered_rows.append(_row_text(session, now) + _row_options(options))
-            emitted += 1
-    else:
-        groups = (
-            _host_groups(sessions) if navigation.view == "hosts" else _provider_groups(sessions)
         )
-        for group in groups:
-            group_type = str(group["groupType"])
-            value = str(group["value"])
-            label = sanitize(group.get("label") or value)
-            info = json.dumps(
-                {
-                    "type": "group",
-                    "groupType": group_type,
-                    "value": value,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            if group_type == "provider":
-                search_metadata = " ".join(
-                    (label, value, PROVIDER_LABELS[value], PROVIDER_SEARCH_TERMS[value])
-                )
-                icon = _provider_icon(value)
-            else:
-                search_metadata = " ".join((label, "host", "hosts"))
-                icon = HOST_GROUP_ICON
-            options = [
-                ("info", info),
-                ("meta", search_metadata),
-                ("icon", icon),
-                ("display", _group_display(group, now)),
-            ]
-            if any(bool(item.get("active")) for item in group["sessions"]):
-                options.append(("active", "true"))
-            rendered_rows.append(label + _row_options(options))
-            emitted += 1
+        options: list[tuple[str, object]] = [
+            ("info", info),
+            ("meta", search_metadata),
+            ("icon", _provider_icon(kind)),
+            ("display", _row_display(session, now)),
+        ]
+        if session.get("active"):
+            options.append(("active", "true"))
+        rendered_rows.append(_row_text(session, now) + _row_options(options))
+        emitted += 1
 
     if emitted == 0:
-        status = "No agent sessions found"
+        scope_host = _scope_host_id(snapshot, navigation)
+        if scope_host is not None:
+            status = "No agent sessions on " + _breadcrumb(navigation, snapshot).removeprefix(
+                "Agents › "
+            )
+        else:
+            status = "No agent sessions found"
         if effective_message:
             status = "No sessions · " + effective_message
         rendered_rows.append(status + _row_options([("nonselectable", "true"), ("urgent", "true")]))
@@ -946,33 +941,8 @@ def _parse_selection(raw: str | None) -> dict[str, Any]:
     return payload
 
 
-def _parse_group_selection(raw: str | None) -> dict[str, Any]:
-    if not raw:
-        raise engine.PickerError("Rofi did not provide a group selection")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise engine.PickerError("Rofi group metadata is invalid") from exc
-    if not isinstance(payload, dict) or payload.get("type") != "group":
-        raise engine.PickerError("Rofi group metadata is incomplete")
-    group_type = payload.get("groupType")
-    value = payload.get("value")
-    if (
-        not isinstance(group_type, str)
-        or group_type not in {"host", "provider"}
-        or not isinstance(value, str)
-        or not value
-    ):
-        raise engine.PickerError("Rofi group metadata is incomplete")
-    if any(char in value for char in "\x00\n\r\t") or len(value) > 256:
-        raise engine.PickerError("Rofi group contains invalid text")
-    if group_type == "provider" and value not in PROVIDER_LABELS:
-        raise engine.PickerError("Rofi group contains an invalid provider")
-    return payload
-
-
 def _parse_row_selection(raw: str | None) -> tuple[str, dict[str, Any]]:
-    """Parse typed row metadata without ever deriving identity from display text."""
+    """Parse a leaf row; group metadata is no longer a valid action target."""
 
     if raw:
         try:
@@ -980,47 +950,24 @@ def _parse_row_selection(raw: str | None) -> tuple[str, dict[str, Any]]:
         except json.JSONDecodeError:
             payload = None
         if isinstance(payload, dict) and payload.get("type") == "group":
-            return "group", _parse_group_selection(raw)
+            raise engine.PickerError("Rofi group rows are no longer actionable")
     return "session", _parse_selection(raw)
 
 
-def _enter_group(
-    navigation: NavigationState,
-    group: Mapping[str, Any],
+def _cycled_scope(
     snapshot: Mapping[str, Any] | None,
+    navigation: NavigationState,
+    direction: int,
 ) -> NavigationState:
-    """Validate a selected root group against the current snapshot."""
+    """Wrap through stable Host Mesh scopes without doing discovery."""
 
-    group_type = group.get("groupType")
-    value = group.get("value")
-    if (
-        navigation.nested
-        or not isinstance(group_type, str)
-        or group_type
-        not in {
-            "host",
-            "provider",
-        }
-    ):
-        raise engine.PickerError("selected group is not available in this view")
-    if group_type == "host" and navigation.view != "hosts":
-        raise engine.PickerError("selected host is not available in this view")
-    if group_type == "provider" and navigation.view != "providers":
-        raise engine.PickerError("selected provider is not available in this view")
-    sessions = _valid_sessions(snapshot)
-    groups = _host_groups(sessions) if group_type == "host" else _provider_groups(sessions)
-    if not any(item.get("value") == value for item in groups):
-        raise engine.PickerError("selected group is no longer available")
-    return NavigationState(navigation.view, group_type, value)
-
-
-def _cycled_root(navigation: NavigationState, direction: int) -> NavigationState:
-    views = ("recent", "hosts", "providers")
+    ring = _scope_ring(snapshot)
+    current = _canonical_navigation(snapshot, navigation)
     try:
-        index = views.index(navigation.view)
+        index = ring.index(current)
     except ValueError:
         index = 0
-    return NavigationState(views[(index + direction) % len(views)])
+    return ring[(index + direction) % len(ring)]
 
 
 def _open_selection(
@@ -1150,6 +1097,8 @@ def _render_error_notice(
     refresh_deadline: float | None = None,
     error_deadline: float | None = None,
     navigation: NavigationState | None = None,
+    keep_filter: bool | None = None,
+    keep_selection: bool | None = None,
 ) -> str:
     """Render a user-visible error with a bounded, self-clearing timeout."""
 
@@ -1163,33 +1112,8 @@ def _render_error_notice(
         clear_message=True,
         continuation=continuation,
         navigation=navigation,
-    )
-
-
-def _escape_error_output(
-    state: ContinuationState,
-    message: str,
-    *,
-    refresh_deadline: float | None = None,
-) -> str:
-    """Recover a nested Escape callback without depending on the model.
-
-    Rofi invokes the script again for custom callbacks.  A configuration or
-    model failure must not leave the continuation scoped to a group that can
-    no longer be rendered: pressing Escape again would otherwise repeat the
-    same failure forever.  Root Escape is handled before setup and returns no
-    rows, so this helper only emits the enclosing root for a nested state.
-    """
-
-    if not state.navigation.nested:
-        return ""
-    return _render_error_notice(
-        None,
-        message,
-        preserve=True,
-        continuation=True,
-        refresh_deadline=refresh_deadline,
-        navigation=state.navigation.root(),
+        keep_filter=keep_filter,
+        keep_selection=keep_selection,
     )
 
 
@@ -1417,25 +1341,17 @@ def run_rofi(
     except ValueError:
         retv = 0
 
+    if retv == ROFI_RETV_CUSTOM_6:
+        # Escape is native in the managed invocation.  Keep this immediate
+        # return as a migration guard for an older binding that still routed
+        # it through script mode; no cache/model/config work is safe here.
+        return 0
     continuation_state = _parse_continuation_state(environ.get("ROFI_DATA"))
     navigation = continuation_state.navigation
-    if retv == ROFI_RETV_CUSTOM_6 and not navigation.nested:
-        # Escape is an unconditional root-level exit, including when loading
-        # the configuration would otherwise produce an error row.
-        return 0
     store = store or CacheStore()
     try:
         config = config or load_config()
     except Exception as exc:  # noqa: BLE001 - visible Rofi configuration boundary
-        if retv == ROFI_RETV_CUSTOM_6:
-            rendered = _escape_error_output(
-                continuation_state,
-                f"Configuration failed: {sanitize(exc)}",
-                refresh_deadline=continuation_state.active().refresh_deadline,
-            )
-            if rendered:
-                print(rendered, end="")
-            return 0
         if retv == ROFI_RETV_CUSTOM_19:
             now = time.time()
             active = continuation_state.active(now)
@@ -1484,10 +1400,40 @@ def run_rofi(
         print(rendered, end="")
         return 0
 
+    if retv in {ROFI_RETV_CUSTOM_2, ROFI_RETV_CUSTOM_3}:
+        # Left/Right is deliberately cache-only.  Do not prepare Host Mesh,
+        # provider clients, or a presentation context just to change the
+        # immutable scope ring.  Preserve the filter, but let Rofi reset its
+        # cursor for the newly rendered leaf list.
+        direction = 1 if retv == ROFI_RETV_CUSTOM_2 else -1
+        next_navigation = _cycled_scope(None, navigation, direction)
+        try:
+            snapshot = _presentation_snapshot(store, config)
+            next_navigation = _cycled_scope(snapshot, navigation, direction)
+            rendered = _render_continuation(
+                snapshot,
+                continuation_state,
+                navigation=next_navigation,
+                preserve_filter=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - structural callback boundary
+            rendered = _render_error_notice(
+                None,
+                f"Navigation failed: {sanitize(exc)}",
+                preserve=False,
+                continuation=True,
+                refresh_deadline=continuation_state.active().refresh_deadline,
+                navigation=next_navigation,
+                keep_filter=True,
+                keep_selection=False,
+            )
+        print(rendered, end="")
+        return 0
+
     # Parse a selected row before preparing Host Mesh or loading the model so
     # an option-backed existing session can take the bounded Tmux fast path.
-    # Group selections and rows without current option evidence continue
-    # through the normal context setup below.
+    # Rows without current option evidence continue through the normal context
+    # setup below.
     preselected: dict[str, Any] | None = None
     preselected_type = "session"
     preselection_error: Exception | None = None
@@ -1509,15 +1455,6 @@ def run_rofi(
     try:
         context = _presentation_context(store, config)
     except Exception as exc:  # noqa: BLE001 - private model boundary
-        if retv == ROFI_RETV_CUSTOM_6:
-            rendered = _escape_error_output(
-                continuation_state,
-                f"Model setup failed: {sanitize(exc)}",
-                refresh_deadline=continuation_state.active().refresh_deadline,
-            )
-            if rendered:
-                print(rendered, end="")
-            return 0
         print(
             _render_error_notice(
                 None,
@@ -1536,15 +1473,6 @@ def run_rofi(
     # callback, including structural navigation and a selected row, before
     # any callback can silently render an empty untyped list.
     if context is not None and context.error:
-        if retv == ROFI_RETV_CUSTOM_6:
-            rendered = _escape_error_output(
-                continuation_state,
-                f"Contract refresh failed: {sanitize(context.error)}",
-                refresh_deadline=continuation_state.active().refresh_deadline,
-            )
-            if rendered:
-                print(rendered, end="")
-            return 0
         try:
             snapshot = _presentation_snapshot(store, config, context)
             if snapshot is None:
@@ -1621,18 +1549,6 @@ def run_rofi(
                 raise preselection_error
             if selected is None:
                 row_type, selected = _parse_row_selection(environ.get("ROFI_INFO"))
-            if row_type == "group":
-                snapshot = _presentation_snapshot(store, config, context)
-                next_navigation = _enter_group(navigation, selected, snapshot)
-                print(
-                    _render_continuation(
-                        snapshot,
-                        continuation_state,
-                        navigation=next_navigation,
-                    ),
-                    end="",
-                )
-                return 0
             if fast_error is not None:
                 raise fast_error
             _open_selection(selected, config, store=store, context=context)
@@ -1643,11 +1559,10 @@ def run_rofi(
                 snapshot = _presentation_snapshot(store, config, context)
             except Exception:  # noqa: BLE001 - preserve the original callback error
                 snapshot = None
-            operation = "open session" if row_type == "session" else "navigate"
             print(
                 _render_error_notice(
                     snapshot,
-                    message=f"Unable to {operation}: {sanitize(exc)}",
+                    message=f"Unable to open session: {sanitize(exc)}",
                     preserve=True,
                     continuation=True,
                     refresh_deadline=continuation_state.active().refresh_deadline,
@@ -1656,55 +1571,6 @@ def run_rofi(
                 end="",
             )
             return 0
-
-    if retv in {ROFI_RETV_CUSTOM_2, ROFI_RETV_CUSTOM_3, ROFI_RETV_CUSTOM_4, ROFI_RETV_CUSTOM_5}:
-        # Horizontal navigation always changes the top-level lens.  Nested
-        # groups therefore switch directly to the adjacent root and discard
-        # their scope, filter, and cursor while retaining live continuation
-        # state.  Custom 4/5 remain accepted for old/manual invocations, but
-        # are intentionally unadvertised: supported bindings leave Tab and
-        # Shift+Tab as Rofi's normal row navigation.
-        direction = 1 if retv in {ROFI_RETV_CUSTOM_2, ROFI_RETV_CUSTOM_4} else -1
-        next_navigation = _cycled_root(navigation, direction)
-        try:
-            snapshot = _presentation_snapshot(store, config, context)
-            rendered = _render_continuation(
-                snapshot,
-                continuation_state,
-                navigation=next_navigation,
-            )
-        except Exception as exc:  # noqa: BLE001 - structural callback boundary
-            rendered = _render_error_notice(
-                None,
-                f"Navigation failed: {sanitize(exc)}",
-                preserve=True,
-                continuation=True,
-                refresh_deadline=continuation_state.active().refresh_deadline,
-                navigation=next_navigation,
-            )
-        print(rendered, end="")
-        return 0
-
-    if retv == ROFI_RETV_CUSTOM_6:
-        # Escape is Back inside a group and Exit at a root.  Returning no
-        # records is the Rofi script-mode close signal, so do not render a
-        # replacement list for the root case.
-        next_navigation = navigation.root()
-        try:
-            snapshot = _presentation_snapshot(store, config, context)
-            rendered = _render_continuation(
-                snapshot,
-                continuation_state,
-                navigation=next_navigation,
-            )
-        except Exception as exc:  # noqa: BLE001 - Escape must always recover
-            rendered = _escape_error_output(
-                continuation_state,
-                f"Unable to return to group root: {sanitize(exc)}",
-                refresh_deadline=continuation_state.active().refresh_deadline,
-            )
-        print(rendered, end="")
-        return 0
 
     if retv == ROFI_RETV_CUSTOM_19:
         try:
