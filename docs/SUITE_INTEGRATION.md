@@ -2,18 +2,14 @@
 
 Status: the P7 contract-only cutover and guarded-open performance follow-up are
 complete in version `0.3.0`; the P8 flat-scope navigation implementation is
-complete in source version `0.4.0`. Managed publication, Starship deployment,
-and operator acceptance for P8 remain a coordinated follow-up. Agent Plus consumes
-Tmux Session v1 through its public process contract on every product path; Tmux
-Plus is mandatory. It consumes Host Mesh v1 when SSH Plus is available and
-otherwise uses the shared local-only identity with a `null` Mesh revision. A
-present malformed or unsupported companion is visible and never enables a
-fallback. Tmux Plus retains generic rename/kill ownership; Agent Plus has no
-rename/kill action.
-
-The managed runtime remains on P7 until the coordinated P8 cutover; this
-document describes the P8 source contract and implementation without claiming
-deployment.
+complete in version `0.4.0`. P8 is published and pinned for coordinated managed
+deployment; host-specific rollout and operator acceptance are tracked by the
+deployment owner. Agent Plus consumes Tmux Session v1 through its public
+process contract on every product path; Tmux Plus is mandatory. It consumes
+Host Mesh v1 when SSH Plus is available and otherwise uses the shared
+local-only identity with a `null` Mesh revision. A present malformed or
+unsupported companion is visible and never enables a fallback. Tmux Plus
+retains generic rename/kill ownership; Agent Plus has no rename/kill action.
 
 ## Target ownership
 
@@ -43,7 +39,7 @@ The integration boundaries are versioned process contracts:
 Agent Plus does not import another repository's Python modules or read its
 private configuration, history, health, or cache files.
 
-## P8 flat-scope navigation (implemented in source)
+## P8 flat-scope navigation
 
 P8 removes Agent Plus's `Hosts` and `Providers` browsing roots and all group
 rows. The normal picker contains only agent-session leaves in a flat host-scope
@@ -76,9 +72,7 @@ cancel action. Neither cancellation key is a script callback.
 
 P8 changes only presentation and interaction. Agent discovery and correlation,
 Host Mesh v1, Tmux Session v1, stable typed selection identity, and guarded
-lifecycle operations remain unchanged. The managed P7 interaction description
-below remains authoritative for the deployed runtime until the coordinated P8
-cutover.
+lifecycle operations remain unchanged.
 
 The canonical `rofi-ssh-plus`, `rofi-tmux-plus`, and `rofi-agent-plus`
 commands are resolved through `PATH`. A suite deployment installs public
@@ -97,8 +91,7 @@ Agent Plus remains authoritative for:
 - correlation between native provider sessions and tmux panes/options;
 - waiting-session reuse and title-derived, collision-free provider wrapper
   names; and
-- the P8 flat host-scope presentation in source; the managed runtime remains on
-  the P7 `Recent`, `Hosts`, and `Providers` presentation until cutover.
+- the P8 flat host-scope presentation.
 
 SSH Plus must not know provider commands. Tmux Plus may carry generic pane
 metadata and requested tmux `@` options but must not assign meaning to them.
@@ -419,7 +412,7 @@ option are revalidated before any action. Tmux Plus avoids the unnecessary
 model reload on a successful exact-reference open, and SSH Plus's managed
 prelaunch path is implemented without weakening route fallback or
 successful-connection history semantics. The coordinated sources passed their
-automated gates, were pinned and deployed to Starship, and passed operator
-acceptance for the exercised local and remote paths. The table remains a
-diagnostic pre-P7 baseline rather than an API guarantee or latency SLA; there
-is no open P7 performance gate.
+automated gates, were pinned and deployed through the managed configuration,
+and passed operator acceptance for the exercised local and remote paths. The
+table remains a diagnostic pre-P7 baseline rather than an API guarantee or
+latency SLA; there is no open P7 performance gate.
