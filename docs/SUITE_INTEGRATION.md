@@ -158,11 +158,25 @@ separate from both identities.
 
 When the selected provider session already has a compatible tmux reference:
 
-1. Revalidate provider state as required by that provider.
-2. Call `rofi-tmux-plus open` with mesh revision, host ID, server generation,
-   session ID, and creation time. The observed name is not an open precondition.
-3. On `stale_session`, refresh correlation and retry only if the same provider
-   session maps unambiguously to a new reference.
+1. If discovery proved the association with the exact provider tmux option,
+   call `rofi-tmux-plus open` early with mesh revision, host ID, server
+   generation, session ID, creation time, the observed name when present, and
+   `--require-option OPTION=PROVIDER_ID`. Tmux Plus checks every precondition
+   before focusing or launching.
+2. On an explicit no-action `stale_session`, `session_not_found`,
+   `stale_mesh`, or compatibility `invalid_input`, discard the fast attempt
+   and continue once through the normal selected-host revalidation. A
+   timeout, malformed response, ambiguous nonzero result, `operation_failed`,
+   or `launch_failed` is rendered as an error and is never retried because it
+   could follow a successful action.
+3. Process-only associations, retained rows without option proof, incomplete
+   or stale references, and rows without a tmux session use the existing full
+   provider/host revalidation path. The option-backed marker is typed JSON and
+   is not derived from visible row text or raw cached option metadata.
+   Local-only selections with a `null` Mesh revision also remain on this full
+   path because omitting `--mesh-revision` is unpinned at the Tmux boundary,
+   not a local-only assertion. A non-null Mesh revision is required for the
+   early guarded open.
 
 When no compatible tmux session exists:
 

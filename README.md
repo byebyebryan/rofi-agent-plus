@@ -78,6 +78,19 @@ selection uses Tmux Plus to focus or launch the terminal, or to create a
 deferred provider-resume wrapper with typed provider options. Icon provenance
 and trademark notes are in [`ASSETS.md`](ASSETS.md).
 
+When discovery correlated a session through its exact provider tmux option,
+the row carries a private `providerOptionVerified` marker. Selecting that row
+can use Tmux Plus's guarded `open --require-option` operation directly, which
+rechecks the complete stable reference, expected name when present, Mesh
+revision, and provider option before focusing or launching. Typed pre-action
+errors (`stale_session`, `session_not_found`, `stale_mesh`, or compatibility
+`invalid_input`) fall back once to the normal selected-host refresh. Ambiguous
+or potentially post-action failures never retry. Process-only, retained
+without proof, and create-path rows keep the full revalidation path.
+Local-only rows with a `null` Mesh revision also stay on full revalidation:
+omitting `--mesh-revision` is an unpinned Tmux request, not a local-only
+assertion.
+
 ## Configuration
 
 Configuration is optional and lives at

@@ -900,6 +900,12 @@ def _tmux_association(
             session.get("pending") is True or options.get("@agent_picker_waiting") == "1"
         )
         if options.get(option) == identifier:
+            # A required provider option is the only discovery evidence that
+            # can safely skip the expensive selected-host revalidation on
+            # open.  Process ancestry remains useful correlation evidence,
+            # but it is a transient observation and is deliberately not
+            # eligible for the guarded lifecycle fast path.
+            candidate["providerOptionVerified"] = True
             option_claims[key] = candidate
         for pane in panes:
             if not isinstance(pane, Mapping) or not _PANE_ID.fullmatch(
@@ -1501,7 +1507,13 @@ class ContractBackend:
                             {"host": host.host_id, "stage": "tmux", "message": _bounded_text(error)}
                         )
                 if association is not None:
-                    row["tmux"] = association
+                    tmux_reference = dict(association)
+                    option_verified = tmux_reference.pop("providerOptionVerified", None)
+                    if option_verified is True:
+                        row["providerOptionVerified"] = True
+                    else:
+                        row.pop("providerOptionVerified", None)
+                    row["tmux"] = tmux_reference
                     row["tmuxSession"] = association["observedName"]
                     if association["pending"] and not row.get("active"):
                         row["activityState"] = "waiting"

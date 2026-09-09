@@ -18,7 +18,7 @@ from typing import Protocol
 from . import engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig
-from .contract_backend import CommandOutput
+from .contract_backend import CommandOutput, select_backend
 
 _SCHEMA_VERSION = 1
 _CAPABILITY = "host-mesh-v1+tmux-session-v1"
@@ -307,6 +307,136 @@ def _run_json(
     return _success_response(output, host_id, revision, opening=opening)
 
 
+def _open_reference(
+    backend: _ContractBackend,
+    reference: StableReference,
+    deadline: float,
+    *,
+    required_option: tuple[str, str] | None = None,
+    expected_name: bool = False,
+) -> StableReference:
+    """Open one stable reference through the public Tmux contract.
+
+    ``required_option`` is used only by the discovery-proven fast path.  The
+    producer checks it before focusing or launching, so a missing or changed
+    provider option is a typed no-action failure.  The ordinary lifecycle path
+    intentionally keeps its historical no-precondition open call because it
+    has already performed a fresh selected-host revalidation.
+    """
+
+    argv = [
+        backend.tmux_command,
+        "open",
+        "--json",
+        "--host",
+        reference.host_id,
+    ]
+    if reference.mesh_revision is not None:
+        argv.extend(("--mesh-revision", reference.mesh_revision))
+    argv.extend(
+        (
+            "--server-generation",
+            reference.server_generation,
+            "--session-id",
+            reference.session_id,
+            "--created-at",
+            str(reference.created_at),
+        )
+    )
+    if expected_name and reference.observed_name is not None:
+        argv.extend(("--expected-name", reference.observed_name))
+    if required_option is not None:
+        option_name, option_value = required_option
+        argv.extend(("--require-option", f"{option_name}={option_value}"))
+    result = _run_json(
+        backend,
+        argv,
+        deadline,
+        reference.host_id,
+        reference.mesh_revision,
+        opening=True,
+    )
+    # Open may legitimately observe a new name, but it must never return a
+    # different stable tmux identity than the one this typed provider row
+    # selected.  Otherwise a malformed or confused producer response could be
+    # reconciled into the wrong provider cache entry.
+    if (
+        result.host_id,
+        result.mesh_revision,
+        result.server_generation,
+        result.session_id,
+        result.created_at,
+    ) != (
+        reference.host_id,
+        reference.mesh_revision,
+        reference.server_generation,
+        reference.session_id,
+        reference.created_at,
+    ):
+        raise LifecycleError("operation_failed", "Tmux Session open returned another session")
+    return result
+
+
+def fast_open_selection(
+    selection: Mapping[str, object],
+    *,
+    backend: _ContractBackend | None = None,
+    timeout: float = _LIFECYCLE_SECONDS,
+) -> None:
+    """Open an option-proven session without refreshing the Agent snapshot.
+
+    This is deliberately a narrow optimization.  The selection parser and
+    discovery backend mark a row eligible only when the provider's exact tmux
+    user option claimed the same provider ID.  Tmux Plus then revalidates that
+    option, the complete stable reference, and Mesh revision before any
+    action.  All other rows continue through :class:`ContractLifecycle`.
+    """
+
+    if selection.get("providerOptionVerified") is not True:
+        raise LifecycleError(
+            "operation_failed", "selected session lacks option-backed tmux evidence"
+        )
+    identity = _backend_identity(selection.get("backend"))
+    host_id = selection.get("hostId")
+    kind = selection.get("kind")
+    identifier = selection.get("id")
+    if (
+        not isinstance(host_id, str)
+        or not _HOST_ID.fullmatch(host_id)
+        or kind not in _PROVIDER_OPTIONS
+        or not isinstance(identifier, str)
+    ):
+        raise LifecycleError("operation_failed", "selected contract session is invalid")
+    if kind in {"codex", "claude"}:
+        valid_identifier = engine.UUID_PATTERN.fullmatch(identifier)
+    else:
+        valid_identifier = engine.OPENCODE_ID_PATTERN.fullmatch(identifier)
+    if valid_identifier is None:
+        raise LifecycleError("operation_failed", "selected provider session is invalid")
+    revision = identity["meshRevision"]
+    if revision is None:
+        # An omitted --mesh-revision is intentionally unpinned at the Tmux
+        # contract boundary.  Never turn a local-only/null authority into a
+        # fast action that could cross into a newly available Mesh.
+        raise LifecycleError(
+            "operation_failed", "null-authority sessions require full revalidation"
+        )
+    reference = _reference(selection.get("tmux"), host_id, revision)
+    selected_backend = backend or select_backend()
+    if not (
+        isinstance(getattr(selected_backend, "tmux_command", None), str)
+        and callable(getattr(selected_backend, "_run", None))
+    ):
+        raise LifecycleError("operation_failed", "contract lifecycle backend is unavailable")
+    _open_reference(
+        selected_backend,
+        reference,
+        time.monotonic() + timeout,
+        required_option=(_PROVIDER_OPTIONS[str(kind)][0], identifier),
+        expected_name=True,
+    )
+
+
 def _safe_wrapper_name(display_name: object, kind: str, identifier: str, attempt: int) -> str:
     cleaned = (
         re.sub(r"[^A-Za-z0-9_-]+", "-", display_name.strip()).strip("-_")
@@ -403,48 +533,7 @@ class ContractLifecycle:
         )
 
     def _open(self, selection: Mapping[str, object], reference: StableReference) -> StableReference:
-        argv = [
-            self.backend.tmux_command,
-            "open",
-            "--json",
-            "--host",
-            reference.host_id,
-            "--server-generation",
-            reference.server_generation,
-            "--session-id",
-            reference.session_id,
-            "--created-at",
-            str(reference.created_at),
-        ]
-        if reference.mesh_revision is not None:
-            argv[5:5] = ["--mesh-revision", reference.mesh_revision]
-        result = _run_json(
-            self.backend,
-            argv,
-            self.deadline,
-            reference.host_id,
-            reference.mesh_revision,
-            opening=True,
-        )
-        # Open may legitimately observe a new name, but it must never return
-        # a different stable tmux identity than the one this typed provider
-        # row selected.  Otherwise a malformed or confused producer response
-        # could be reconciled into the wrong provider cache entry.
-        if (
-            result.host_id,
-            result.mesh_revision,
-            result.server_generation,
-            result.session_id,
-            result.created_at,
-        ) != (
-            reference.host_id,
-            reference.mesh_revision,
-            reference.server_generation,
-            reference.session_id,
-            reference.created_at,
-        ):
-            raise LifecycleError("operation_failed", "Tmux Session open returned another session")
-        return result
+        return _open_reference(self.backend, reference, self.deadline)
 
     def _create(
         self, selection: Mapping[str, object], row: Mapping[str, object]

@@ -20,7 +20,7 @@ from urllib.parse import quote, unquote
 from . import engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig, load_config
-from .contract_lifecycle import ContractLifecycle
+from .contract_lifecycle import ContractLifecycle, LifecycleError, fast_open_selection
 
 ROFI_RETV_SELECTED = 1
 ROFI_RETV_CUSTOM_1 = 10
@@ -37,6 +37,9 @@ AUTO_REFRESH_MAX_SECONDS = 30
 AUTO_REFRESH_DATA_PREFIX = "background-refresh:"
 AUTO_REFRESH_IDLE_DATA = "idle"
 ERROR_NOTICE_SECONDS = 3
+FAST_OPEN_FALLBACK_CODES = frozenset(
+    {"stale_session", "session_not_found", "stale_mesh", "invalid_input"}
+)
 ERROR_NOTICE_DATA_PREFIX = "error-notice:"
 NAVIGATION_DATA_PREFIX = "navigation:"
 NAVIGATION_DATA_VERSION = 1
@@ -487,6 +490,16 @@ def selection_payload(session: Mapping[str, Any]) -> str:
             "backend": session.get("backend"),
         }
     )
+    verified = session.get("providerOptionVerified")
+    if verified is not None:
+        if not isinstance(verified, bool):
+            raise engine.PickerError("Rofi session has an invalid tmux evidence marker")
+        # Retained rows from a failed tmux stage are useful for display, but
+        # are not current option-backed evidence.  Do not let their marker
+        # re-enable the fast path on a later selection.
+        payload["providerOptionVerified"] = bool(
+            verified and not session.get("tmuxStale") and not session.get("tmuxAmbiguous")
+        )
     if "tmux" in session:
         payload["tmux"] = session["tmux"]
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -913,6 +926,9 @@ def _parse_selection(raw: str | None) -> dict[str, Any]:
     ):
         raise engine.PickerError("Rofi contract selection metadata is incomplete")
     tmux = payload.get("tmux")
+    verified = payload.get("providerOptionVerified")
+    if "providerOptionVerified" in payload and not isinstance(verified, bool):
+        raise engine.PickerError("Rofi contract tmux evidence marker is invalid")
     if tmux is not None:
         if (
             not isinstance(tmux, Mapping)
@@ -1023,6 +1039,38 @@ def _open_selection(
         else ContractLifecycle(store, config, context, timeout=timeout)
     )
     lifecycle.open_or_create(selection)
+
+
+def _try_fast_open(selection: Mapping[str, Any]) -> tuple[bool, Exception | None]:
+    """Attempt the guarded open for an option-backed existing session.
+
+    ``True`` means the Tmux action completed and Rofi can close.  A ``None``
+    error means the typed Tmux contract explicitly reported a no-action state
+    and the caller should continue through the normal full revalidation path.
+    Any other error is returned for rendering; retrying it could duplicate a
+    terminal focus or launch whose result was ambiguous.
+    """
+
+    if selection.get("providerOptionVerified") is not True or not isinstance(
+        selection.get("tmux"), Mapping
+    ):
+        return False, None
+    backend = selection.get("backend")
+    if not isinstance(backend, Mapping) or backend.get("meshRevision") is None:
+        # Omitting --mesh-revision is an unpinned Tmux request, not a
+        # local-only assertion.  Keep null-authority rows on the full path so
+        # a newly available SSH/Host Mesh contract cannot change authority
+        # between render and click.
+        return False, None
+    try:
+        fast_open_selection(selection)
+    except LifecycleError as error:
+        if error.code in FAST_OPEN_FALLBACK_CODES:
+            return False, None
+        return False, error
+    except Exception as error:  # noqa: BLE001 - fail closed at callback boundary
+        return False, error
+    return True, None
 
 
 def _background_command() -> list[str]:
@@ -1436,6 +1484,28 @@ def run_rofi(
         print(rendered, end="")
         return 0
 
+    # Parse a selected row before preparing Host Mesh or loading the model so
+    # an option-backed existing session can take the bounded Tmux fast path.
+    # Group selections and rows without current option evidence continue
+    # through the normal context setup below.
+    preselected: dict[str, Any] | None = None
+    preselected_type = "session"
+    preselection_error: Exception | None = None
+    fast_error: Exception | None = None
+    if retv == ROFI_RETV_SELECTED:
+        try:
+            preselected_type, preselected = _parse_row_selection(environ.get("ROFI_INFO"))
+        except Exception as exc:  # noqa: BLE001 - selected callback boundary
+            preselection_error = exc
+        else:
+            if preselected_type == "session":
+                completed, fast_error = _try_fast_open(preselected)
+                if completed:
+                    # Tmux Plus has already validated and opened this exact
+                    # reference.  No cache reconciliation is needed because
+                    # the reference itself did not change.
+                    return 0
+
     try:
         context = _presentation_context(store, config)
     except Exception as exc:  # noqa: BLE001 - private model boundary
@@ -1544,10 +1614,13 @@ def run_rofi(
         return 0
 
     if retv == ROFI_RETV_SELECTED:
-        selected: dict[str, Any] | None = None
-        row_type = "session"
+        selected = preselected
+        row_type = preselected_type
         try:
-            row_type, selected = _parse_row_selection(environ.get("ROFI_INFO"))
+            if preselection_error is not None:
+                raise preselection_error
+            if selected is None:
+                row_type, selected = _parse_row_selection(environ.get("ROFI_INFO"))
             if row_type == "group":
                 snapshot = _presentation_snapshot(store, config, context)
                 next_navigation = _enter_group(navigation, selected, snapshot)
@@ -1560,6 +1633,8 @@ def run_rofi(
                     end="",
                 )
                 return 0
+            if fast_error is not None:
+                raise fast_error
             _open_selection(selected, config, store=store, context=context)
             # No rows means Rofi closes after a successful action.
             return 0

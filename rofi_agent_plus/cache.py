@@ -117,12 +117,22 @@ def _merge_host_snapshot(
                 fresh["tmux"] = dict(old["tmux"])
                 fresh["tmuxSession"] = old.get("tmuxSession")
             if "tmux" in fresh:
+                if fresh.get("providerOptionVerified") is not True:
+                    fresh.pop("providerOptionVerified", None)
                 fresh["tmuxStale"] = True
+            else:
+                fresh.pop("providerOptionVerified", None)
             return
         if not current_had_tmux:
             fresh.pop("tmux", None)
             fresh.pop("tmuxSession", None)
             fresh.pop("tmuxStale", None)
+            fresh.pop("providerOptionVerified", None)
+        elif fresh.get("providerOptionVerified") is not True:
+            # The marker is inseparable from an option-backed association.
+            # In particular, a provider-stage retention merge can overlay a
+            # fresh process-only association on an older option-backed row.
+            fresh.pop("providerOptionVerified", None)
 
     if previous and isinstance(previous.get("sessions"), list):
         for old in previous["sessions"]:
@@ -158,6 +168,10 @@ def _merge_host_snapshot(
                 if "tmux" in fresh:
                     retained["tmux"] = fresh["tmux"]
                     retained["tmuxSession"] = fresh.get("tmuxSession")
+                    if fresh.get("providerOptionVerified") is True:
+                        retained["providerOptionVerified"] = True
+                    else:
+                        retained.pop("providerOptionVerified", None)
                 fresh.clear()
                 fresh.update(retained)
             elif preserve and fresh is None:

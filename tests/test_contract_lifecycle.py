@@ -18,6 +18,7 @@ from rofi_agent_plus.contract_lifecycle import (
     ContractLifecycle,
     LifecycleError,
     _success_response,
+    fast_open_selection,
 )
 from rofi_agent_plus.rofi import _open_selection, run_rofi, selection_payload
 
@@ -217,6 +218,111 @@ class ContractLifecycleTest(unittest.TestCase):
         self.assertEqual("renamed outside", cached["sessions"][0]["tmuxSession"])
         self.assertEqual(REVISION, cached["sessions"][0]["tmux"]["meshRevision"])
         self.assertEqual(context.backend, cached["backend"])
+
+    def test_fast_open_uses_exact_reference_name_revision_and_provider_option(self) -> None:
+        selected = self.selection()
+        selected["providerOptionVerified"] = True
+        selected["tmux"] = copy.deepcopy(row()["tmux"])
+        backend = FakeBackend([], [success(descriptor())])
+
+        fast_open_selection(selected, backend=backend)
+
+        self.assertEqual(1, len(backend.calls))
+        self.assertEqual(
+            [
+                "rofi-tmux-plus",
+                "open",
+                "--json",
+                "--host",
+                "alpha",
+                "--mesh-revision",
+                REVISION,
+                "--server-generation",
+                "tmux-v1:alpha",
+                "--session-id",
+                "$4",
+                "--created-at",
+                "5",
+                "--expected-name",
+                "old-name",
+                "--require-option",
+                f"@codex_thread_id={THREAD}",
+            ],
+            backend.calls[0][0],
+        )
+
+    def test_fast_open_rejects_null_authority_before_running_tmux(self) -> None:
+        local_backend = FakeBackend([], [])
+        local_backend.identity = {**BACKEND, "meshRevision": None}
+        selected = self.selection()
+        selected["backend"] = dict(local_backend.identity)
+        selected["providerOptionVerified"] = True
+        selected["tmux"] = {
+            **copy.deepcopy(row()["tmux"]),
+            "meshRevision": None,
+        }
+        local_response = success(descriptor())
+        local_response["meshRevision"] = None
+        local_backend._responses = [local_response]
+
+        with self.assertRaisesRegex(LifecycleError, "null-authority"):
+            fast_open_selection(selected, backend=local_backend)
+
+        self.assertEqual([], local_backend.calls)
+
+    def test_fast_open_derives_the_provider_option_from_kind_and_id(self) -> None:
+        identifiers = {
+            "codex": THREAD,
+            "claude": "22222222-2222-2222-2222-222222222222",
+            "opencode": "ses_0319af718ffegy8N1IoMEggx4B",
+        }
+        options = {
+            "codex": "@codex_thread_id",
+            "claude": "@claude_session_id",
+            "opencode": "@opencode_session_id",
+        }
+        for kind, identifier in identifiers.items():
+            with self.subTest(kind=kind):
+                selected = self.selection(kind)
+                selected["id"] = identifier
+                selected["providerOptionVerified"] = True
+                selected["tmux"] = copy.deepcopy(row()["tmux"])
+                backend = FakeBackend([], [success(descriptor())])
+
+                fast_open_selection(selected, backend=backend)
+
+                argv = backend.calls[0][0]
+                self.assertEqual(
+                    f"{options[kind]}={identifier}",
+                    argv[argv.index("--require-option") + 1],
+                )
+
+    def test_fast_open_rejects_rows_without_option_proof_before_running_tmux(self) -> None:
+        backend = FakeBackend([], [success(descriptor())])
+        selected = self.selection()
+        selected["tmux"] = copy.deepcopy(row()["tmux"])
+
+        with self.assertRaisesRegex(LifecycleError, "lacks option-backed"):
+            fast_open_selection(selected, backend=backend)
+        self.assertEqual([], backend.calls)
+
+    def test_fast_open_ambiguous_or_malformed_results_make_one_attempt(self) -> None:
+        selected = self.selection()
+        selected["providerOptionVerified"] = True
+        selected["tmux"] = copy.deepcopy(row()["tmux"])
+        malformed = CommandOutput((), 0, "not-json", "")
+        timed_out = CommandOutput((), 0, json.dumps(success(descriptor())), "", timed_out=True)
+        for response in (
+            (2, failure("operation_failed", "unknown result")),
+            (2, failure("launch_failed", "terminal failed")),
+            malformed,
+            timed_out,
+        ):
+            with self.subTest(response=response):
+                backend = FakeBackend([], [response])
+                with self.assertRaises(LifecycleError):
+                    fast_open_selection(selected, backend=backend)
+                self.assertEqual(1, len(backend.calls))
 
     def test_lifecycle_revalidates_only_the_selected_host(self) -> None:
         lifecycle, _store, backend, _context = self.harness([row()], [success(descriptor())])

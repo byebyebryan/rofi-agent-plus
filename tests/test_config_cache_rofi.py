@@ -14,8 +14,9 @@ from pathlib import Path
 from unittest import mock
 
 from rofi_agent_plus import VERSION, app, engine
-from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, build_snapshot
+from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, PresentationContext, build_snapshot
 from rofi_agent_plus.config import ConfigError, PickerConfig, config_from_mapping, load_config
+from rofi_agent_plus.contract_lifecycle import LifecycleError
 from rofi_agent_plus.rofi import (
     AUTO_REFRESH_DATA_PREFIX,
     ERROR_NOTICE_DATA_PREFIX,
@@ -1046,6 +1047,184 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual(payload, _parse_selection(json.dumps(payload)))
         with self.assertRaises(engine.PickerError):
             _parse_selection(json.dumps({"kind": "codex", "id": "bad"}))
+
+    def test_selection_parser_requires_a_boolean_option_evidence_marker(self) -> None:
+        payload = json.loads(selection_payload(session(providerOptionVerified=True)))
+        self.assertIs(payload["providerOptionVerified"], True)
+        self.assertIs(
+            _parse_selection(json.dumps(payload))["providerOptionVerified"],
+            True,
+        )
+        for invalid in (None, "true", 0, 1, [], {}):
+            malformed = dict(payload)
+            malformed["providerOptionVerified"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaises(engine.PickerError):
+                _parse_selection(json.dumps(malformed))
+
+    def test_stale_tmux_rows_cannot_export_option_evidence(self) -> None:
+        payload = json.loads(
+            selection_payload(
+                session(
+                    providerOptionVerified=True,
+                    tmuxStale=True,
+                    tmux={
+                        "meshRevision": None,
+                        "serverGeneration": "tmux-v1:local",
+                        "sessionId": "$4",
+                        "createdAt": 5,
+                        "observedName": "agent",
+                    },
+                )
+            )
+        )
+        self.assertIs(payload["providerOptionVerified"], False)
+
+    def test_option_backed_selection_fast_path_skips_model_and_cache_work(self) -> None:
+        selected = session(
+            backend={
+                "kind": "contract",
+                "capability": "host-mesh-v1+tmux-session-v1",
+                "meshRevision": "sha256:mesh-v1",
+            },
+            providerOptionVerified=True,
+            tmux={
+                "meshRevision": "sha256:mesh-v1",
+                "serverGeneration": "tmux-v1:remote",
+                "sessionId": "$4",
+                "createdAt": 5,
+                "observedName": "agent",
+            },
+        )
+        store = mock.Mock(spec=CacheStore)
+        with (
+            mock.patch("rofi_agent_plus.rofi.fast_open_selection") as fast_open,
+            mock.patch("sys.stdout", new=io.StringIO()),
+        ):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {"ROFI_RETV": "1", "ROFI_INFO": selection_payload(selected)},
+                    store=store,
+                    config=self._config(),
+                ),
+            )
+        fast_open.assert_called_once()
+        store.presentation_context.assert_not_called()
+        store.load_current.assert_not_called()
+        store.refresh.assert_not_called()
+
+    def test_null_authority_selection_skips_fast_path_and_uses_full_open(self) -> None:
+        selected = session(
+            providerOptionVerified=True,
+            tmux={
+                "meshRevision": None,
+                "serverGeneration": "tmux-v1:local",
+                "sessionId": "$4",
+                "createdAt": 5,
+                "observedName": "agent",
+            },
+        )
+        config = self._config()
+        context = PresentationContext(config.fingerprint, selected["backend"], selected=object())
+        store = mock.Mock(spec=CacheStore)
+        store.presentation_context.return_value = context
+        with (
+            mock.patch("rofi_agent_plus.rofi.fast_open_selection") as fast_open,
+            mock.patch("rofi_agent_plus.rofi._open_selection") as full_open,
+            mock.patch("sys.stdout", new=io.StringIO()),
+        ):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {"ROFI_RETV": "1", "ROFI_INFO": selection_payload(selected)},
+                    store=store,
+                    config=config,
+                ),
+            )
+        fast_open.assert_not_called()
+        full_open.assert_called_once()
+
+    def test_fast_path_safe_contract_errors_fall_back_once_to_full_open(self) -> None:
+        selected = session(
+            backend={
+                "kind": "contract",
+                "capability": "host-mesh-v1+tmux-session-v1",
+                "meshRevision": "sha256:mesh-v1",
+            },
+            providerOptionVerified=True,
+            tmux={
+                "meshRevision": "sha256:mesh-v1",
+                "serverGeneration": "tmux-v1:remote",
+                "sessionId": "$4",
+                "createdAt": 5,
+                "observedName": "agent",
+            },
+        )
+        context = PresentationContext(
+            self._config().fingerprint,
+            selected["backend"],
+            selected=object(),
+        )
+        for code in ("stale_session", "session_not_found", "stale_mesh", "invalid_input"):
+            with self.subTest(code=code):
+                store = mock.Mock(spec=CacheStore)
+                store.presentation_context.return_value = context
+                with (
+                    mock.patch(
+                        "rofi_agent_plus.rofi.fast_open_selection",
+                        side_effect=LifecycleError(code, "no action"),
+                    ),
+                    mock.patch("rofi_agent_plus.rofi._open_selection") as full_open,
+                    mock.patch("sys.stdout", new=io.StringIO()),
+                ):
+                    run_rofi(
+                        {"ROFI_RETV": "1", "ROFI_INFO": selection_payload(selected)},
+                        store=store,
+                        config=self._config(),
+                    )
+                full_open.assert_called_once()
+
+    def test_fast_path_ambiguous_error_never_retries_or_opens_full_path(self) -> None:
+        selected = session(
+            backend={
+                "kind": "contract",
+                "capability": "host-mesh-v1+tmux-session-v1",
+                "meshRevision": "sha256:mesh-v1",
+            },
+            providerOptionVerified=True,
+            tmux={
+                "meshRevision": "sha256:mesh-v1",
+                "serverGeneration": "tmux-v1:remote",
+                "sessionId": "$4",
+                "createdAt": 5,
+                "observedName": "agent",
+            },
+        )
+        context = PresentationContext(
+            self._config().fingerprint,
+            selected["backend"],
+            selected=object(),
+        )
+        store = mock.Mock(spec=CacheStore)
+        store.presentation_context.return_value = context
+        store.load_current.return_value = {"sessions": [selected], "errors": []}
+        output = io.StringIO()
+        with (
+            mock.patch(
+                "rofi_agent_plus.rofi.fast_open_selection",
+                side_effect=LifecycleError("operation_failed", "timed out"),
+            ) as fast_open,
+            mock.patch("rofi_agent_plus.rofi._open_selection") as full_open,
+            mock.patch("sys.stdout", output),
+        ):
+            run_rofi(
+                {"ROFI_RETV": "1", "ROFI_INFO": selection_payload(selected)},
+                store=store,
+                config=self._config(),
+            )
+        fast_open.assert_called_once()
+        full_open.assert_not_called()
+        self.assertIn("Unable to open session", output.getvalue())
 
     def test_initial_mode_refreshes_cache_and_alt_r_forces_refresh(self) -> None:
         store = mock.Mock(spec=CacheStore)

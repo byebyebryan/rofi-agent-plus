@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from rofi_agent_plus import engine
-from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, build_snapshot
+from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, _merge_host_snapshot, build_snapshot
 from rofi_agent_plus.codex import AppServerClient
 from rofi_agent_plus.config import PickerConfig
 from rofi_agent_plus.contract_backend import (
@@ -228,6 +228,28 @@ class InventoryContractTest(unittest.TestCase):
         assert association is not None
         self.assertEqual("$4", association["sessionId"])
         self.assertIsNone(association["observedName"])
+
+    def test_option_claims_mark_associations_but_process_only_claims_do_not(self) -> None:
+        host = copy.deepcopy(self.payload["hosts"][0])
+        association, error = _tmux_association(
+            host, "codex", THREAD, {"pid": 12345, "ancestors": [12345]}, "sha256:mesh-v1"
+        )
+        self.assertIsNone(error)
+        assert association is not None
+        self.assertIs(association["providerOptionVerified"], True)
+
+        process_only = copy.deepcopy(host)
+        process_only["sessions"][0]["options"]["@codex_thread_id"] = None
+        association, error = _tmux_association(
+            process_only,
+            "codex",
+            THREAD,
+            {"pid": 12345, "ancestors": [12345]},
+            "sha256:mesh-v1",
+        )
+        self.assertIsNone(error)
+        assert association is not None
+        self.assertNotIn("providerOptionVerified", association)
 
 
 class BackendSelectionAndTransportTest(unittest.TestCase):
@@ -767,7 +789,14 @@ class ContractBackendAssemblyTest(unittest.TestCase):
         self.assertEqual(2, len(rows))
         correlated = next(row for row in rows if row["id"] == THREAD)
         self.assertEqual("$4", correlated["tmux"]["sessionId"])
+        self.assertIs(correlated["providerOptionVerified"], True)
+        self.assertNotIn("providerOptionVerified", correlated["tmux"])
         self.assertEqual("active", correlated["activityState"])
+        rendered = render_snapshot({"sessions": [correlated], "errors": []})
+        info = rendered.split("\x00info\x1f", 1)[1].split("\x1fmeta\x1f", 1)[0]
+        selected = _parse_selection(info)
+        self.assertIs(selected["providerOptionVerified"], True)
+        self.assertNotIn("providerOptionVerified", selected["tmux"])
         outside = next(row for row in rows if row["id"].startswith("2222"))
         self.assertTrue(outside["active"])
         self.assertNotIn("tmux", outside)
@@ -860,6 +889,87 @@ class ContractBackendAssemblyTest(unittest.TestCase):
 class ContractCacheTest(unittest.TestCase):
     def setUp(self) -> None:
         self.config = PickerConfig(max_sessions=40)
+
+    def test_provider_retention_clears_old_option_proof_for_process_only_tmux(self) -> None:
+        old = {
+            "contractMode": True,
+            "hostId": "alpha",
+            "kind": "codex",
+            "id": THREAD,
+            "providerOptionVerified": True,
+            "tmux": {"sessionId": "$1"},
+            "tmuxSession": "old",
+        }
+        fresh = {
+            "contractMode": True,
+            "hostId": "alpha",
+            "kind": "codex",
+            "id": THREAD,
+            "tmux": {"sessionId": "$2"},
+            "tmuxSession": "new",
+        }
+        merged = _merge_host_snapshot(
+            {"sessions": [old]},
+            {
+                "sessions": [fresh],
+                "errors": [{"stage": "threads", "message": "provider unavailable"}],
+            },
+        )
+        row = merged["sessions"][0]
+        self.assertEqual("$2", row["tmux"]["sessionId"])
+        self.assertNotIn("providerOptionVerified", row)
+
+    def test_provider_retention_carries_fresh_option_proof(self) -> None:
+        old = {
+            "contractMode": True,
+            "hostId": "alpha",
+            "kind": "codex",
+            "id": THREAD,
+            "tmux": {"sessionId": "$1"},
+        }
+        fresh = {
+            "contractMode": True,
+            "hostId": "alpha",
+            "kind": "codex",
+            "id": THREAD,
+            "providerOptionVerified": True,
+            "tmux": {"sessionId": "$2"},
+        }
+        merged = _merge_host_snapshot(
+            {"sessions": [old]},
+            {
+                "sessions": [fresh],
+                "errors": [{"stage": "threads", "message": "provider unavailable"}],
+            },
+        )
+        self.assertIs(merged["sessions"][0]["providerOptionVerified"], True)
+
+    def test_authoritative_missing_tmux_also_clears_option_proof(self) -> None:
+        old = {
+            "contractMode": True,
+            "hostId": "alpha",
+            "kind": "codex",
+            "id": THREAD,
+            "providerOptionVerified": True,
+            "tmux": {"sessionId": "$1"},
+            "tmuxSession": "old",
+        }
+        fresh = {
+            "contractMode": True,
+            "hostId": "alpha",
+            "kind": "codex",
+            "id": THREAD,
+        }
+        merged = _merge_host_snapshot(
+            {"sessions": [old]},
+            {
+                "sessions": [fresh],
+                "errors": [{"stage": "tmux-missing", "message": "tmux unavailable"}],
+            },
+        )
+        row = merged["sessions"][0]
+        self.assertNotIn("tmux", row)
+        self.assertNotIn("providerOptionVerified", row)
 
     def test_scoped_lifecycle_refresh_keeps_peer_ttl_stale_for_next_full_refresh(self) -> None:
         backend = {
