@@ -10,6 +10,9 @@ present malformed or unsupported companion is visible and never enables a
 fallback. Tmux Plus retains generic rename/kill ownership; Agent Plus has no
 rename/kill action.
 
+P8 flat-scope navigation is an accepted suite design target, not an implemented
+runtime claim.
+
 ## Target ownership
 
 The three Rofi pickers form an acyclic stack:
@@ -38,6 +41,43 @@ The integration boundaries are versioned process contracts:
 Agent Plus does not import another repository's Python modules or read its
 private configuration, history, health, or cache files.
 
+## P8 flat-scope navigation target
+
+P8 removes Agent Plus's `Hosts` and `Providers` browsing roots and all group
+rows. The normal picker contains only agent-session leaves in a flat host-scope
+ring:
+
+```text
+Agents › All
+Agents › Local
+Agents › <remote host in Host Mesh order>
+```
+
+`All` is the mixed newest-first list across hosts and providers. `Local`
+follows, then every authoritative remote in stable Host Mesh order. Empty or
+unavailable hosts retain their scope and may render a non-actionable empty-state
+row; activity never moves a view. When no remote exists, the redundant `All`
+and `Local` scopes collapse to one `Local` view. Agent Plus starts in `All` when
+it exists and does not persist host scope between invocations.
+
+Provider becomes a searchable row attribute rather than a navigation axis.
+Provider icons remain visible, and provider names and aliases remain in filter
+metadata, so `codex`, `claude`, and `opencode` continue to isolate sessions
+without mixing host and provider dimensions in one view ring.
+
+Left and Right wrap through host scopes using the current immutable snapshot;
+they never trigger provider discovery, tmux inventory, or SSH work. They
+preserve the filter and reset selection to the first eligible matching row.
+Tab and Shift+Tab remain native row navigation, Enter opens or resumes the
+selected session, and Escape plus Ctrl+G always close through Rofi's native
+cancel action. Neither cancellation key is a script callback.
+
+P8 changes only presentation and interaction. Agent discovery and correlation,
+Host Mesh v1, Tmux Session v1, stable typed selection identity, and guarded
+lifecycle operations remain unchanged. The later P7 interaction description in
+this document remains authoritative for the deployed runtime until the
+coordinated P8 cutover.
+
 The canonical `rofi-ssh-plus`, `rofi-tmux-plus`, and `rofi-agent-plus`
 commands are resolved through `PATH`. A suite deployment installs public
 entry-point symlinks under `~/.local/bin` or an equivalent user executable
@@ -55,7 +95,8 @@ Agent Plus remains authoritative for:
 - correlation between native provider sessions and tmux panes/options;
 - waiting-session reuse and title-derived, collision-free provider wrapper
   names; and
-- the `Recent`, `Hosts`, and `Providers` presentation.
+- the currently deployed P7 `Recent`, `Hosts`, and `Providers` presentation,
+  followed by the accepted P8 flat host-scope presentation at cutover.
 
 SSH Plus must not know provider commands. Tmux Plus may carry generic pane
 metadata and requested tmux `@` options but must not assign meaning to them.
