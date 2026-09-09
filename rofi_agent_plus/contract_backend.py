@@ -1,9 +1,8 @@
 """Process-only Host Mesh/Tmux Session discovery backend.
 
-This module deliberately knows only the public JSON contracts.  The legacy
-engine remains intact and is selected whenever the complete capability pair is
-not on ``PATH``.  It has no imports from the sibling Plus repositories and no
-knowledge of their private files or Python modules.
+This module deliberately knows only the public JSON contracts.  Tmux Plus is
+required; when SSH Plus is absent it synthesizes the documented local-only
+identity rather than reviving an Agent-owned SSH or tmux path.
 """
 
 from __future__ import annotations
@@ -72,7 +71,7 @@ _WHOLE_REFRESH_MAX_SECONDS = 30.0
 
 
 class ContractError(engine.PickerError):
-    """Visible public-contract failure; never a legacy fallback trigger."""
+    """Visible public-contract failure; never a fallback trigger."""
 
 
 class StaleMeshError(ContractError):
@@ -231,7 +230,7 @@ class MeshHost:
 
 @dataclass(frozen=True)
 class Mesh:
-    revision: str
+    revision: str | None
     executable: str
     connect_timeout: int
     attempts: int
@@ -376,6 +375,43 @@ def parse_mesh(payload: object) -> Mesh:
     if len({host.host_id.casefold() for host in hosts}) != len(hosts):
         raise ContractError("Host Mesh host ids are ambiguous")
     return Mesh(revision, executable, timeout, attempts, tuple(hosts))
+
+
+def _local_mesh() -> Mesh:
+    """Mirror the suite's local-only identity without importing Tmux Plus."""
+
+    short_source = socket.gethostname()
+    raw_short = short_source.split(".", 1)[0] or "localhost"
+    raw_full = socket.getfqdn() or raw_short
+    host_id = raw_short.casefold() if _HOST_ID.fullmatch(raw_short) else "localhost"
+    aliases = tuple(
+        dict.fromkeys(
+            value
+            for value in (raw_full, raw_short)
+            if (
+                value
+                and value.strip() == value
+                and not value.startswith("-")
+                and not any(
+                    char.isspace() or unicodedata.category(char).startswith("C") for char in value
+                )
+            )
+        )
+    )
+    display = (
+        raw_short[:255]
+        if raw_short
+        and raw_short.strip() == raw_short
+        and not any(unicodedata.category(char).startswith("C") for char in raw_short)
+        else host_id
+    )
+    return Mesh(
+        None,
+        "",
+        1,
+        1,
+        (MeshHost(host_id, display, True, aliases or (host_id,), ()),),
+    )
 
 
 def _json(command: CommandOutput, source: str) -> Mapping[str, object]:
@@ -579,39 +615,6 @@ print(json.dumps({"nativeHostname":socket.gethostname(),"parents":parents,"activ
 """
 
 
-def _local_active() -> dict[str, object]:
-    """Compatibility helper for direct unit callers.
-
-    Contract discovery itself invokes the fixed probe through ``_run_bounded``
-    so its ``ps`` read shares the whole-refresh deadline.
-    """
-
-    parents, codex, claude, opencode = engine._process_table()
-
-    def entry(pid: int) -> dict[str, object]:
-        chain: list[int] = []
-        current = pid
-        while current > 1 and current not in chain and len(chain) < 128:
-            chain.append(current)
-            current = parents.get(current, 0)
-        return {"pid": pid, "ancestors": chain}
-
-    def candidates(pids: set[int], resolver: Callable[[int], str | None]) -> dict[str, object]:
-        result: dict[str, list[dict[str, object]]] = {}
-        for pid in sorted(pids):
-            if identifier := resolver(pid):
-                result.setdefault(identifier, []).append(entry(pid))
-        return {identifier: {"candidates": values} for identifier, values in result.items()}
-
-    return {
-        "nativeHostname": socket.gethostname(),
-        "parents": parents,
-        "active": candidates(codex, engine._thread_id_for_process),
-        "claudeActive": candidates(claude, engine._claude_session_id_for_process),
-        "opencodeActive": candidates(opencode, engine._opencode_session_id_for_process),
-    }
-
-
 def _validate_active(payload: object) -> dict[str, object]:
     if not isinstance(payload, Mapping):
         raise ContractError("provider activity probe returned invalid JSON")
@@ -667,7 +670,9 @@ def _validate_active(payload: object) -> dict[str, object]:
 
 
 def _inventory_args(tmux_command: str, mesh: Mesh) -> list[str]:
-    argv = [tmux_command, "inventory", "--json", "--panes", "--mesh-revision", mesh.revision]
+    argv = [tmux_command, "inventory", "--json", "--panes"]
+    if mesh.revision is not None:
+        argv.extend(("--mesh-revision", mesh.revision))
     for host in mesh.hosts:
         argv.extend(("--host", host.host_id))
     for option in _OPTIONS:
@@ -805,7 +810,7 @@ def _inventory(payload: object, mesh: Mesh) -> dict[str, dict[str, object]]:
     return result
 
 
-def _tmux_reference(session: Mapping[str, object], revision: str) -> dict[str, object]:
+def _tmux_reference(session: Mapping[str, object], revision: str | None) -> dict[str, object]:
     """Validate and project a session into the only tmux action identity.
 
     The provider owns the primary row identity.  This deliberately keeps the
@@ -845,7 +850,7 @@ def _tmux_association(
     provider: str,
     identifier: str,
     active: Mapping[str, object],
-    revision: str,
+    revision: str | None,
 ) -> tuple[dict[str, object] | None, str | None]:
     """Return one conservative association or an ambiguity diagnostic.
 
@@ -917,32 +922,6 @@ def _tmux_association(
     return option_claims.get(key) or process_claims.get(key), None
 
 
-@dataclass
-class LegacyBackend:
-    kind: str = "legacy"
-    mesh_revision: str | None = None
-
-    @property
-    def identity(self) -> dict[str, object]:
-        return {"kind": self.kind, "capability": "legacy-v1", "meshRevision": None}
-
-    def prepare(self) -> None:
-        return None
-
-    def stream(self, config: Any) -> Sequence[dict[str, object]]:
-        return list(
-            engine.stream_session_events(
-                config.hosts,
-                config.max_sessions,
-                engine.DEFAULT_TIMEOUT,
-                include_local=True,
-                aliases=config.aliases,
-                routes=config.routes,
-                ssh_policy=config.ssh_policy,
-            )
-        )
-
-
 class ContractBackend:
     """Contract-backed discovery with one bounded Mesh retry on stale state."""
 
@@ -950,7 +929,7 @@ class ContractBackend:
 
     def __init__(
         self,
-        ssh_command: str,
+        ssh_command: str | None,
         tmux_command: str,
         *,
         runner: Runner = _run_bounded,
@@ -989,6 +968,9 @@ class ContractBackend:
                 self._stream_deadline = deadline
         elif self._stream_deadline is None:
             self._stream_deadline = time.monotonic() + _WHOLE_REFRESH_MAX_SECONDS
+        if self.ssh_command is None:
+            self.mesh = _local_mesh()
+            return
         output = self._run(
             [self.ssh_command, "mesh", "list", "--json"],
             timeout=min(5.0, self._remaining(self._stream_deadline)),
@@ -1344,15 +1326,34 @@ class ContractBackend:
                 )
                 present.add((kind, identifier))
 
-    def _once(self, config: Any, deadline: float | None = None) -> list[dict[str, object]]:
+    def _once(
+        self,
+        config: Any,
+        deadline: float | None = None,
+        host_ids: Sequence[str] | None = None,
+    ) -> list[dict[str, object]]:
         assert self.mesh is not None
+        if host_ids is None:
+            mesh = self.mesh
+        else:
+            requested = tuple(dict.fromkeys(host_ids))
+            selected = tuple(host for host in self.mesh.hosts if host.host_id in requested)
+            if len(selected) != len(requested):
+                raise ContractError("selected host is not in the current Host Mesh")
+            mesh = Mesh(
+                self.mesh.revision,
+                self.mesh.executable,
+                self.mesh.connect_timeout,
+                self.mesh.attempts,
+                selected,
+            )
         deadline = deadline or self._stream_deadline
         if deadline is None:
             whole_seconds = max(
                 _WHOLE_REFRESH_MIN_SECONDS,
                 min(
                     _WHOLE_REFRESH_MAX_SECONDS,
-                    float(self.mesh.connect_timeout * self.mesh.attempts + 12),
+                    float(mesh.connect_timeout * mesh.attempts + 12),
                 ),
             )
             deadline = time.monotonic() + whole_seconds
@@ -1380,49 +1381,56 @@ class ContractBackend:
                     raise stage
             return host.host_id, (route, codex, claude, opencode, active)
 
-        # All host and provider workers finish before this function can return.
-        # Each external child receives the shared remaining deadline, so joining
-        # cannot leave post-return reporting or subprocess work behind.
-        with ThreadPoolExecutor(
-            max_workers=min(_MAX_HOST_WORKERS, len(self.mesh.hosts)),
-            thread_name_prefix="rofi-agent-host",
-        ) as pool:
-            futures = {pool.submit(host_stage, host): host.host_id for host in self.mesh.hosts}
-            try:
-                for future in as_completed(futures, timeout=self._remaining(deadline)):
-                    host_id, stage = future.result()
-                    stages[host_id] = stage
-            except FuturesTimeoutError as error:
-                for future in futures:
-                    future.cancel()
-                raise ContractError("contract refresh timed out") from error
-        try:
+        def inventory_stage() -> dict[str, dict[str, object]]:
             inventory_command = self._run(
-                _inventory_args(self.tmux_command, self.mesh),
+                _inventory_args(self.tmux_command, mesh),
                 timeout=min(15.0, self._remaining(deadline)),
             )
             if inventory_command.returncode != 0:
                 _raise_command_failure(inventory_command, "Tmux Session inventory")
-            inventory_payload = _json(inventory_command, "Tmux Session inventory")
-            tmux = _inventory(inventory_payload, self.mesh)
-            tmux_error: ContractError | None = None
-        except StaleMeshError:
-            raise
-        except ContractError as error:
-            tmux = {}
-            tmux_error = error
+            return _inventory(_json(inventory_command, "Tmux Session inventory"), mesh)
+
+        # Inventory does not depend on provider-native results.  Start it with
+        # host probes, while retaining one shared deadline and joining every
+        # child before returning so no post-refresh work survives this call.
+        with ThreadPoolExecutor(
+            max_workers=min(_MAX_HOST_WORKERS, len(mesh.hosts)) + 1,
+            thread_name_prefix="rofi-agent-host",
+        ) as pool:
+            futures = {pool.submit(host_stage, host): host.host_id for host in mesh.hosts}
+            inventory_future = pool.submit(inventory_stage)
+            try:
+                for future in as_completed(futures, timeout=self._remaining(deadline)):
+                    host_id, stage = future.result()
+                    stages[host_id] = stage
+                tmux = inventory_future.result(timeout=self._remaining(deadline))
+                tmux_error: ContractError | None = None
+            except FuturesTimeoutError as error:
+                for future in (*futures, inventory_future):
+                    future.cancel()
+                raise ContractError("contract refresh timed out") from error
+            except StaleMeshError:
+                raise
+            except ContractError as error:
+                tmux = {}
+                tmux_error = error
         events: list[dict[str, object]] = [
             {
                 "event": "refresh-started",
-                "hosts": [host.host_id for host in self.mesh.hosts],
+                "hosts": [host.host_id for host in mesh.hosts],
                 "backend": self.identity,
             }
         ]
-        for host in self.mesh.hosts:
+        for host in mesh.hosts:
             route, codex, claude, opencode, active = stages[host.host_id]
-            target = engine.HostTarget(None if host.local else route, host.host_id)
-            merged = engine.merge_host_results(
-                [(target, codex, claude, opencode, active)], config.max_sessions
+            merged = engine.merge_provider_results(
+                host.host_id,
+                host.display,
+                codex,
+                claude,
+                opencode,
+                active,
+                config.max_sessions,
             )
             self._append_active_only_rows(merged["sessions"], active)
             errors = list(merged["errors"])
@@ -1466,12 +1474,6 @@ class ContractBackend:
                 row["backend"] = dict(self.identity)
                 row["host"] = host.display
                 row["hostId"] = host.host_id
-                row["windowHost"] = (
-                    active.get("nativeHostname", host.host_id)
-                    if isinstance(active, Mapping)
-                    else host.host_id
-                )
-                row["connectHost"] = route or "local"
                 activity = (
                     active.get(
                         {"codex": "active", "claude": "claudeActive", "opencode": "opencodeActive"}[
@@ -1492,7 +1494,7 @@ class ContractBackend:
                             str(row["kind"]),
                             str(row["id"]),
                             info if isinstance(info, Mapping) else {},
-                            self.mesh.revision,
+                            mesh.revision,
                         )
                     except ContractError as error:
                         errors.append(
@@ -1527,6 +1529,7 @@ class ContractBackend:
         config: Any,
         *,
         deadline: float | None = None,
+        host_ids: Sequence[str] | None = None,
     ) -> Sequence[dict[str, object]]:
         if deadline is not None:
             self._stream_deadline = deadline
@@ -1535,7 +1538,7 @@ class ContractBackend:
         try:
             for attempt in range(2):
                 try:
-                    return self._once(config, self._stream_deadline)
+                    return self._once(config, self._stream_deadline, host_ids)
                 except StaleMeshError:
                     if attempt:
                         raise
@@ -1549,11 +1552,11 @@ def select_backend(
     *,
     which: Callable[[str], str | None] = shutil.which,
     runner: Runner = _run_bounded,
-) -> LegacyBackend | ContractBackend:
-    """Choose the pair atomically: one external command is never enough."""
+) -> ContractBackend:
+    """Select the mandatory Tmux contract and optional Host Mesh contract."""
 
     ssh_command = which("rofi-ssh-plus")
     tmux_command = which("rofi-tmux-plus")
-    if ssh_command is None or tmux_command is None:
-        return LegacyBackend()
+    if tmux_command is None:
+        raise ContractError("rofi-tmux-plus is required for Agent Plus")
     return ContractBackend(ssh_command, tmux_command, runner=runner, which=which)

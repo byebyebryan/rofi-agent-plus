@@ -9,11 +9,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from rofi_agent_plus import engine
 from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, build_snapshot
 from rofi_agent_plus.codex import AppServerClient
 from rofi_agent_plus.config import PickerConfig
@@ -229,28 +231,123 @@ class InventoryContractTest(unittest.TestCase):
 
 
 class BackendSelectionAndTransportTest(unittest.TestCase):
-    def test_pair_selection_never_mixes_one_external_owner(self) -> None:
-        self.assertEqual("legacy", select_backend(which=lambda _name: None).kind)
-        self.assertEqual(
-            "legacy",
-            select_backend(
-                which=lambda name: "/tools/ssh" if name == "rofi-ssh-plus" else None
-            ).kind,
+    def test_tmux_is_required_but_missing_ssh_selects_local_contract(self) -> None:
+        with self.assertRaisesRegex(ContractError, "rofi-tmux-plus is required"):
+            select_backend(which=lambda _name: None)
+        backend = select_backend(
+            which=lambda name: "/tools/tmux" if name == "rofi-tmux-plus" else None
         )
+        self.assertEqual("contract", backend.kind)
+        self.assertIsNone(backend.ssh_command)
+        with mock.patch(
+            "rofi_agent_plus.contract_backend.socket.gethostname", return_value="LOCAL.Example"
+        ):
+            with mock.patch(
+                "rofi_agent_plus.contract_backend.socket.getfqdn", return_value="LOCAL.Example"
+            ):
+                backend.prepare()
         self.assertEqual(
-            "contract",
-            select_backend(which=lambda name: f"/tools/{name}").kind,
+            {
+                "kind": "contract",
+                "capability": CONTRACT_CAPABILITY,
+                "meshRevision": None,
+            },
+            backend.identity,
+        )
+        assert backend.mesh is not None
+        self.assertEqual("local", backend.mesh.local.host_id)
+        self.assertEqual("LOCAL", backend.mesh.local.display)
+        self.assertEqual(("LOCAL.Example", "LOCAL"), backend.mesh.local.aliases)
+
+    def test_local_only_identity_matches_tmux_plus_odd_hostname_rules(self) -> None:
+        backend = select_backend(
+            which=lambda name: "/tools/tmux" if name == "rofi-tmux-plus" else None
+        )
+        with mock.patch(
+            "rofi_agent_plus.contract_backend.socket.gethostname", return_value="-bad name"
+        ):
+            with mock.patch(
+                "rofi_agent_plus.contract_backend.socket.getfqdn", return_value="-bad name"
+            ):
+                backend.prepare()
+        assert backend.mesh is not None
+        self.assertEqual("localhost", backend.mesh.local.host_id)
+        self.assertEqual("-bad name", backend.mesh.local.display)
+        self.assertEqual(("localhost",), backend.mesh.local.aliases)
+
+    def test_present_malformed_ssh_contract_never_becomes_local_only(self) -> None:
+        backend = select_backend(
+            which=lambda name: f"/tools/{name}",
+            runner=lambda argv, **_kwargs: CommandOutput(tuple(argv), 0, "not-json", ""),
+        )
+        with self.assertRaisesRegex(ContractError, "invalid JSON"):
+            backend.prepare()
+        self.assertIsNone(backend.mesh)
+
+    def test_ssh_absent_discovers_local_rows_through_tmux_contract(self) -> None:
+        inventory_calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> CommandOutput:
+            inventory_calls.append(argv)
+            return output(
+                argv,
+                {
+                    "schemaVersion": 1,
+                    "generatedAt": 1,
+                    "meshRevision": None,
+                    "hosts": [
+                        {
+                            "hostId": "local",
+                            "display": "LOCAL",
+                            "local": True,
+                            "status": "ok",
+                            "observedAt": 1,
+                            "nativeHostname": "LOCAL",
+                            "serverGeneration": None,
+                            "route": None,
+                            "sessions": [],
+                            "error": None,
+                        }
+                    ],
+                },
+            )
+
+        backend = select_backend(
+            which=lambda name: "/tools/tmux" if name == "rofi-tmux-plus" else None,
+            runner=runner,
+        )
+        with (
+            mock.patch(
+                "rofi_agent_plus.contract_backend.socket.gethostname", return_value="LOCAL.Example"
+            ),
+            mock.patch(
+                "rofi_agent_plus.contract_backend.socket.getfqdn", return_value="LOCAL.Example"
+            ),
+        ):
+            backend.prepare()
+        active = {
+            "nativeHostname": "LOCAL",
+            "active": {},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        backend._active = lambda _host, _deadline: (None, active)  # type: ignore[method-assign]
+        backend._provider_results = lambda *_args: (  # type: ignore[method-assign]
+            [{"id": THREAD, "name": "local session", "cwd": "/work"}],
+            {"installed": False, "sessions": []},
+            {"installed": False, "sessions": []},
         )
 
-    def test_capability_disappearance_selects_legacy_without_mixing_cached_contract(self) -> None:
-        available = {"rofi-ssh-plus": "/tools/ssh", "rofi-tmux-plus": "/tools/tmux"}
+        events = backend._once(PickerConfig())
 
-        def selector(name: str) -> str | None:
-            return available.get(name)
-
-        self.assertEqual("contract", select_backend(which=selector).kind)
-        available.pop("rofi-tmux-plus")
-        self.assertEqual("legacy", select_backend(which=selector).kind)
+        self.assertEqual(1, len(inventory_calls))
+        self.assertIn("--host", inventory_calls[0])
+        self.assertIn("local", inventory_calls[0])
+        self.assertNotIn("--mesh-revision", inventory_calls[0])
+        row = events[1]["sessions"][0]
+        self.assertTrue(row["contractMode"])
+        self.assertEqual("local", row["hostId"])
+        self.assertIsNone(row["backend"]["meshRevision"])
 
     def test_reached_marker_uses_emitted_route_order_and_reports_only_evidence(self) -> None:
         mesh = parse_mesh(fixture("mesh-v1.json"))
@@ -611,6 +708,34 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
 
 
 class ContractBackendAssemblyTest(unittest.TestCase):
+    def test_inventory_starts_before_provider_discovery_completes(self) -> None:
+        mesh = parse_mesh(fixture("mesh-v1.json"))
+        inventory_started = threading.Event()
+
+        def runner(argv: list[str], **_kwargs: object) -> CommandOutput:
+            self.assertEqual("inventory", argv[1])
+            inventory_started.set()
+            return output(argv, fixture("tmux-inventory-v1.json"))
+
+        backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=runner)
+        backend.mesh = mesh
+        active = {
+            "nativeHostname": "native",
+            "active": {},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        backend._active = lambda _host, _deadline: (None, active)  # type: ignore[method-assign]
+
+        def provider_results(*_args: object) -> tuple[object, object, object]:
+            self.assertTrue(inventory_started.wait(0.5))
+            return [], {"installed": False, "sessions": []}, {"installed": False, "sessions": []}
+
+        backend._provider_results = provider_results  # type: ignore[method-assign]
+        events = backend._once(PickerConfig())
+        self.assertTrue(inventory_started.is_set())
+        self.assertEqual("refresh-finished", events[-1]["event"])
+
     def test_outside_tmux_active_is_preserved_and_inventory_is_subordinate(self) -> None:
         mesh_payload = fixture("mesh-v1.json")
         inventory_payload = fixture("tmux-inventory-v1.json")
@@ -693,14 +818,13 @@ class ContractBackendAssemblyTest(unittest.TestCase):
         events = backend._once(PickerConfig())
         self.assertIn("tmux", str(events[1]["errors"]))
 
-    def test_contract_rows_fail_closed_before_legacy_open(self) -> None:
-        with mock.patch("rofi_agent_plus.rofi.engine.resolve_host_target") as resolve:
-            with self.assertRaisesRegex(PickerError, "prepared authority"):
-                _open_selection(
-                    {"contractMode": True, "kind": "codex", "id": THREAD},
-                    PickerConfig(),
-                )
-        resolve.assert_not_called()
+    def test_rofi_open_fails_closed_without_a_prepared_contract(self) -> None:
+        with self.assertRaisesRegex(PickerError, "prepared authority"):
+            _open_selection(
+                {"contractMode": True, "kind": "codex", "id": THREAD},
+                PickerConfig(),
+            )
+        self.assertFalse(hasattr(engine, "resolve_host_target"))
 
     def test_rendered_contract_info_round_trips_and_cannot_fall_into_legacy_open(self) -> None:
         row = {
@@ -728,15 +852,130 @@ class ContractBackendAssemblyTest(unittest.TestCase):
         info = rendered.split("\x00info\x1f", 1)[1].split("\x1fmeta\x1f", 1)[0]
         selected = _parse_selection(info)
         self.assertTrue(selected["contractMode"])
-        with mock.patch("rofi_agent_plus.rofi.engine.resolve_host_target") as resolve:
-            with self.assertRaisesRegex(PickerError, "prepared authority"):
-                _open_selection(selected, PickerConfig())
-        resolve.assert_not_called()
+        with self.assertRaisesRegex(PickerError, "prepared authority"):
+            _open_selection(selected, PickerConfig())
+        self.assertFalse(hasattr(engine, "launch_attach"))
 
 
 class ContractCacheTest(unittest.TestCase):
     def setUp(self) -> None:
         self.config = PickerConfig(max_sessions=40)
+
+    def test_scoped_lifecycle_refresh_keeps_peer_ttl_stale_for_next_full_refresh(self) -> None:
+        backend = {
+            "kind": "contract",
+            "capability": CONTRACT_CAPABILITY,
+            "meshRevision": "sha256:mesh-v1",
+        }
+        stale_at = int(time.time()) - self.config.refresh_seconds - 1
+        selected_at = int(time.time())
+        previous = {
+            "version": CACHE_VERSION,
+            "fingerprint": self.config.fingerprint,
+            "generatedAt": stale_at,
+            "backend": backend,
+            "hosts": {
+                "alpha": {
+                    "generatedAt": stale_at,
+                    "sessions": [{"hostId": "alpha", "kind": "codex", "id": THREAD}],
+                    "errors": [],
+                },
+                "beta": {
+                    "generatedAt": stale_at,
+                    "sessions": [{"hostId": "beta", "kind": "codex", "id": THREAD}],
+                    "errors": [],
+                },
+            },
+            "sessions": [],
+            "errors": [],
+        }
+        scoped = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["alpha"],
+                        "backend": backend,
+                    },
+                    {
+                        "event": "host-complete",
+                        "host": "alpha",
+                        "generatedAt": selected_at,
+                        "sessions": [
+                            {"hostId": "alpha", "kind": "codex", "id": THREAD, "recencyAt": 2}
+                        ],
+                        "errors": [],
+                        "backend": backend,
+                    },
+                    {"event": "refresh-finished", "backend": backend},
+                ]
+            ),
+            previous,
+            now=selected_at,
+            retain_unselected_hosts=True,
+        )
+        self.assertEqual(stale_at, scoped["generatedAt"])
+        self.assertEqual(selected_at, scoped["hosts"]["alpha"]["generatedAt"])
+        self.assertEqual(previous["hosts"]["beta"], scoped["hosts"]["beta"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CacheStore(Path(temporary) / "cache")
+            store.write(scoped)
+            calls: list[object] = []
+
+            def full_discovery(
+                _config: PickerConfig,
+                prior: object,
+            ):
+                calls.append(prior)
+                return iter(
+                    [
+                        {
+                            "event": "refresh-started",
+                            "hosts": ["alpha", "beta"],
+                            "backend": backend,
+                        },
+                        {
+                            "event": "host-complete",
+                            "host": "alpha",
+                            "sessions": [],
+                            "errors": [],
+                            "backend": backend,
+                        },
+                        {
+                            "event": "host-complete",
+                            "host": "beta",
+                            "sessions": [],
+                            "errors": [],
+                            "backend": backend,
+                        },
+                        {"event": "refresh-finished", "backend": backend},
+                    ]
+                )
+
+            store.refresh(self.config, discover=full_discovery)
+        self.assertEqual(1, len(calls))
+
+        unseeded = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {"event": "refresh-started", "hosts": ["alpha"], "backend": backend},
+                    {
+                        "event": "host-complete",
+                        "host": "alpha",
+                        "sessions": [],
+                        "errors": [],
+                        "backend": backend,
+                    },
+                    {"event": "refresh-finished", "backend": backend},
+                ]
+            ),
+            now=selected_at,
+            retain_unselected_hosts=True,
+        )
+        self.assertEqual(0, unseeded["generatedAt"])
 
     def test_contract_prunes_removed_hosts_and_does_not_bless_partial_data(self) -> None:
         previous = {

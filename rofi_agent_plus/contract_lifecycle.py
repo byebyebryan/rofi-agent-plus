@@ -2,7 +2,7 @@
 
 This module deliberately consumes only the public ``rofi-tmux-plus`` JSON
 commands.  It owns no SSH, terminal, Niri, or raw tmux behavior; those remain
-behind the Tmux Session boundary.  The legacy engine never enters this module.
+behind the Tmux Session boundary.
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ class _ContractBackend(Protocol):
 @dataclass(frozen=True)
 class StableReference:
     host_id: str
-    mesh_revision: str
+    mesh_revision: str | None
     server_generation: str
     session_id: str
     created_at: int
@@ -112,14 +112,20 @@ def _backend_identity(value: object) -> dict[str, object]:
         or value.get("capability") != _CAPABILITY
     ):
         raise LifecycleError("operation_failed", "contract action lacks a current authority")
-    revision = _text(value.get("meshRevision"), "mesh revision")
-    assert revision is not None
-    if revision.strip() != revision or any(char.isspace() for char in revision):
+    revision = value.get("meshRevision")
+    if revision is not None and not isinstance(revision, str):
+        raise LifecycleError("operation_failed", "contract action has an invalid mesh revision")
+    if isinstance(revision, str) and (
+        not revision
+        or len(revision) > _MAX_FIELD
+        or revision.strip() != revision
+        or any(char.isspace() or unicodedata.category(char).startswith("C") for char in revision)
+    ):
         raise LifecycleError("operation_failed", "contract action has an invalid mesh revision")
     return {"kind": "contract", "capability": _CAPABILITY, "meshRevision": revision}
 
 
-def _reference(value: object, host_id: str, revision: str) -> StableReference:
+def _reference(value: object, host_id: str, revision: str | None) -> StableReference:
     if not isinstance(value, Mapping) or value.get("meshRevision") != revision:
         raise LifecycleError("operation_failed", "session no longer has a current tmux reference")
     generation = _text(value.get("serverGeneration"), "server generation")
@@ -199,7 +205,7 @@ def _provider_row(
     return row
 
 
-def _descriptor(value: object, host_id: str, revision: str) -> StableReference:
+def _descriptor(value: object, host_id: str, revision: str | None) -> StableReference:
     """Validate the public complete descriptor and project its stable ref."""
 
     if not isinstance(value, Mapping) or value.get("hostId") != host_id:
@@ -251,7 +257,7 @@ def _error_response(output: CommandOutput) -> LifecycleError:
 def _success_response(
     output: CommandOutput,
     host_id: str,
-    revision: str,
+    revision: str | None,
     *,
     opening: bool,
 ) -> StableReference:
@@ -289,7 +295,7 @@ def _run_json(
     argv: Sequence[str],
     deadline: float,
     host_id: str,
-    revision: str,
+    revision: str | None,
     *,
     opening: bool,
 ) -> StableReference:
@@ -366,12 +372,16 @@ class ContractLifecycle:
 
     def _refresh_row(self, selection: Mapping[str, object]) -> dict[str, object]:
         try:
+            host_id = selection.get("hostId")
+            if not isinstance(host_id, str) or not _HOST_ID.fullmatch(host_id):
+                raise LifecycleError("operation_failed", "selected contract session is invalid")
             snapshot = self.store.refresh(
                 self.config,
                 force=True,
                 require_fresh=True,
                 context=self.context,
                 deadline=self.deadline,
+                host_ids=(host_id,),
             )
         except engine.PickerError as error:
             raise LifecycleError("operation_failed", str(error)) from error
@@ -399,8 +409,6 @@ class ContractLifecycle:
             "--json",
             "--host",
             reference.host_id,
-            "--mesh-revision",
-            reference.mesh_revision,
             "--server-generation",
             reference.server_generation,
             "--session-id",
@@ -408,6 +416,8 @@ class ContractLifecycle:
             "--created-at",
             str(reference.created_at),
         ]
+        if reference.mesh_revision is not None:
+            argv[5:5] = ["--mesh-revision", reference.mesh_revision]
         result = _run_json(
             self.backend,
             argv,
@@ -462,11 +472,12 @@ class ContractLifecycle:
                 "--json",
                 "--host",
                 host_id,
-                "--mesh-revision",
-                self.identity["meshRevision"],
                 "--name",
                 wrapper_name,
             ]
+            revision = self.identity["meshRevision"]
+            if revision is not None:
+                argv[5:5] = ["--mesh-revision", str(revision)]
             if cwd_value is not None:
                 argv.extend(("--cwd", cwd_value))
             argv.extend(
@@ -487,7 +498,7 @@ class ContractLifecycle:
                     argv,
                     self.deadline,
                     host_id,
-                    str(self.identity["meshRevision"]),
+                    self.identity["meshRevision"],
                     opening=True,
                 )
             except LifecycleError as error:
@@ -505,7 +516,9 @@ class ContractLifecycle:
     def open_or_create(self, selection: Mapping[str, object]) -> None:
         row = self._refresh_row(selection)
         host_id = str(selection["hostId"])
-        revision = str(self.identity["meshRevision"])
+        revision = self.identity["meshRevision"]
+        if revision is not None and not isinstance(revision, str):
+            raise LifecycleError("operation_failed", "contract action has an invalid mesh revision")
         tmux = row.get("tmux")
         if tmux is not None:
             reference = _reference(tmux, host_id, revision)

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rofi_agent_plus.cache import CacheStore, PresentationContext
+from rofi_agent_plus.cache import CacheStore, PresentationContext, build_snapshot
 from rofi_agent_plus.config import PickerConfig
 from rofi_agent_plus.contract_backend import CommandOutput
 from rofi_agent_plus.contract_lifecycle import (
@@ -123,26 +123,28 @@ class FakeBackend:
         self._rows = rows if rows and isinstance(rows[0], list) else [rows]  # type: ignore[index]
         self._responses = list(responses)
         self.calls: list[tuple[list[str], float]] = []
+        self.stream_kwargs: list[dict[str, object]] = []
         self.streams = 0
         self.errors: list[dict[str, object]] = []
 
     def prepare(self) -> None:
         return None
 
-    def stream(self, _config: PickerConfig, **_kwargs: object):
+    def stream(self, _config: PickerConfig, **kwargs: object):
+        self.stream_kwargs.append(dict(kwargs))
         index = min(self.streams, len(self._rows) - 1)
         self.streams += 1
         rows = self._rows[index]
         return [
-            {"event": "refresh-started", "hosts": ["alpha"], "backend": dict(BACKEND)},
+            {"event": "refresh-started", "hosts": ["alpha"], "backend": dict(self.identity)},
             {
                 "event": "host-complete",
                 "host": "alpha",
                 "sessions": copy.deepcopy(rows),
                 "errors": copy.deepcopy(self.errors),
-                "backend": dict(BACKEND),
+                "backend": dict(self.identity),
             },
-            {"event": "refresh-finished", "backend": dict(BACKEND)},
+            {"event": "refresh-finished", "backend": dict(self.identity)},
         ]
 
     def _run(self, argv: list[str], **kwargs: object) -> CommandOutput:
@@ -215,6 +217,33 @@ class ContractLifecycleTest(unittest.TestCase):
         self.assertEqual("renamed outside", cached["sessions"][0]["tmuxSession"])
         self.assertEqual(REVISION, cached["sessions"][0]["tmux"]["meshRevision"])
         self.assertEqual(context.backend, cached["backend"])
+
+    def test_lifecycle_revalidates_only_the_selected_host(self) -> None:
+        lifecycle, _store, backend, _context = self.harness([row()], [success(descriptor())])
+        lifecycle.open_or_create(self.selection())
+        self.assertEqual(("alpha",), backend.stream_kwargs[0]["host_ids"])
+
+    def test_local_only_lifecycle_omits_mesh_revision(self) -> None:
+        local_backend = FakeBackend([], [])
+        local_backend.identity = {**BACKEND, "meshRevision": None}
+        local_row = row()
+        local_row["backend"] = dict(local_backend.identity)
+        local_row["tmux"] = {**local_row["tmux"], "meshRevision": None}
+        local_backend._rows = [[local_row]]
+        local_response = success(descriptor())
+        local_response["meshRevision"] = None
+        local_backend._responses = [local_response]
+        store = CacheStore(
+            Path(self.temporary.name) / "local-cache", backend_selector=lambda: local_backend
+        )
+        context = PresentationContext(
+            self.config.fingerprint, dict(local_backend.identity), selected=local_backend
+        )
+        selection = self.selection()
+        selection["backend"] = dict(local_backend.identity)
+        lifecycle = ContractLifecycle(store, self.config, context)
+        lifecycle.open_or_create(selection)
+        self.assertNotIn("--mesh-revision", local_backend.calls[0][0])
 
     def test_open_rejects_a_success_response_for_another_stable_session(self) -> None:
         lifecycle, store, backend, _context = self.harness(
@@ -373,6 +402,67 @@ class ContractLifecycleTest(unittest.TestCase):
             lifecycle.open_or_create(self.selection())
         self.assertEqual([], backend.calls)
 
+    def test_incomplete_scoped_revalidation_never_uses_a_retained_local_or_remote_row(self) -> None:
+        for host_id in ("alpha", "beta"):
+            with self.subTest(host_id=host_id):
+                stale = row(tmux=False)
+                stale["hostId"] = host_id
+                stale["host"] = host_id.title()
+                backend = FakeBackend([], [])
+                store = CacheStore(
+                    Path(self.temporary.name) / f"incomplete-{host_id}",
+                    backend_selector=lambda backend=backend: backend,
+                )
+                context = PresentationContext(
+                    self.config.fingerprint,
+                    dict(BACKEND),
+                    selected=backend,
+                )
+                previous = build_snapshot(
+                    self.config,
+                    iter(
+                        [
+                            {
+                                "event": "refresh-started",
+                                "hosts": [host_id],
+                                "backend": dict(BACKEND),
+                            },
+                            {
+                                "event": "host-complete",
+                                "host": host_id,
+                                "sessions": [stale],
+                                "errors": [],
+                                "backend": dict(BACKEND),
+                            },
+                            {"event": "refresh-finished", "backend": dict(BACKEND)},
+                        ]
+                    ),
+                    now=1,
+                )
+                store.write(previous)
+                backend.stream = mock.Mock(  # type: ignore[method-assign]
+                    return_value=[
+                        {
+                            "event": "refresh-started",
+                            "hosts": [host_id],
+                            "backend": dict(BACKEND),
+                        }
+                    ]
+                )
+                selection = self.selection()
+                selection["hostId"] = host_id
+                lifecycle = ContractLifecycle(store, self.config, context)
+
+                with self.assertRaisesRegex(LifecycleError, "incomplete contract host coverage"):
+                    lifecycle.open_or_create(selection)
+
+                backend.stream.assert_called_once()
+                self.assertEqual((host_id,), backend.stream.call_args.kwargs["host_ids"])
+                self.assertEqual([], backend.calls)
+                retained = store.load(self.config.fingerprint, BACKEND)
+                assert retained is not None
+                self.assertEqual(host_id, retained["sessions"][0]["hostId"])
+
     def test_lifecycle_revalidation_does_not_use_stale_cache_while_lock_is_held(self) -> None:
         lifecycle, store, backend, context = self.harness(
             [row(tmux=False)], [success(descriptor())]
@@ -385,6 +475,74 @@ class ContractLifecycleTest(unittest.TestCase):
             self.assertTrue(acquired)
             with self.assertRaisesRegex(LifecycleError, "revalidation is already in progress"):
                 lifecycle.open_or_create(self.selection())
+        self.assertEqual([], backend.calls)
+
+    def test_lifecycle_revalidation_never_consumes_a_recent_other_host_scoped_cache(self) -> None:
+        alpha = row(tmux=False)
+        beta = row(tmux=False)
+        beta["hostId"] = "beta"
+        beta["host"] = "Beta"
+        backend = FakeBackend([], [success(descriptor())])
+        store = CacheStore(
+            Path(self.temporary.name) / "recent-other-host",
+            backend_selector=lambda: backend,
+        )
+        context = PresentationContext(self.config.fingerprint, dict(BACKEND), selected=backend)
+        full = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {"event": "refresh-started", "hosts": ["alpha", "beta"], "backend": BACKEND},
+                    {
+                        "event": "host-complete",
+                        "host": "alpha",
+                        "sessions": [alpha],
+                        "errors": [],
+                        "backend": BACKEND,
+                    },
+                    {
+                        "event": "host-complete",
+                        "host": "beta",
+                        "sessions": [beta],
+                        "errors": [],
+                        "backend": BACKEND,
+                    },
+                    {"event": "refresh-finished", "backend": BACKEND},
+                ]
+            ),
+            now=int(time.time()),
+        )
+        other_host_scoped = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {"event": "refresh-started", "hosts": ["alpha"], "backend": BACKEND},
+                    {
+                        "event": "host-complete",
+                        "host": "alpha",
+                        "sessions": [alpha],
+                        "errors": [],
+                        "backend": BACKEND,
+                    },
+                    {"event": "refresh-finished", "backend": BACKEND},
+                ]
+            ),
+            full,
+            now=int(time.time()),
+            retain_unselected_hosts=True,
+        )
+        self.assertLessEqual(time.time() - other_host_scoped["generatedAt"], 1.0)
+        store.write(other_host_scoped)
+        selection = self.selection()
+        selection["hostId"] = "beta"
+        lifecycle = ContractLifecycle(store, self.config, context)
+        lifecycle.deadline = time.monotonic() + 0.01
+
+        with store.lock() as acquired:
+            self.assertTrue(acquired)
+            with self.assertRaisesRegex(LifecycleError, "revalidation is already in progress"):
+                lifecycle.open_or_create(selection)
+
         self.assertEqual([], backend.calls)
 
     def test_malformed_and_rollback_responses_do_not_reconcile(self) -> None:

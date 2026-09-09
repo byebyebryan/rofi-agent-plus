@@ -1,9 +1,4 @@
-# Optional.  Without this file the picker queries the local host only.
-hosts = ["laptop.lan"]
-host_routes = ["workstation=workstation-vpn.example|workstation.example"]
-aliases = ["legacy-host=workstation"]
-terminal = "ghostty"
+# Optional provider-cache settings. Hosts and lifecycle belong to the
+# companion Rofi Plus commands.
 max_sessions = 40
 refresh_seconds = 30
-ssh_connect_timeout = 2
-ssh_connection_attempts = 1

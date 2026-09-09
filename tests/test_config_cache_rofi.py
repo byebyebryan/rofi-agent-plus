@@ -58,13 +58,18 @@ def session(
     kind: str = "codex", identifier: str = THREAD_ID, **values: object
 ) -> dict[str, object]:
     result: dict[str, object] = {
+        "contractMode": True,
+        "backend": {
+            "kind": "contract",
+            "capability": "host-mesh-v1+tmux-session-v1",
+            "meshRevision": None,
+        },
         "kind": kind,
         "id": identifier,
         "name": "hello\nworld\x00",
         "cwd": str(Path.home() / "code/project"),
         "host": "workstation",
-        "windowHost": "workstation-vpn.example",
-        "connectHost": "workstation-vpn.example",
+        "hostId": "workstation",
         "recencyAt": 100,
         "updatedAt": 100,
         "active": False,
@@ -98,46 +103,29 @@ def parse_rendered_records(output: str) -> tuple[list[str], list[str]]:
 
 
 class ConfigTest(unittest.TestCase):
-    def test_missing_config_is_local_only_with_dms_defaults(self) -> None:
+    def test_missing_config_has_only_provider_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = load_config(Path(temporary) / "missing.toml")
-        self.assertEqual((), config.hosts)
-        self.assertEqual((), config.host_routes)
         self.assertEqual(40, config.max_sessions)
         self.assertEqual(30, config.refresh_seconds)
-        self.assertEqual(2, config.ssh_connect_timeout)
-        self.assertEqual(1, config.ssh_connection_attempts)
 
-    def test_loads_routes_and_aliases(self) -> None:
+    def test_loads_provider_settings_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            path.write_text(
-                'hosts = ["ignored.lan"]\n'
-                'host_routes = ["workstation=workstation-vpn.example|workstation.example"]\n'
-                'aliases = ["LEGACY-HOST=Workstation"]\n'
-                'terminal = "foot --class agent"\n'
-                "max_sessions = 12\nrefresh_seconds = 60\n"
-                "ssh_connect_timeout = 3\nssh_connection_attempts = 2\n"
-            )
+            path.write_text("max_sessions = 12\nrefresh_seconds = 60\n")
             config = load_config(path)
-        self.assertEqual(("ignored.lan",), config.hosts)
-        self.assertEqual(
-            ("workstation=workstation-vpn.example|workstation.example",), config.host_routes
-        )
-        self.assertEqual("Workstation", config.aliases["legacy-host"])
-        self.assertEqual("foot --class agent", config.terminal)
-        self.assertEqual(
-            ("workstation-vpn.example", "workstation.example"), config.routes[0].route_paths
-        )
+        self.assertEqual(12, config.max_sessions)
+        self.assertEqual(60, config.refresh_seconds)
 
     def test_rejects_unknown_keys_wrong_types_and_bounds(self) -> None:
         for text in (
             "mystery = true\n",
-            'hosts = "workstation"\n',
+            'hosts = ["workstation"]\n',
+            'host_routes = ["workstation=example"]\n',
+            'aliases = ["workstation=workstation"]\n',
+            'terminal = "ghostty"\n',
             "max_sessions = 0\n",
             "refresh_seconds = 301\n",
-            "ssh_connect_timeout = true\n",
-            'host_routes = ["bad route"]\n',
         ):
             with self.subTest(text=text), tempfile.TemporaryDirectory() as temporary:
                 path = Path(temporary) / "config.toml"
@@ -145,56 +133,49 @@ class ConfigTest(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     load_config(path)
 
-    def test_cli_values_override_config_values(self) -> None:
-        config = config_from_mapping(
-            {
-                "hosts": ["config-host"],
-                "host_routes": ["config=config-host"],
-                "aliases": ["config-host=Config"],
-                "max_sessions": 12,
-                "ssh_connect_timeout": 3,
-            }
-        )
-        args = app.build_parser().parse_args(
-            [
-                "--ssh-connect-timeout",
-                "5",
-                "list",
-                "--host",
-                "cli-host",
-                "--route",
-                "cli=cli-host",
-                "--alias",
-                "cli-host=CLI",
-                "--limit",
-                "7",
-            ]
-        )
+    def test_cli_limit_overrides_config_without_host_or_ssh_options(self) -> None:
+        config = config_from_mapping({"max_sessions": 12})
+        args = app.build_parser().parse_args(["list", "--limit", "7"])
         merged = app._apply_cli_config(config, args)
-        self.assertEqual(("cli-host",), merged.hosts)
-        self.assertEqual(("cli=cli-host",), merged.host_routes)
-        self.assertEqual({"cli-host": "CLI"}, merged.aliases)
         self.assertEqual(7, merged.max_sessions)
-        self.assertEqual(5, merged.ssh_connect_timeout)
 
-        host_only = app.build_parser().parse_args(["list", "--host", "host-only"])
-        self.assertEqual((), app._apply_cli_config(config, host_only).host_routes)
+    def test_retired_cli_commands_and_companion_options_are_rejected(self) -> None:
+        parser = app.build_parser()
+        for argv in (
+            ["open", "--id", THREAD_ID],
+            ["open-claude", "--id", THREAD_ID],
+            ["open-opencode", "--id", OPENCODE_ID],
+            ["list", "--host", "host-a"],
+            ["list", "--route", "host-a=example"],
+            ["list", "--alias", "old=host-a"],
+            ["list", "--no-local"],
+            ["list", "--stream"],
+            ["--timeout", "1", "list"],
+            ["--ssh-connect-timeout", "1", "list"],
+            ["refresh", "--terminal", "terminal"],
+        ):
+            with (
+                self.subTest(argv=argv),
+                self.assertRaises(SystemExit),
+                mock.patch("sys.stderr", new=io.StringIO()),
+            ):
+                parser.parse_args(argv)
 
-    def test_diagnostic_limit_retains_legacy_200_row_bound(self) -> None:
-        args = app.build_parser().parse_args(["list", "--limit", "200"])
-        self.assertEqual(200, app._apply_cli_config(PickerConfig(), args).max_sessions)
-        args = app.build_parser().parse_args(["list", "--limit", "201"])
-        with self.assertRaises(engine.PickerError):
+    def test_diagnostic_limit_uses_the_persisted_bound(self) -> None:
+        args = app.build_parser().parse_args(["list", "--limit", "100"])
+        self.assertEqual(100, app._apply_cli_config(PickerConfig(), args).max_sessions)
+        args = app.build_parser().parse_args(["list", "--limit", "101"])
+        with self.assertRaises(ConfigError):
             app._apply_cli_config(PickerConfig(), args)
 
-    def test_fingerprint_excludes_terminal_and_ttl_but_tracks_discovery(self) -> None:
+    def test_fingerprint_excludes_ttl_but_tracks_session_limit(self) -> None:
         original = PickerConfig()
         self.assertEqual(
             original.fingerprint,
-            original.with_overrides(terminal="foot", refresh_seconds=60).fingerprint,
+            original.with_overrides(refresh_seconds=60).fingerprint,
         )
         self.assertNotEqual(
-            original.fingerprint, original.with_overrides(hosts=["workstation"]).fingerprint
+            original.fingerprint, original.with_overrides(max_sessions=12).fingerprint
         )
 
 
@@ -206,7 +187,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.2.0", engine.VERSION)
+        self.assertEqual("0.3.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -360,7 +341,7 @@ class CacheTest(unittest.TestCase):
         self.store.clear_background_marker()
 
     def test_activity_failure_keeps_last_known_activity(self) -> None:
-        old = session(active=True, activityState="active", tmuxSession="agent")
+        old = session(active=True, activityState="active")
         previous = build_snapshot(self.config, self.events(old), now=100)
         current = build_snapshot(
             self.config,
@@ -372,7 +353,7 @@ class CacheTest(unittest.TestCase):
             now=200,
         )
         self.assertTrue(current["sessions"][0]["active"])
-        self.assertEqual("agent", current["sessions"][0]["tmuxSession"])
+        self.assertNotIn("tmux", current["sessions"][0])
 
 
 class RofiProtocolTest(unittest.TestCase):
@@ -1061,7 +1042,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("\x00keep-selection\x1ftrue", rendered)
 
     def test_selection_parser_validates_provider_ids(self) -> None:
-        payload = {"kind": "opencode", "id": OPENCODE_ID}
+        payload = json.loads(selection_payload(session("opencode", OPENCODE_ID)))
         self.assertEqual(payload, _parse_selection(json.dumps(payload)))
         with self.assertRaises(engine.PickerError):
             _parse_selection(json.dumps({"kind": "codex", "id": "bad"}))
@@ -1476,28 +1457,13 @@ class RofiProtocolTest(unittest.TestCase):
             self.assertIn("\x00keep-selection\x1ftrue", output.getvalue())
             self.assertIn("\x00keep-filter\x1ftrue", output.getvalue())
 
-    def test_selection_dispatches_each_provider_and_detaches_terminal(self) -> None:
-        for kind, identifier, resolver in (
-            ("codex", THREAD_ID, "resolve_open_target"),
-            ("claude", THREAD_ID, "resolve_claude_open_target"),
-            ("opencode", OPENCODE_ID, "resolve_opencode_open_target"),
-        ):
-            with self.subTest(kind=kind):
-                selected = session(kind, identifier)
-                with (
-                    mock.patch.object(
-                        engine, "resolve_host_target", return_value=engine.HostTarget(None)
-                    ),
-                    mock.patch.object(engine, resolver, return_value="agent-session") as opener,
-                    mock.patch.object(engine, "focus_existing_window", return_value=False),
-                    mock.patch.object(engine, "launch_attach") as launch,
-                ):
-                    from rofi_agent_plus.rofi import _open_selection
+    def test_selection_requires_the_contract_lifecycle(self) -> None:
+        from rofi_agent_plus.rofi import _open_selection
 
-                    _open_selection(selected, PickerConfig())
-                opener.assert_called_once()
-                launch.assert_called_once()
-                self.assertTrue(launch.call_args.kwargs["detach"])
+        with self.assertRaisesRegex(engine.PickerError, "prepared authority"):
+            _open_selection(session(), PickerConfig())
+        for name in ("resolve_open_target", "launch_attach", "focus_existing_window"):
+            self.assertFalse(hasattr(engine, name), name)
 
     @staticmethod
     def _config() -> PickerConfig:
@@ -1524,7 +1490,8 @@ class EntrypointTest(unittest.TestCase):
             env=environment,
         )
         self.assertEqual(0, direct.returncode)
-        self.assertIn("open-opencode", direct.stdout)
+        self.assertIn("{list,active,refresh}", direct.stdout)
+        self.assertNotIn("open-opencode", direct.stdout)
         with tempfile.TemporaryDirectory() as temporary:
             link = Path(temporary) / "picker"
             link.symlink_to(root / "bin" / "rofi-agent-plus")

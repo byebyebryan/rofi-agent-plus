@@ -1,11 +1,14 @@
 # Rofi Agent Plus Suite Integration
 
-Status: P6 discovery/correlation/cache, contract-backed open/create,
-fail-closed Rofi callbacks, deployment, and operator acceptance are complete.
-Agent Plus consumes Host Mesh v1 and Tmux Session v1 through public process
-contracts when both capability executables are available; the complete legacy
-backend remains the rollback path when zero or one is present. Tmux Plus
-retains generic rename/kill ownership; Agent Plus has no rename/kill action.
+Status: the P7 contract-only cutover is complete in version `0.3.0`; managed
+publication and deployment are coordinated through chezmoi, while operator
+acceptance remains pending. Agent Plus consumes
+Tmux Session v1 through its public process contract on every product path; Tmux
+Plus is mandatory. It consumes Host Mesh v1 when SSH Plus is available and
+otherwise uses the shared local-only identity with a `null` Mesh revision. A
+present malformed or unsupported companion is visible and never enables a
+fallback. Tmux Plus retains generic rename/kill ownership; Agent Plus has no
+rename/kill action.
 
 ## Target ownership
 
@@ -57,7 +60,7 @@ Agent Plus remains authoritative for:
 SSH Plus must not know provider commands. Tmux Plus may carry generic pane
 metadata and requested tmux `@` options but must not assign meaning to them.
 
-## Responsibilities to remove
+## Removed responsibilities
 
 After migration, Agent Plus no longer owns:
 
@@ -69,16 +72,19 @@ After migration, Agent Plus no longer owns:
 - generic local or SSH tmux attachment; or
 - raw tmux session creation and option-setting mechanics.
 
-The P6 implementation kept legacy lifecycle paths while contract open/create
-deployed and received live acceptance. Removing that compatibility code is a
-separate reviewed follow-up; acceptance does not make cleanup automatic.
+P7 removed the Agent-owned host, SSH, generic tmux, Niri, terminal, and direct
+lifecycle implementation. Agent Plus retains provider-native process probes
+and correlation helpers only; no second cross-repository Python dependency was
+introduced.
 
 ## Discovery flow
 
 A full Agent Plus refresh follows this sequence:
 
-1. Call `rofi-ssh-plus mesh list --json`, validate Host Mesh schema version 1,
-   and retain its opaque `meshRevision` for the whole refresh.
+1. When available, call `rofi-ssh-plus mesh list --json`, validate Host Mesh
+   schema version 1, and retain its opaque `meshRevision` for the whole refresh.
+   When the executable is absent, synthesize the same local-only host identity
+   as Tmux Plus and use a `null` revision.
 2. Use the local descriptor and configured remote descriptors as the provider
    discovery set.
 3. Run provider-native probes against each logical host. For remote hosts, try
@@ -86,7 +92,7 @@ A full Agent Plus refresh follows this sequence:
 4. Report only classified SSH transport results through
    `mesh report-route`, including the mesh revision and attempt completion
    time; never report a provider command failure as an unreachable route.
-5. Call `rofi-tmux-plus inventory --json --panes --mesh-revision REVISION`
+5. Concurrently call `rofi-tmux-plus inventory --json --panes [--mesh-revision REVISION]`
    with one repeated `--host` for each host in the retained discovery set and
    with the provider session options requested explicitly.
 6. Correlate provider identities, processes, pane PIDs, and tmux user options
@@ -224,12 +230,12 @@ live sessions and DMS-era wrappers for no user-facing benefit. The new generic
 Tmux Plus pending marker supersedes `@agent_picker_waiting` only for newly
 created wrappers.
 
-## Configuration migration
+## Final configuration ownership
 
 The standalone Agent Plus configuration keys move as follows when suite
 integration lands:
 
-| Current key | Target owner |
+| Former Agent key | Target owner |
 | --- | --- |
 | `hosts` | SSH Plus Host Mesh |
 | `host_routes` | SSH Plus Host Mesh |
@@ -241,15 +247,15 @@ integration lands:
 | `refresh_seconds` | Agent Plus provider cache |
 
 The coordinated deployment renders host and SSH policy into SSH Plus, terminal
-argv into Tmux Plus, and only provider-owned keys into Agent Plus. The new
-Agent configuration rejects the removed host, SSH, and terminal keys instead
-of supporting two authorities. Chezmoi converts the current terminal string to
-Tmux Plus's argv-array form; the application does not perform an old-path or
-old-schema migration.
+argv into Tmux Plus, and only provider-owned keys into Agent Plus. Agent Plus
+rejects the removed host, SSH, and terminal keys instead of supporting two
+authorities. Chezmoi converts terminal configuration to Tmux Plus's argv-array
+form; Agent Plus does not perform an old-path or old-schema migration.
 
-The current CLI route and alias overrides remain diagnostic compatibility
-tools during the migration. New integration tests exercise contract fixtures
-rather than importing owner implementations.
+The diagnostic CLI has no route, alias, host, SSH, terminal, or direct-open
+compatibility overrides. `list` and `refresh` use the selected contract backend;
+new integration tests exercise contract fixtures rather than importing owner
+implementations.
 
 ## User-visible handoffs
 
@@ -279,13 +285,14 @@ provider-specific actions or icons merely to create a reverse dependency.
 ## Failure and fallback rules
 
 - An absent SSH Plus permits local-only operation. Both Agent Plus and Tmux
-  Plus synthesize the same fallback identity: the case-folded short system
-  hostname as ID and display, with the full and short hostnames as aliases.
+  Plus synthesize the same fallback identity: the short hostname case-folded
+  as ID only when it is a valid host ID (otherwise `localhost`), the validated
+  raw short hostname as display (otherwise that ID), and the validated full
+  plus short hostnames as aliases (otherwise that ID).
   Malformed or unsupported Host Mesh output is visible and is not silently
   treated as an empty mesh.
-- An absent Tmux Plus retains the current standalone Agent Plus engine only
-  during the migration window. The final suite does not maintain two generic
-  tmux engines indefinitely.
+- An absent Tmux Plus is a visible, closed failure. Agent Plus has no
+  standalone generic tmux engine.
 - Partial host or provider failures retain valid per-host snapshots and do not
   overwrite them with empty data.
 - Route-health reporting never increments SSH user connection history.
@@ -300,15 +307,14 @@ provider-specific actions or icons merely to create a reverse dependency.
    in current source.)
 3. Add Agent Plus consumer adapters behind explicit capability detection.
    (Complete in current source.)
-4. Run legacy and contract-backed discovery side by side against deterministic
-   fixtures and compare host/session identity, activity, and lifecycle
-   decisions (open-existing, create, and active-outside-tmux refusal).
-   (Complete in P6.)
+4. Run contract-backed discovery against deterministic fixtures and compare
+   host/session identity, activity, and lifecycle decisions (open-existing,
+   create, and active-outside-tmux refusal). (Complete in P6.)
 5. Keep all three public commands and Rofi modes on the managed `PATH` and
    verify local plus remote discovery, focus, create, and resume on each
    intended host. (Complete in P6 through automated and operator acceptance.)
-6. Remove legacy host-route and generic tmux code in a later reviewed change
-   after the accepted rollback boundary is deliberately retired.
+6. Retire the accepted legacy host-route and generic tmux rollback boundary.
+   (Complete in P7; managed rollout is coordinated through chezmoi.)
 
 Acceptance requires that the same logical machine has the same host ID and
 display label in all three pickers, that a provider session maps to the same
@@ -322,7 +328,7 @@ Ctrl+G close unconditionally, while nested Escape returns to a safe root. The
 Rofi bindings must preserve native Tab row navigation and must not capture
 Ctrl+G as a script callback.
 
-## P6 acceptance and performance follow-up
+## P6 acceptance and P7 performance follow-up
 
 P6 functional acceptance is complete. The unattended gate passed from the two
 exercised managed host perspectives and covered Host Mesh identity, Agent
@@ -346,12 +352,15 @@ host observed these pre-terminal costs:
 | Tmux Plus remote open | about 0.65 s | the local work plus one SSH revalidation |
 | SSH Plus managed selection | about 0.62 s | detached-worker startup and the synchronous pre-launch reachability probe |
 
-Terminal startup is excluded from those measurements. The Agent path is the
-largest target: even a local selection currently waits for remote-host
-activity/provider discovery and then a separate all-host Tmux inventory. The
-follow-up order is to scope lifecycle refresh to the selected host and run
-independent Agent/Tmux discovery concurrently; avoid Tmux Plus's successful
-open-path model reload; then revisit SSH Plus preflight or connection reuse
-without weakening route fallback or successful-connection history semantics.
+Terminal startup is excluded from those measurements. The Agent path was the
+largest target: even a local selection waited for remote-host activity/provider
+discovery and then a separate all-host Tmux inventory. P7 now scopes lifecycle
+refresh to the selected host and starts provider discovery plus Tmux inventory
+concurrently under one deadline, while retaining stage-level failures and
+stable-reference checks. Tmux Plus now avoids the unnecessary model reload on
+a successful exact-reference open, and SSH Plus's managed prelaunch path is
+implemented without weakening route fallback or successful-connection history
+semantics. The remaining follow-up is measurement: re-profile end-to-end
+selection with actual remote revalidation and record the new observed costs.
 These measurements are diagnostic baselines, not an API guarantee or latency
 SLA.

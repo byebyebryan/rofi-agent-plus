@@ -1,27 +1,27 @@
 # Rofi Agent Plus
 
 `rofi-agent-plus` is a standalone Rofi script-mode picker for Codex CLI,
-Claude Code, and OpenCode sessions.  It ports the discovery and tmux-opening
-engine from DMS Agent Picker while keeping Rofi responsible for the searchable
-presentation and navigation.
+Claude Code, and OpenCode sessions. It owns provider-native discovery,
+correlation, and presentation while the Rofi Plus suite owns hosts and tmux
+lifecycle.
 
 The repository, executable, Python package, Rofi mode, configuration, and cache
-use the `rofi-agent-plus` name. When both public companion executables are on
-`PATH`, the implemented discovery backend consumes Host Mesh v1 from
-`rofi-ssh-plus` and live generic tmux inventory from `rofi-tmux-plus`; it
-keeps provider-native discovery, correlation, and its private cache here. If
-either companion is absent, the complete legacy backend remains the rollback
-path. In contract mode, Agent Plus revalidates a typed provider row and calls
-the public Tmux Session v1 `open` or `create` command; it never guesses an SSH
-route, Niri window, terminal argv, or raw tmux target. Rename and kill remain
-Tmux Plus management actions, not Agent Plus actions.
+use the `rofi-agent-plus` name. `rofi-tmux-plus` is mandatory and supplies
+live generic tmux inventory plus all open/create terminal lifecycle. When
+`rofi-ssh-plus` is present, Agent Plus consumes its Host Mesh v1. When it is
+absent, Agent Plus uses the suite's local-only identity and still discovers and
+resumes local provider sessions through Tmux Plus. A present malformed or
+unsupported companion contract is a visible failure, never a fallback. Agent
+Plus revalidates a typed provider row and calls the public Tmux Session v1
+`open` or `create` command; it never guesses an SSH route, Niri window,
+terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
+actions, not Agent Plus actions.
 
-Version `0.2.0` supports Python 3.11+ and has no runtime package dependencies.
-The current core contract requires Python 3, the Codex CLI, SSH, tmux, and a
-terminal with `-e` support.  Claude Code and OpenCode are optional provider
-tools: their sessions are included only on hosts where the corresponding
-binary is installed.  Remote hosts need Python 3, tmux, and whichever provider
-tools they expose, but do not need this repository installed.
+Version `0.3.0` supports Python 3.11+ and has no runtime package dependencies.
+The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
+`PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
+also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
+expose; they do not need this repository installed.
 
 ## Install and run
 
@@ -64,7 +64,7 @@ metadata is typed JSON, so opening a session never depends on parsing visible
 text.  A trailing `›` and host/provider icon make drill-down groups easy to
 recognize; groups containing active sessions receive the same active styling as
 session rows.  Breadcrumb prompts identify the current root or nested group,
-for example `Agents › Hosts › workstation` or
+for example `Agents › Hosts › host-a` or
 `Agents › Providers › Codex`.
 
 Rows use a two-line layout: the session title is primary, while a smaller
@@ -74,10 +74,9 @@ names and aliases remain in the row's filter text and invisible Rofi metadata,
 so searching for `codex`, `claude`, `Claude Code`, or `opencode` still works.
 The complete session identity is carried in Rofi's `info` metadata, not parsed
 from visible text.  Active rows are marked with Rofi's active-row metadata.  A
-successful legacy selection preserves the established focus/resume/create
-path. A contract selection instead uses Tmux Plus to focus or launch the
-terminal, or to create a deferred provider-resume wrapper with typed provider
-options. Icon provenance and trademark notes are in [`ASSETS.md`](ASSETS.md).
+selection uses Tmux Plus to focus or launch the terminal, or to create a
+deferred provider-resume wrapper with typed provider options. Icon provenance
+and trademark notes are in [`ASSETS.md`](ASSETS.md).
 
 ## Configuration
 
@@ -87,32 +86,25 @@ Configuration is optional and lives at
 are in [`examples/config.toml`](examples/config.toml):
 
 ```toml
-hosts = ["laptop.lan"]
-host_routes = ["workstation=workstation-vpn.example|workstation.example"]
-aliases = ["legacy-host=workstation"]
-terminal = "ghostty"
 max_sessions = 40
 refresh_seconds = 30
-ssh_connect_timeout = 2
-ssh_connection_attempts = 1
 ```
 
-Host routes take precedence over `hosts`.  Routes use
-`logical=preferred|fallback`; the logical name is displayed and the selected
-route is retained for opening.  Malformed TOML, unknown keys, wrong types, and
-out-of-range values are reported visibly in Rofi.  Diagnostic CLI values such
-as `--route`, `--host`, `--alias`, `--timeout`, and the SSH policy options
-override the file for side-by-side testing.
+Agent Plus accepts only provider-owned `max_sessions` and `refresh_seconds`.
+Host routes, aliases, SSH policy, and terminal settings belong to SSH Plus or
+Tmux Plus and are rejected here. Malformed TOML, unknown keys, wrong types,
+and out-of-range values are reported visibly in Rofi. The diagnostic `list`
+command may temporarily override only `max_sessions` with `--limit`.
 
 ## Cache visibility
 
 The picker stores a private, versioned snapshot under
 `$XDG_CACHE_HOME/rofi-agent-plus/`, or `~/.cache/rofi-agent-plus/`.  The
 directory is mode 0700 and cache/lock files are mode 0600.  Writes use a
-temporary file, fsync, and atomic replacement.  The snapshot fingerprint
-includes host routes, hosts, aliases, session limit, and SSH policy. Contract
-snapshots also carry backend identity and the exact Host Mesh revision, so a
-legacy or older-Mesh result is never rendered as current contract data. A
+temporary file, fsync, and atomic replacement. The snapshot fingerprint
+includes the provider session limit. Snapshots also carry contract identity and
+the exact Host Mesh revision (or the explicit local-only `null` revision), so
+data from a changed authority is never rendered as current. A
 discovery-affecting configuration or authority change causes a synchronous
 refresh.
 
@@ -138,27 +130,25 @@ The same executable has a JSON CLI when called without `ROFI_RETV`:
 
 ```sh
 ./bin/rofi-agent-plus list --limit 40
-./bin/rofi-agent-plus list --route 'workstation=workstation-vpn.example|workstation.example' --stream
 ./bin/rofi-agent-plus active
-./bin/rofi-agent-plus open --host local --id UUID --name project --cwd "$PWD" --detach
-./bin/rofi-agent-plus open-claude --host local --id UUID --detach
-./bin/rofi-agent-plus open-opencode --host local --id ses_... --detach
 ./bin/rofi-agent-plus refresh
 ```
 
-The legacy provider engine preserves DMS-created tmux option names and opening
-behavior, including Codex `@codex_thread_id`, Claude
-`@claude_session_id`, OpenCode `@opencode_session_id`, waiting-session reuse,
-Niri window focus, and remote SSH attach behavior.  OpenCode discovery keeps
-the root-only `parent_id IS NULL` filter and all-project scope.
+`list` and `refresh` exercise the selected public contract backend. `active`
+is a provider-process diagnostic only: it does not inspect tmux or open a
+session. Direct `open`, provider-specific open, host/route/alias, no-local,
+SSH-policy, and terminal CLI options were retired in 0.3.0. Existing tmux
+option spellings remain correlation inputs, including `@codex_thread_id`,
+`@claude_session_id`, `@opencode_session_id`, and `@agent_picker_waiting`.
+OpenCode discovery keeps the root-only `parent_id IS NULL` filter and
+all-project scope.
 
 ## Deployment and ownership
 
-This repository is the canonical implementation of Agent Plus. A later,
-coordinated deployment will move Chezmoi's release pin, Rofi mode, host
-configuration, and Niri binding to the new name. Until then, the existing live
-Agent Picker deployment remains unchanged. DMS remains responsible for the
-bar, notifications, idle handling, lock screen, polkit, and the general
+This repository is the canonical implementation of Agent Plus. A coordinated
+Chezmoi deployment pins its release, installs the public command and Rofi mode,
+and keeps only provider-owned Agent Plus configuration. DMS remains responsible
+for the bar, notifications, idle handling, lock screen, polkit, and the general
 Spotlight launcher.
 
 The former DMS Agent Picker repository is retained for compatibility and

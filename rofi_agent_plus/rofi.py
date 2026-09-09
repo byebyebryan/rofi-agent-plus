@@ -7,7 +7,6 @@ import math
 import os
 import re
 import signal
-import socket
 import sys
 import time
 import unicodedata
@@ -260,7 +259,7 @@ def _age(timestamp: object, now: float | None = None) -> str:
 
 def _session_key(session: Mapping[str, Any]) -> tuple[str, str, str]:
     return (
-        str(session.get("windowHost") or session.get("host") or "local"),
+        str(session.get("hostId") or session.get("host") or "local"),
         str(session.get("kind") or ""),
         str(session.get("id") or ""),
     )
@@ -285,7 +284,7 @@ def _session_sort_key(session: Mapping[str, Any]) -> tuple[object, ...]:
 
     timestamp = _recency_timestamp(session.get("recencyAt"))
     name = sanitize(session.get("name") or session.get("id") or "Agent")
-    host = sanitize(session.get("host") or session.get("windowHost") or "local")
+    host = sanitize(session.get("host") or session.get("hostId") or "local")
     kind = sanitize(session.get("kind") or "")
     identifier = sanitize(session.get("id") or "")
     return (
@@ -316,14 +315,18 @@ def _valid_sessions(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]:
         identifier = item.get("id")
         if not isinstance(kind, str) or kind not in PROVIDER_LABELS:
             continue
-        if not isinstance(identifier, str) or not identifier:
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or item.get("contractMode") is not True
+        ):
             continue
         result.append(dict(item))
     return result
 
 
 def _session_host(session: Mapping[str, Any]) -> str:
-    return sanitize(session.get("host") or session.get("windowHost") or "local") or "local"
+    return sanitize(session.get("host") or session.get("hostId") or "local") or "local"
 
 
 def _newest_session_timestamp(sessions: Sequence[Mapping[str, Any]]) -> float | None:
@@ -428,7 +431,7 @@ def _navigation_data(navigation: NavigationState) -> str:
 
 
 def _parse_navigation_state(value: object) -> NavigationState:
-    """Decode navigation state while accepting legacy refresh-only data."""
+    """Decode navigation state while accepting older refresh-only data."""
 
     if not isinstance(value, str):
         return NavigationState()
@@ -474,33 +477,18 @@ parse_navigation_state = _parse_navigation_state
 def selection_payload(session: Mapping[str, Any]) -> str:
     """Encode a row's trusted selection identity for ``ROFI_INFO``."""
 
-    payload = {
-        key: session[key]
-        for key in (
-            "kind",
-            "id",
-            "name",
-            "cwd",
-            "host",
-            "windowHost",
-            "connectHost",
-            "route",
-        )
-        if key in session
-    }
-    if session.get("contractMode") is True:
-        # Contract rows must carry their authority and subordinate stable tmux
-        # reference through Rofi.  Dropping this marker would let a callback
-        # silently reinterpret a logical host as legacy SSH input.
-        payload.update(
-            {
-                "contractMode": True,
-                "hostId": session.get("hostId"),
-                "backend": session.get("backend"),
-            }
-        )
-        if "tmux" in session:
-            payload["tmux"] = session["tmux"]
+    if session.get("contractMode") is not True:
+        raise engine.PickerError("Rofi can only open contract-backed sessions")
+    payload = {key: session[key] for key in ("kind", "id", "name", "cwd", "host") if key in session}
+    payload.update(
+        {
+            "contractMode": True,
+            "hostId": session.get("hostId"),
+            "backend": session.get("backend"),
+        }
+    )
+    if "tmux" in session:
+        payload["tmux"] = session["tmux"]
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -508,7 +496,7 @@ def _row_text(session: Mapping[str, Any], now: float | None = None) -> str:
     kind = str(session.get("kind") or "")
     provider = PROVIDER_LABELS.get(kind, kind.title() or "Agent")
     name = sanitize(session.get("name") or session.get("id") or "Agent")
-    host = sanitize(session.get("host") or session.get("windowHost") or "local")
+    host = sanitize(session.get("host") or session.get("hostId") or "local")
     cwd = _shorten_cwd(session.get("cwd"))
     age = _age(session.get("recencyAt"), now)
     activity = sanitize(
@@ -521,7 +509,7 @@ def _row_display(session: Mapping[str, Any], now: float | None = None) -> str:
     """Return the two-line Pango presentation for one session row."""
 
     name = sanitize(session.get("name") or session.get("id") or "Agent")
-    host = sanitize(session.get("host") or session.get("windowHost") or "local")
+    host = sanitize(session.get("host") or session.get("hostId") or "local")
     cwd = _shorten_cwd(session.get("cwd"))
     age = _age(session.get("recencyAt"), now)
     activity = sanitize(
@@ -662,7 +650,7 @@ def _parse_error_notice(value: object) -> tuple[float | None, str]:
 
 
 def _parse_continuation_state(value: object) -> ContinuationState:
-    """Parse current and legacy Rofi continuation components together."""
+    """Parse current and older Rofi continuation components together."""
 
     refresh_deadline = _parse_refresh_deadline(value)
     error_deadline, error_message = _parse_error_notice(value)
@@ -904,37 +892,41 @@ def _parse_selection(raw: str | None) -> dict[str, Any]:
             raise engine.PickerError("Rofi selection contains an invalid session id")
     elif not engine.OPENCODE_ID_PATTERN.fullmatch(identifier):
         raise engine.PickerError("Rofi selection contains an invalid session id")
-    if payload.get("contractMode") is True:
-        host_id = payload.get("hostId")
-        backend = payload.get("backend")
-        if (
-            not isinstance(host_id, str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", host_id, re.ASCII)
-            or not isinstance(backend, Mapping)
-            or backend.get("kind") != "contract"
-            or backend.get("capability") != "host-mesh-v1+tmux-session-v1"
-            or not _contract_text(backend.get("meshRevision"))
-            or backend["meshRevision"].strip() != backend["meshRevision"]
-            or any(char.isspace() for char in backend["meshRevision"])
-        ):
-            raise engine.PickerError("Rofi contract selection metadata is incomplete")
-        tmux = payload.get("tmux")
-        if tmux is not None:
-            if (
-                not isinstance(tmux, Mapping)
-                or tmux.get("meshRevision") != backend["meshRevision"]
-                or not _contract_text(tmux.get("serverGeneration"))
-                or not isinstance(tmux.get("sessionId"), str)
-                or not re.fullmatch(r"\$[0-9]+", tmux["sessionId"], re.ASCII)
-                or isinstance(tmux.get("createdAt"), bool)
-                or not isinstance(tmux.get("createdAt"), int)
-                or tmux["createdAt"] < 0
-                or tmux.get("observedName") is not None
-                and not _contract_text(tmux.get("observedName"))
-            ):
-                raise engine.PickerError("Rofi contract tmux metadata is invalid")
-    elif "contractMode" in payload:
+    if payload.get("contractMode") is not True:
         raise engine.PickerError("Rofi contract selection metadata is invalid")
+    host_id = payload.get("hostId")
+    backend = payload.get("backend")
+    revision = backend.get("meshRevision") if isinstance(backend, Mapping) else object()
+    if (
+        not isinstance(host_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", host_id, re.ASCII)
+        or not isinstance(backend, Mapping)
+        or backend.get("kind") != "contract"
+        or backend.get("capability") != "host-mesh-v1+tmux-session-v1"
+        or revision is not None
+        and (
+            not _contract_text(revision)
+            or not isinstance(revision, str)
+            or revision.strip() != revision
+            or any(char.isspace() for char in revision)
+        )
+    ):
+        raise engine.PickerError("Rofi contract selection metadata is incomplete")
+    tmux = payload.get("tmux")
+    if tmux is not None:
+        if (
+            not isinstance(tmux, Mapping)
+            or tmux.get("meshRevision") != revision
+            or not _contract_text(tmux.get("serverGeneration"))
+            or not isinstance(tmux.get("sessionId"), str)
+            or not re.fullmatch(r"\$[0-9]+", tmux["sessionId"], re.ASCII)
+            or isinstance(tmux.get("createdAt"), bool)
+            or not isinstance(tmux.get("createdAt"), int)
+            or tmux["createdAt"] < 0
+            or tmux.get("observedName") is not None
+            and not _contract_text(tmux.get("observedName"))
+        ):
+            raise engine.PickerError("Rofi contract tmux metadata is invalid")
     return payload
 
 
@@ -1023,48 +1015,14 @@ def _open_selection(
     store: CacheStore | None = None,
     context: PresentationContext | None = None,
 ) -> None:
-    if selection.get("contractMode") is True:
-        if store is None or context is None:
-            raise engine.PickerError("contract-backed open requires a prepared authority")
-        lifecycle = (
-            ContractLifecycle(store, config, context)
-            if timeout is None
-            else ContractLifecycle(store, config, context, timeout=timeout)
-        )
-        lifecycle.open_or_create(selection)
-        return
-    # Preserve the established legacy default while leaving ``None`` available
-    # to mean the contract lifecycle's independently bounded action budget.
-    timeout = engine.DEFAULT_TIMEOUT if timeout is None else timeout
-    route_value = selection.get("route")
-    host_value = route_value or selection.get("connectHost") or "local"
-    if not isinstance(host_value, str):
-        raise engine.PickerError("selected session has an invalid host")
-    target = engine.resolve_host_target(engine.parse_host_target(host_value), config.ssh_policy)
-    identifier = str(selection["id"])
-    name = selection.get("name") if isinstance(selection.get("name"), str) else None
-    cwd = selection.get("cwd") if isinstance(selection.get("cwd"), str) else None
-    kind = str(selection["kind"])
-    if kind == "codex":
-        session = engine.resolve_open_target(
-            target, identifier, name, cwd, timeout, config.ssh_policy
-        )
-    elif kind == "claude":
-        session = engine.resolve_claude_open_target(
-            target, identifier, name, cwd, timeout, config.ssh_policy
-        )
-    else:
-        session = engine.resolve_opencode_open_target(
-            target, identifier, name, cwd, timeout, config.ssh_policy
-        )
-    window_host = selection.get("windowHost")
-    if not isinstance(window_host, str) or not window_host:
-        window_host = target.connect_host or socket.gethostname()
-    if engine.focus_existing_window(session, window_host, timeout):
-        return
-    # Rofi is itself the foreground UI.  The terminal must be detached so
-    # returning from this function lets Rofi close immediately.
-    engine.launch_attach(target, session, config.terminal, config.ssh_policy, detach=True)
+    if selection.get("contractMode") is not True or store is None or context is None:
+        raise engine.PickerError("contract-backed open requires a prepared authority")
+    lifecycle = (
+        ContractLifecycle(store, config, context)
+        if timeout is None
+        else ContractLifecycle(store, config, context, timeout=timeout)
+    )
+    lifecycle.open_or_create(selection)
 
 
 def _background_command() -> list[str]:
@@ -1090,7 +1048,7 @@ def _presentation_snapshot(
     """Read only the capability/revision selected for this invocation.
 
     Production context always gates by capability and Mesh revision.  An
-    explicit invalid/mock context keeps the legacy test seam as a safe
+    explicit invalid/mock context keeps the test seam as a safe
     non-production fallback instead of making class identity a security
     boundary.
     """
@@ -1506,7 +1464,7 @@ def run_rofi(
     # A present but malformed companion pair is never the same thing as an
     # absent capability.  Render its bounded diagnostic for every non-exit
     # callback, including structural navigation and a selected row, before
-    # any callback can silently render an empty legacy-shaped list.
+    # any callback can silently render an empty untyped list.
     if context is not None and context.error:
         if retv == ROFI_RETV_CUSTOM_6:
             rendered = _escape_error_output(
@@ -1602,12 +1560,7 @@ def run_rofi(
                     end="",
                 )
                 return 0
-            if selected.get("contractMode") is True:
-                _open_selection(selected, config, store=store, context=context)
-            else:
-                # Preserve the legacy callback and opening path exactly while
-                # a missing companion pair remains the rollback authority.
-                _open_selection(selected, config)
+            _open_selection(selected, config, store=store, context=context)
             # No rows means Rofi closes after a successful action.
             return 0
         except Exception as exc:  # noqa: BLE001 - selected callback boundary

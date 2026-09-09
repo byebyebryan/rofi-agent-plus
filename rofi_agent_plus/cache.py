@@ -19,9 +19,8 @@ from typing import Any
 from . import engine
 from .config import PickerConfig
 
-# v2 adds the discovery authority identity.  A Host Mesh revision is part of
-# cache validity, so a legacy or older-Mesh snapshot can never be consumed as
-# current contract data.
+# v2 adds the discovery authority identity.  A Host Mesh revision (or the
+# explicit local-only ``null`` identity) is part of cache validity.
 CACHE_VERSION = 2
 DEFAULT_CACHE_DIR = Path("rofi-agent-plus")
 SNAPSHOT_NAME = "snapshot.json"
@@ -171,9 +170,9 @@ def _merge_host_snapshot(
                 # only its own state; an old tmux display name without the
                 # matching current nested reference would be false authority.
                 activity_fields = ("active", "activityState")
-                # The contract path owns tmux authority separately.  Keep
-                # legacy's pre-existing broad activity fallback unchanged as
-                # its rollback behavior still carries that private field.
+                # Contract rows own tmux authority separately. Older cache
+                # records may still carry this display-only field, so do not
+                # reinterpret it as a current contract reference.
                 if old.get("contractMode") is not True and fresh.get("contractMode") is not True:
                     activity_fields += ("tmuxSession",)
                 for field in activity_fields:
@@ -203,7 +202,6 @@ def _backend_identity(value: object) -> dict[str, object] | None:
     capability = value.get("capability")
     revision = value.get("meshRevision")
     expected_capability = {
-        "legacy": "legacy-v1",
         "contract": "host-mesh-v1+tmux-session-v1",
         "contract-error": "host-mesh-v1+tmux-session-v1",
     }.get(kind)
@@ -216,9 +214,7 @@ def _backend_identity(value: object) -> dict[str, object] | None:
         or any(char.isspace() or ord(char) < 32 for char in revision)
     ):
         return None
-    if kind in {"legacy", "contract-error"} and revision is not None:
-        return None
-    if kind == "contract" and revision is None:
+    if kind == "contract-error" and revision is not None:
         return None
     return {"kind": kind, "capability": capability, "meshRevision": revision}
 
@@ -285,19 +281,62 @@ def _flatten_errors(hosts: Mapping[str, Mapping[str, Any]]) -> list[dict[str, st
     return errors
 
 
+def _scoped_generated_at(
+    previous: Mapping[str, Any] | None,
+    backend: Mapping[str, object],
+) -> int:
+    """Keep a partial lifecycle check from refreshing peer-host TTLs."""
+
+    if previous is None or _backend_identity(previous.get("backend")) != dict(backend):
+        return 0
+    value = previous.get("generatedAt")
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _require_complete_contract_transaction(snapshot: Mapping[str, Any]) -> None:
+    """Reject an aborted transaction before a lifecycle action uses old rows.
+
+    Provider and inventory failures are classified per host and remain useful
+    to ``ContractLifecycle._provider_row``. In contrast, refresh/contract
+    failures mean the selected host was never authoritatively revalidated, so
+    retaining its old row must not permit an open or create action.
+    """
+
+    backend = _backend_identity(snapshot.get("backend"))
+    if backend is None or backend["kind"] != "contract":
+        raise engine.PickerError("Agent Plus lifecycle revalidation has no current contract")
+    errors = snapshot.get("errors")
+    if not isinstance(errors, list):
+        raise engine.PickerError("Agent Plus lifecycle revalidation returned invalid errors")
+    for error in errors:
+        if not isinstance(error, Mapping):
+            raise engine.PickerError("Agent Plus lifecycle revalidation returned invalid errors")
+        stage = error.get("stage")
+        if stage in {"contract", "refresh"}:
+            message = str(error.get("message") or "transaction did not complete")
+            raise engine.PickerError(f"Agent Plus lifecycle revalidation failed: {message}")
+
+
 def build_snapshot(
     config: PickerConfig,
     events: Iterator[dict[str, Any]],
     previous: Mapping[str, Any] | None = None,
     now: int | None = None,
+    *,
+    retain_unselected_hosts: bool = False,
 ) -> dict[str, Any]:
     """Build a versioned snapshot from the engine's per-host event stream."""
 
     hosts: dict[str, dict[str, Any]] = {}
     refresh_errors: list[dict[str, str]] = []
     backend: dict[str, object] = {
-        "kind": "legacy",
-        "capability": "legacy-v1",
+        "kind": "contract",
+        "capability": "host-mesh-v1+tmux-session-v1",
         "meshRevision": None,
     }
     expected_hosts: set[str] | None = None
@@ -348,10 +387,10 @@ def build_snapshot(
                 # Contract Mesh is authoritative for host membership.  Start
                 # from compatible old rows only for currently declared hosts,
                 # which prunes removed hosts before any cache merge.
-                if backend["kind"] != "contract" or (
+                if backend["kind"] == "contract" and (
                     previous is not None and _backend_identity(previous.get("backend")) == backend
                 ):
-                    preserve_previous(expected_hosts if backend["kind"] == "contract" else None)
+                    preserve_previous(None if retain_unselected_hosts else expected_hosts)
             elif kind == "host-complete":
                 key = str(event.get("host") or "local")
                 if expected_hosts is not None and key not in expected_hosts:
@@ -403,7 +442,16 @@ def build_snapshot(
             )
         return _failed_contract_snapshot(config, previous, backend, refresh_errors)
 
-    generated_at = int(now if now is not None else time.time())
+    # A lifecycle revalidation only refreshes one host.  Its selected-host
+    # snapshot is current, but advancing the top-level timestamp would bless
+    # every retained peer as globally fresh and suppress the required next
+    # all-host discovery.  An absent/incompatible prior authority falls back
+    # to zero so this partial result is never treated as a full refresh.
+    generated_at = (
+        _scoped_generated_at(previous, backend)
+        if retain_unselected_hosts
+        else int(now if now is not None else time.time())
+    )
     errors = _flatten_errors(hosts)
     errors.extend(refresh_errors)
     return {
@@ -480,10 +528,8 @@ class CacheStore:
             selected = select_backend()
         else:
             selected = self._backend_selector()
-        # Only the concrete public-contract consumer supports the optional
-        # deadline parameter.  Keep injected legacy/fake seams byte-for-byte
-        # compatible while ensuring a lifecycle authority re-check cannot
-        # create a second independent Host Mesh budget.
+        # Keep injected test seams compatible while ensuring a lifecycle
+        # authority re-check cannot create a second independent Mesh budget.
         if deadline is not None:
             from .contract_backend import ContractBackend
 
@@ -679,6 +725,7 @@ class CacheStore:
         wait_seconds: float = LOCK_WAIT_SECONDS,
         context: PresentationContext | None = None,
         deadline: float | None = None,
+        host_ids: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """Synchronously refresh, with bounded lock waiting and safe fallback."""
 
@@ -703,6 +750,8 @@ class CacheStore:
                     "fingerprint": config.fingerprint,
                     "backend": failure_backend,
                 }
+                if require_fresh:
+                    _require_complete_contract_transaction(snapshot)
                 return snapshot
             try:
                 if context is not None:
@@ -729,6 +778,8 @@ class CacheStore:
                     "fingerprint": config.fingerprint,
                     "backend": failure_backend,
                 }
+                if require_fresh:
+                    _require_complete_contract_transaction(snapshot)
                 return snapshot
             backend_identity = dict(identity)
 
@@ -737,13 +788,12 @@ class CacheStore:
                 _previous: Mapping[str, Any] | None,
             ) -> Iterator[dict[str, Any]]:
                 assert selected_backend is not None
-                if (
-                    deadline is not None
-                    and backend_identity is not None
-                    and backend_identity.get("kind") == "contract"
-                ):
-                    return iter(selected_backend.stream(discovery_config, deadline=deadline))  # type: ignore[union-attr]
-                return iter(selected_backend.stream(discovery_config))  # type: ignore[union-attr]
+                kwargs: dict[str, object] = {}
+                if deadline is not None:
+                    kwargs["deadline"] = deadline
+                if host_ids is not None:
+                    kwargs["host_ids"] = host_ids
+                return iter(selected_backend.stream(discovery_config, **kwargs))  # type: ignore[union-attr]
 
             discover = backend_discover
         previous = self.load(config.fingerprint, backend_identity)
@@ -757,8 +807,16 @@ class CacheStore:
                     # completed the refresh while we were waiting.
                     previous = self.load(config.fingerprint, backend_identity)
                     if not force and self.is_fresh(previous, config.refresh_seconds):
-                        return previous or _empty_snapshot(config)
-                    snapshot = build_snapshot(config, discover(config, previous), previous)
+                        cached = previous or _empty_snapshot(config)
+                        if require_fresh:
+                            _require_complete_contract_transaction(cached)
+                        return cached
+                    snapshot = build_snapshot(
+                        config,
+                        discover(config, previous),
+                        previous,
+                        retain_unselected_hosts=host_ids is not None,
+                    )
                     if uses_selected_backend:
                         # An old detached owner may finish after Mesh/capability
                         # changed.  Re-observe while still holding the mutation
@@ -776,7 +834,7 @@ class CacheStore:
                             }
                         if _backend_identity(snapshot.get("backend")) != current_identity:
                             current = self.load(config.fingerprint, current_identity)
-                            return current or {
+                            authority_changed = current or {
                                 "version": CACHE_VERSION,
                                 "fingerprint": config.fingerprint,
                                 "generatedAt": 0,
@@ -791,6 +849,9 @@ class CacheStore:
                                     }
                                 ],
                             }
+                            if require_fresh:
+                                _require_complete_contract_transaction(authority_changed)
+                            return authority_changed
                     self.write(snapshot)
                     backend = _backend_identity(snapshot.get("backend"))
                     self._last_refresh_scope = (
@@ -798,15 +859,18 @@ class CacheStore:
                         if backend is not None
                         else None
                     )
+                    if require_fresh:
+                        _require_complete_contract_transaction(snapshot)
                     return snapshot
             current = self.load(config.fingerprint, backend_identity)
-            # Lifecycle actions must not reinterpret a lock-contended retained
-            # snapshot as a synchronous revalidation.  A just-completed,
-            # same-authority concurrent refresh is safe to consume; anything
-            # older remains ordinary picker fallback data only.
-            if current is not None and (
-                (require_fresh and self.age(current) <= 1.0)
-                or (not require_fresh and (not force or self.age(current) <= 1.0))
+            # A lifecycle action must not reinterpret any lock-contended cache
+            # snapshot as its selected-host revalidation. Ordinary picker
+            # callbacks may consume a just-completed same-authority refresh;
+            # older data remains ordinary picker fallback only.
+            if (
+                current is not None
+                and not require_fresh
+                and (not force or self.age(current) <= 1.0)
             ):
                 return current
             if time.monotonic() >= lock_deadline:
@@ -828,8 +892,8 @@ class CacheStore:
         owner: str | None = None,
     ) -> bool:
         if scope is None and owner is None:
-            # Preserve the legacy unscoped status seam; production Rofi passes
-            # a typed capability scope and owned cleanup always passes owner.
+            # Preserve this unscoped test seam; production Rofi passes a typed
+            # capability scope and owned cleanup always passes an owner.
             return True
         if not isinstance(payload, Mapping):
             return False
@@ -975,23 +1039,12 @@ def _empty_snapshot(config: PickerConfig) -> dict[str, Any]:
         "version": CACHE_VERSION,
         "fingerprint": config.fingerprint,
         "generatedAt": int(time.time()),
-        "backend": {"kind": "legacy", "capability": "legacy-v1", "meshRevision": None},
+        "backend": {
+            "kind": "contract-error",
+            "capability": "host-mesh-v1+tmux-session-v1",
+            "meshRevision": None,
+        },
         "hosts": {},
         "sessions": [],
         "errors": [],
     }
-
-
-def _discover(
-    config: PickerConfig,
-    _previous: Mapping[str, Any] | None,
-) -> Iterator[dict[str, Any]]:
-    yield from engine.stream_session_events(
-        config.hosts,
-        config.max_sessions,
-        engine.DEFAULT_TIMEOUT,
-        include_local=True,
-        aliases=config.aliases,
-        routes=config.routes,
-        ssh_policy=config.ssh_policy,
-    )
