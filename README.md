@@ -5,6 +5,11 @@ Claude Code, and OpenCode sessions. It owns provider-native discovery,
 correlation, and presentation while the Rofi Plus suite owns hosts and tmux
 lifecycle.
 
+The repository contains the published P9 consumer implementation: it vendors
+and independently validates exact released Host Mesh v1 and Tmux Session v1
+bundles through their public process contracts. Managed suite deployment is
+coordinated through chezmoi.
+
 The repository, executable, Python package, Rofi mode, configuration, and cache
 use the `rofi-agent-plus` name. `rofi-tmux-plus` is mandatory and supplies
 live generic tmux inventory plus all open/create terminal lifecycle. When

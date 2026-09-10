@@ -25,8 +25,10 @@ from rofi_agent_plus.contract_backend import (
     ContractBackend,
     ContractError,
     StaleMeshError,
+    _error_envelope_code,
     _inventory,
     _inventory_args,
+    _raise_command_failure,
     _run_bounded,
     _tmux_association,
     _validate_active,
@@ -46,7 +48,8 @@ def fixture(name: str) -> dict[str, object]:
 
 
 def output(argv: list[str], stdout: object, *, code: int = 0, stderr: str = "") -> CommandOutput:
-    return CommandOutput(tuple(argv), code, json.dumps(stdout), stderr)
+    encoded = json.dumps(stdout, separators=(",", ":")) + "\n"
+    return CommandOutput(tuple(argv), code, encoded, stderr, stdout_bytes=encoded.encode())
 
 
 class MeshParseTest(unittest.TestCase):
@@ -144,7 +147,7 @@ class InventoryContractTest(unittest.TestCase):
                 "--json",
                 "--panes",
                 "--mesh-revision",
-                "sha256:mesh-v1",
+                "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
                 "--host",
                 "alpha",
                 "--host",
@@ -193,13 +196,32 @@ class InventoryContractTest(unittest.TestCase):
         with self.assertRaises(ContractError):
             _inventory(malformed, self.mesh)
 
+    def test_remote_domain_error_may_have_no_reached_route(self) -> None:
+        payload = copy.deepcopy(self.payload)
+        beta = payload["hosts"][1]
+        beta.update(
+            {
+                "status": "error",
+                "route": None,
+                "error": {"code": "operation_failed", "message": "remote command failed"},
+            }
+        )
+        parsed = _inventory(payload, self.mesh)
+        self.assertEqual("error", parsed["beta"]["status"])
+
     def test_duplicate_option_and_process_conflict_are_ambiguous(self) -> None:
         host = self.payload["hosts"][0]
         duplicated = copy.deepcopy(host)
         second = copy.deepcopy(duplicated["sessions"][0])
         second.update({"sessionId": "$9", "createdAt": 99, "name": "other"})
         duplicated["sessions"].append(second)
-        association, error = _tmux_association(duplicated, "codex", THREAD, {}, "sha256:mesh-v1")
+        association, error = _tmux_association(
+            duplicated,
+            "codex",
+            THREAD,
+            {},
+            "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
+        )
         self.assertIsNone(association)
         self.assertEqual("ambiguous provider correlation", error)
 
@@ -214,7 +236,7 @@ class InventoryContractTest(unittest.TestCase):
             "codex",
             THREAD,
             {"pid": 88, "ancestors": [88]},
-            "sha256:mesh-v1",
+            "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         )
         self.assertIsNone(association)
         self.assertEqual("provider option conflicts with process correlation", error)
@@ -222,7 +244,11 @@ class InventoryContractTest(unittest.TestCase):
     def test_nullable_producer_descriptor_keeps_stable_reference(self) -> None:
         parsed = _inventory(fixture("tmux-inventory-nullable-v1.json"), self.mesh)
         association, error = _tmux_association(
-            parsed["alpha"], "codex", THREAD, {}, "sha256:mesh-v1"
+            parsed["alpha"],
+            "codex",
+            THREAD,
+            {},
+            "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         )
         self.assertIsNone(error)
         assert association is not None
@@ -232,7 +258,11 @@ class InventoryContractTest(unittest.TestCase):
     def test_option_claims_mark_associations_but_process_only_claims_do_not(self) -> None:
         host = copy.deepcopy(self.payload["hosts"][0])
         association, error = _tmux_association(
-            host, "codex", THREAD, {"pid": 12345, "ancestors": [12345]}, "sha256:mesh-v1"
+            host,
+            "codex",
+            THREAD,
+            {"pid": 12345, "ancestors": [12345]},
+            "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         )
         self.assertIsNone(error)
         assert association is not None
@@ -245,7 +275,7 @@ class InventoryContractTest(unittest.TestCase):
             "codex",
             THREAD,
             {"pid": 12345, "ancestors": [12345]},
-            "sha256:mesh-v1",
+            "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         )
         self.assertIsNone(error)
         assert association is not None
@@ -253,6 +283,70 @@ class InventoryContractTest(unittest.TestCase):
 
 
 class BackendSelectionAndTransportTest(unittest.TestCase):
+    def test_host_list_exit_and_body_envelopes_must_match(self) -> None:
+        mesh_payload = fixture("mesh-v1.json")
+        error_payload = {
+            "schemaVersion": 1,
+            "ok": False,
+            "error": {"code": "operation_failed", "message": "failed"},
+        }
+        for returncode, payload in ((2, mesh_payload), (0, error_payload)):
+            with self.subTest(returncode=returncode):
+                backend = ContractBackend(
+                    "rofi-ssh-plus",
+                    "rofi-tmux-plus",
+                    runner=lambda argv, payload=payload, returncode=returncode, **_kwargs: output(
+                        argv, payload, code=returncode
+                    ),
+                )
+                with self.assertRaises(ContractError):
+                    backend.prepare()
+
+    def test_error_envelope_uses_the_inventory_byte_cap(self) -> None:
+        payload = {
+            "schemaVersion": 1,
+            "ok": False,
+            "error": {"code": "operation_failed", "message": "failed"},
+        }
+        payload["extensions"] = {f"field{index}": "x" * (16 * 1024) for index in range(40)}
+        encoded = json.dumps(payload, separators=(",", ":")) + "\n"
+        command = CommandOutput(
+            (),
+            2,
+            encoded,
+            "",
+            stdout_bytes=encoded.encode(),
+        )
+        self.assertIsNone(_error_envelope_code(command))
+        self.assertEqual(
+            "operation_failed",
+            _error_envelope_code(command, limit=1 << 20),
+        )
+
+    def test_typed_tmux_errors_validate_host_id_before_stale_recovery(self) -> None:
+        payload = {
+            "schemaVersion": 1,
+            "ok": False,
+            "error": {
+                "code": "stale_mesh",
+                "message": "stale",
+                "hostId": "not a host id",
+            },
+        }
+        command = output([], payload, code=2)
+        # Host Mesh has no known hostId field, so its extension remains
+        # forward-compatible and does not suppress the stable error code.
+        self.assertEqual("stale_mesh", _error_envelope_code(command))
+        self.assertIsNone(_error_envelope_code(command, limit=1 << 20, validate_host_id=True))
+        with self.assertRaises(ContractError) as caught:
+            _raise_command_failure(
+                command,
+                "Tmux Session inventory",
+                limit=1 << 20,
+                validate_host_id=True,
+            )
+        self.assertNotIsInstance(caught.exception, StaleMeshError)
+
     def test_tmux_is_required_but_missing_ssh_selects_local_contract(self) -> None:
         with self.assertRaisesRegex(ContractError, "rofi-tmux-plus is required"):
             select_backend(which=lambda _name: None)
@@ -328,7 +422,6 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
                             "serverGeneration": None,
                             "route": None,
                             "sessions": [],
-                            "error": None,
                         }
                     ],
                 },
@@ -483,6 +576,9 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
         noisy = [sys.executable, "-c", "import sys;sys.stdout.write('x'*100000)"]
         with self.assertRaisesRegex(ContractError, "stdout"):
             _run_bounded(noisy, timeout=2, stdout_limit=128)
+        noisy_stderr = [sys.executable, "-c", "import sys;sys.stderr.write('x'*100000)"]
+        with self.assertRaisesRegex(ContractError, "stderr"):
+            _run_bounded(noisy_stderr, timeout=2, stderr_limit=128)
         sleepy = [sys.executable, "-c", "import time;time.sleep(5)"]
         started = time.monotonic()
         with self.assertRaisesRegex(ContractError, "timed out"):
@@ -653,7 +749,11 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
         backend._report(host, route, "reachable", time.monotonic() + 2)
         backend._run = lambda argv, **_kwargs: output(  # type: ignore[method-assign]
             argv,
-            {"schemaVersion": 1, "ok": False, "error": {"code": "stale_mesh"}},
+            {
+                "schemaVersion": 1,
+                "ok": False,
+                "error": {"code": "stale_mesh", "message": "stale"},
+            },
             code=2,
         )
         with self.assertRaises(StaleMeshError):
@@ -730,6 +830,39 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
 
 
 class ContractBackendAssemblyTest(unittest.TestCase):
+    def test_tmux_inventory_exit_and_body_envelopes_must_match(self) -> None:
+        mesh = parse_mesh(fixture("mesh-v1.json"))
+        inventory_payload = fixture("tmux-inventory-v1.json")
+        error_payload = {
+            "schemaVersion": 1,
+            "ok": False,
+            "error": {"code": "operation_failed", "message": "failed"},
+        }
+        active = {
+            "nativeHostname": "native",
+            "active": {},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        for returncode, payload in ((2, inventory_payload), (0, error_payload)):
+            with self.subTest(returncode=returncode):
+                backend = ContractBackend(
+                    "rofi-ssh-plus",
+                    "rofi-tmux-plus",
+                    runner=lambda argv, payload=payload, returncode=returncode, **_kwargs: output(
+                        argv, payload, code=returncode
+                    ),
+                )
+                backend.mesh = mesh
+                backend._active = lambda _host, _deadline: (None, active)  # type: ignore[method-assign]
+                backend._provider_results = lambda *_args: (  # type: ignore[method-assign]
+                    [],
+                    {"installed": False, "sessions": []},
+                    {"installed": False, "sessions": []},
+                )
+                events = backend._once(PickerConfig())
+                self.assertTrue(any(error.get("stage") == "tmux" for error in events[1]["errors"]))
+
     def test_inventory_starts_before_provider_discovery_completes(self) -> None:
         mesh = parse_mesh(fixture("mesh-v1.json"))
         inventory_started = threading.Event()
@@ -863,7 +996,11 @@ class ContractBackendAssemblyTest(unittest.TestCase):
                 raise AssertionError(argv)
             return output(
                 argv,
-                {"schemaVersion": 1, "ok": False, "error": {"code": "stale_mesh"}},
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "error": {"code": "stale_mesh", "message": "stale"},
+                },
                 code=2,
             )
 
@@ -906,7 +1043,7 @@ class ContractBackendAssemblyTest(unittest.TestCase):
             "backend": {
                 "kind": "contract",
                 "capability": CONTRACT_CAPABILITY,
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
             },
             "hostId": "beta",
             "kind": "codex",
@@ -915,7 +1052,7 @@ class ContractBackendAssemblyTest(unittest.TestCase):
             "host": "Beta",
             "cwd": "/work",
             "tmux": {
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
                 "serverGeneration": "tmux-v1:beta",
                 "sessionId": "$4",
                 "createdAt": 5,
@@ -1020,7 +1157,7 @@ class ContractCacheTest(unittest.TestCase):
         backend = {
             "kind": "contract",
             "capability": CONTRACT_CAPABILITY,
-            "meshRevision": "sha256:mesh-v1",
+            "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         }
         stale_at = int(time.time()) - self.config.refresh_seconds - 1
         selected_at = int(time.time())
@@ -1155,7 +1292,7 @@ class ContractCacheTest(unittest.TestCase):
             "backend": {
                 "kind": "contract",
                 "capability": CONTRACT_CAPABILITY,
-                "meshRevision": "sha256:old",
+                "meshRevision": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             },
             "hosts": {
                 "alpha": {
@@ -1176,7 +1313,7 @@ class ContractCacheTest(unittest.TestCase):
                     "backend": {
                         "kind": "contract",
                         "capability": CONTRACT_CAPABILITY,
-                        "meshRevision": "sha256:new",
+                        "meshRevision": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
                     },
                 },
                 {
@@ -1187,7 +1324,7 @@ class ContractCacheTest(unittest.TestCase):
                     "backend": {
                         "kind": "contract",
                         "capability": CONTRACT_CAPABILITY,
-                        "meshRevision": "sha256:new",
+                        "meshRevision": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
                     },
                 },
                 {
@@ -1195,14 +1332,17 @@ class ContractCacheTest(unittest.TestCase):
                     "backend": {
                         "kind": "contract",
                         "capability": CONTRACT_CAPABILITY,
-                        "meshRevision": "sha256:new",
+                        "meshRevision": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
                     },
                 },
             ]
         )
         snapshot = build_snapshot(self.config, events, previous, now=200)
         self.assertEqual({"alpha"}, set(snapshot["hosts"]))
-        self.assertEqual("sha256:new", snapshot["backend"]["meshRevision"])
+        self.assertEqual(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            snapshot["backend"]["meshRevision"],
+        )
         self.assertEqual(200, snapshot["generatedAt"])
         self.assertEqual([], snapshot["sessions"])
 
@@ -1217,7 +1357,7 @@ class ContractCacheTest(unittest.TestCase):
                         "backend": {
                             "kind": "contract",
                             "capability": CONTRACT_CAPABILITY,
-                            "meshRevision": "sha256:old",
+                            "meshRevision": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
                         },
                     }
                 ]
@@ -1293,7 +1433,7 @@ class ContractCacheTest(unittest.TestCase):
         backend = {
             "kind": "contract",
             "capability": CONTRACT_CAPABILITY,
-            "meshRevision": "sha256:mesh-v1",
+            "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         }
         old = {
             "contractMode": True,
@@ -1366,7 +1506,7 @@ class ContractCacheTest(unittest.TestCase):
         backend = {
             "kind": "contract",
             "capability": CONTRACT_CAPABILITY,
-            "meshRevision": "sha256:mesh-v1",
+            "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         }
         old = {
             "contractMode": True,
@@ -1438,7 +1578,7 @@ class ContractCacheTest(unittest.TestCase):
         backend = {
             "kind": "contract",
             "capability": CONTRACT_CAPABILITY,
-            "meshRevision": "sha256:mesh-v1",
+            "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         }
         old = {
             "contractMode": True,
@@ -1512,7 +1652,7 @@ class ContractCacheTest(unittest.TestCase):
                 "backend": {
                     "kind": "contract",
                     "capability": CONTRACT_CAPABILITY,
-                    "meshRevision": "sha256:a",
+                    "meshRevision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 },
                 "hosts": {},
                 "sessions": [],
@@ -1531,7 +1671,7 @@ class ContractCacheTest(unittest.TestCase):
                     {
                         "kind": "contract",
                         "capability": CONTRACT_CAPABILITY,
-                        "meshRevision": "sha256:b",
+                        "meshRevision": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     },
                 )
             )
@@ -1565,8 +1705,16 @@ class ContractCacheTest(unittest.TestCase):
             self.assertFalse(store.background_path.exists())
 
     def test_late_owner_cannot_write_after_authority_switch(self) -> None:
-        old = {"kind": "contract", "capability": CONTRACT_CAPABILITY, "meshRevision": "sha256:old"}
-        new = {"kind": "contract", "capability": CONTRACT_CAPABILITY, "meshRevision": "sha256:new"}
+        old = {
+            "kind": "contract",
+            "capability": CONTRACT_CAPABILITY,
+            "meshRevision": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        }
+        new = {
+            "kind": "contract",
+            "capability": CONTRACT_CAPABILITY,
+            "meshRevision": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        }
 
         class Backend:
             def __init__(self, identity: dict[str, object]) -> None:
@@ -1636,7 +1784,7 @@ class ContractCacheTest(unittest.TestCase):
         identity = {
             "kind": "contract",
             "capability": CONTRACT_CAPABILITY,
-            "meshRevision": "sha256:mesh-v1",
+            "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
         }
 
         class Backend:

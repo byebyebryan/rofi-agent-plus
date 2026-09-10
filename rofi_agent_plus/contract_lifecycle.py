@@ -7,7 +7,6 @@ behind the Tmux Session boundary.
 
 from __future__ import annotations
 
-import json
 import re
 import time
 import unicodedata
@@ -19,6 +18,7 @@ from . import engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig
 from .contract_backend import CommandOutput, select_backend
+from .wire import WireError, decode_document, validate_string_bounds
 
 _SCHEMA_VERSION = 1
 _CAPABILITY = "host-mesh-v1+tmux-session-v1"
@@ -28,22 +28,10 @@ _LIFECYCLE_SECONDS = 30.0
 _MAX_CREATE_COLLISIONS = 8
 _SESSION_ID = re.compile(r"\$[0-9]+", re.ASCII)
 _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
+_REVISION = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
+_GENERATION = re.compile(r"^[^\x00-\x1f\x7f-\x9f]+$", re.ASCII)
+_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$", re.ASCII)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", re.ASCII)
-_ERROR_CODES = frozenset(
-    {
-        "unknown_host",
-        "stale_mesh",
-        "host_unreachable",
-        "tmux_missing",
-        "session_not_found",
-        "session_exists",
-        "stale_session",
-        "invalid_input",
-        "invalid_cwd",
-        "launch_failed",
-        "operation_failed",
-    }
-)
 _PROVIDER_OPTIONS = {
     "codex": ("@codex_thread_id", "@codex_name", "codex", "resume"),
     "claude": ("@claude_session_id", "@claude_name", "claude", "--resume"),
@@ -100,8 +88,57 @@ def _text(value: object, label: str, *, nullable: bool = False) -> str | None:
 def _nonnegative(value: object, label: str, *, nullable: bool = False) -> int | None:
     if nullable and value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
         raise LifecycleError("operation_failed", f"Tmux Session {label} is invalid")
+    return value
+
+
+def _count(value: object, label: str, *, nullable: bool = False) -> int | None:
+    if nullable and value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**31 - 1:
+        raise LifecycleError("operation_failed", f"Tmux Session {label} is invalid")
+    return value
+
+
+def _required(value: Mapping[str, object], *fields: str) -> None:
+    if any(field not in value for field in fields):
+        raise LifecycleError("operation_failed", "Tmux Session response omitted a required field")
+
+
+def _output_bytes(output: CommandOutput) -> bytes:
+    raw = output.stdout_bytes
+    if raw is not None:
+        if not isinstance(raw, bytes):
+            raise WireError("stdout is not bytes")
+        return raw
+    value = output.stdout
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise WireError("stdout is not bytes")
+    return value.encode("utf-8", "strict")
+
+
+def _generation(value: object, label: str = "server generation") -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_FIELD
+        or any(unicodedata.category(char).startswith("C") for char in value)
+    ):
+        raise LifecycleError("operation_failed", f"Tmux Session {label} is invalid")
+    return value
+
+
+def _error_code(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or not _ERROR_CODE.fullmatch(value)
+    ):
+        raise LifecycleError("operation_failed", "Tmux Session error code is invalid")
     return value
 
 
@@ -115,24 +152,26 @@ def _backend_identity(value: object) -> dict[str, object]:
     revision = value.get("meshRevision")
     if revision is not None and not isinstance(revision, str):
         raise LifecycleError("operation_failed", "contract action has an invalid mesh revision")
-    if isinstance(revision, str) and (
-        not revision
-        or len(revision) > _MAX_FIELD
-        or revision.strip() != revision
-        or any(char.isspace() or unicodedata.category(char).startswith("C") for char in revision)
-    ):
+    if isinstance(revision, str) and not _REVISION.fullmatch(revision):
         raise LifecycleError("operation_failed", "contract action has an invalid mesh revision")
     return {"kind": "contract", "capability": _CAPABILITY, "meshRevision": revision}
 
 
 def _reference(value: object, host_id: str, revision: str | None) -> StableReference:
-    if not isinstance(value, Mapping) or value.get("meshRevision") != revision:
+    if not isinstance(value, Mapping):
         raise LifecycleError("operation_failed", "session no longer has a current tmux reference")
-    generation = _text(value.get("serverGeneration"), "server generation")
+    _required(value, "meshRevision", "serverGeneration", "sessionId", "createdAt")
+    if value["meshRevision"] != revision:
+        raise LifecycleError("operation_failed", "session no longer has a current tmux reference")
+    generation = _generation(value["serverGeneration"])
     session_id = value.get("sessionId")
-    created_at = _nonnegative(value.get("createdAt"), "creation time")
+    created_at = _nonnegative(value["createdAt"], "creation time")
     observed_name = _text(value.get("observedName"), "observed name", nullable=True)
-    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+    if (
+        not isinstance(session_id, str)
+        or len(session_id) > 4096
+        or not _SESSION_ID.fullmatch(session_id)
+    ):
         raise LifecycleError("operation_failed", "session no longer has a valid tmux reference")
     assert generation is not None and created_at is not None
     return StableReference(host_id, revision, generation, session_id, created_at, observed_name)
@@ -154,6 +193,7 @@ def _provider_row(
     identifier = selection.get("id")
     if (
         not isinstance(host_id, str)
+        or len(host_id) > _MAX_FIELD
         or not _HOST_ID.fullmatch(host_id)
         or kind not in _PROVIDER_OPTIONS
         or not isinstance(identifier, str)
@@ -208,50 +248,117 @@ def _provider_row(
 def _descriptor(value: object, host_id: str, revision: str | None) -> StableReference:
     """Validate the public complete descriptor and project its stable ref."""
 
-    if not isinstance(value, Mapping) or value.get("hostId") != host_id:
+    if not isinstance(value, Mapping):
         raise LifecycleError("operation_failed", "Tmux Session response has an invalid descriptor")
-    generation = _text(value.get("serverGeneration"), "server generation")
+    _required(
+        value,
+        "hostId",
+        "serverGeneration",
+        "sessionId",
+        "createdAt",
+        "name",
+        "activityAt",
+        "lastAttachedAt",
+        "attachedClients",
+        "pending",
+        "windowCount",
+        "sessionPath",
+        "currentWindow",
+        "currentPath",
+    )
+    if value["hostId"] != host_id:
+        raise LifecycleError("operation_failed", "Tmux Session response has an invalid descriptor")
+    if (
+        not isinstance(value["hostId"], str)
+        or len(value["hostId"]) > _MAX_FIELD
+        or not _HOST_ID.fullmatch(value["hostId"])
+    ):
+        raise LifecycleError("operation_failed", "Tmux Session response has an invalid descriptor")
+    generation = _generation(value["serverGeneration"])
     session_id = value.get("sessionId")
-    created_at = _nonnegative(value.get("createdAt"), "creation time")
-    name = _text(value.get("name"), "session name")
-    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+    created_at = _nonnegative(value["createdAt"], "creation time")
+    name = _text(value["name"], "session name", nullable=True)
+    if (
+        not isinstance(session_id, str)
+        or len(session_id) > 4096
+        or not _SESSION_ID.fullmatch(session_id)
+    ):
         raise LifecycleError("operation_failed", "Tmux Session response has an invalid descriptor")
     for field in ("activityAt", "lastAttachedAt"):
         _nonnegative(value.get(field), field, nullable=True)
     for field in ("attachedClients", "windowCount"):
-        _nonnegative(value.get(field), field)
+        _count(value.get(field), field, nullable=True)
     if not isinstance(value.get("pending"), bool):
         raise LifecycleError("operation_failed", "Tmux Session pending marker is invalid")
     for field in ("sessionPath", "currentWindow", "currentPath"):
         _text(value.get(field), field, nullable=True)
-    assert generation is not None and created_at is not None and name is not None
+    if "panes" in value:
+        panes = value["panes"]
+        if not isinstance(panes, list) or len(panes) > 512:
+            raise LifecycleError("operation_failed", "Tmux Session panes are invalid")
+        for pane in panes:
+            if not isinstance(pane, Mapping):
+                raise LifecycleError("operation_failed", "Tmux Session pane is invalid")
+            _required(pane, "paneId", "pid", "currentPath", "currentCommand")
+            pane_id = pane["paneId"]
+            if (
+                not isinstance(pane_id, str)
+                or len(pane_id) > 4096
+                or not re.fullmatch(r"%[0-9]+", pane_id)
+            ):
+                raise LifecycleError("operation_failed", "Tmux Session pane is invalid")
+            _count(pane["pid"], "pane pid", nullable=True)
+            _text(pane["currentPath"], "pane path", nullable=True)
+            _text(pane["currentCommand"], "pane command", nullable=True)
+    if "options" in value:
+        options = value["options"]
+        if not isinstance(options, Mapping):
+            raise LifecycleError("operation_failed", "Tmux Session options are invalid")
+        for option, option_value in options.items():
+            if (
+                not isinstance(option, str)
+                or len(option) > _MAX_FIELD
+                or not re.fullmatch(r"@[A-Za-z0-9_.-]+", option)
+            ):
+                raise LifecycleError("operation_failed", "Tmux Session option is invalid")
+            _text(option_value, "session option", nullable=True)
+    assert created_at is not None
     return StableReference(host_id, revision, generation, session_id, created_at, name)
 
 
 def _error_response(output: CommandOutput) -> LifecycleError:
-    if len(output.stdout.encode("utf-8", "replace")) > _MAX_OUTPUT:
-        return LifecycleError("operation_failed", "Tmux Session response exceeded output limit")
     try:
-        payload = json.loads(output.stdout)
-    except json.JSONDecodeError:
+        payload = decode_document(_output_bytes(output), limit=_MAX_OUTPUT)
+        validate_string_bounds(payload, limit=_MAX_FIELD)
+    except (WireError, UnicodeEncodeError):
         return LifecycleError("operation_failed", "Tmux Session command failed")
     if (
         not isinstance(payload, Mapping)
         or payload.get("schemaVersion") != _SCHEMA_VERSION
+        or isinstance(payload.get("schemaVersion"), bool)
+        or not isinstance(payload.get("schemaVersion"), int)
         or payload.get("ok") is not False
         or not isinstance(payload.get("error"), Mapping)
     ):
         return LifecycleError("operation_failed", "Tmux Session command failed")
-    code = payload["error"].get("code")
-    message = payload["error"].get("message")
-    if code not in _ERROR_CODES or not isinstance(message, str):
+    error = payload["error"]
+    if "code" not in error or "message" not in error:
         return LifecycleError("operation_failed", "Tmux Session command failed")
     try:
-        clean = _text(message, "error message")
+        code = _error_code(error["code"])
+        clean = _text(error["message"], "error message")
+        host_id = error.get("hostId")
+        if host_id is not None:
+            if (
+                not isinstance(host_id, str)
+                or not _HOST_ID.fullmatch(host_id)
+                or len(host_id) > _MAX_FIELD
+            ):
+                raise LifecycleError("operation_failed", "Tmux Session error host is invalid")
     except LifecycleError:
         return LifecycleError("operation_failed", "Tmux Session command failed")
     assert clean is not None
-    return LifecycleError(str(code), clean)
+    return LifecycleError(code, clean)
 
 
 def _success_response(
@@ -261,21 +368,26 @@ def _success_response(
     *,
     opening: bool,
 ) -> StableReference:
-    if len(output.stdout.encode("utf-8", "replace")) > _MAX_OUTPUT:
-        raise LifecycleError("operation_failed", "Tmux Session response exceeded output limit")
     try:
-        payload = json.loads(output.stdout)
-    except json.JSONDecodeError as error:
+        payload = decode_document(_output_bytes(output), limit=_MAX_OUTPUT)
+        validate_string_bounds(payload, limit=_MAX_FIELD)
+    except (WireError, UnicodeEncodeError) as error:
         raise LifecycleError("operation_failed", "Tmux Session response is invalid") from error
     if (
         not isinstance(payload, Mapping)
         or payload.get("schemaVersion") != _SCHEMA_VERSION
+        or isinstance(payload.get("schemaVersion"), bool)
+        or not isinstance(payload.get("schemaVersion"), int)
         or payload.get("ok") is not True
         or payload.get("meshRevision") != revision
     ):
         raise LifecycleError("operation_failed", "Tmux Session response is invalid")
-    reference = _descriptor(payload.get("session"), host_id, revision)
+    if "meshRevision" not in payload or "session" not in payload:
+        raise LifecycleError("operation_failed", "Tmux Session response is invalid")
+    reference = _descriptor(payload["session"], host_id, revision)
     if opening:
+        if "focused" not in payload or "terminalLaunched" not in payload:
+            raise LifecycleError("operation_failed", "Tmux Session open response is invalid")
         focused = payload.get("focused")
         launched = payload.get("terminalLaunched")
         if not isinstance(focused, bool) or not isinstance(launched, bool) or focused == launched:
@@ -299,9 +411,19 @@ def _run_json(
     *,
     opening: bool,
 ) -> StableReference:
-    output = backend._run(argv, timeout=min(15.0, _remaining(deadline)))
+    try:
+        output = backend._run(
+            argv,
+            timeout=min(15.0, _remaining(deadline)),
+            stdout_limit=_MAX_OUTPUT,
+            stderr_limit=64 * 1024,
+        )
+    except (engine.PickerError, OSError) as error:
+        raise LifecycleError("operation_failed", "Tmux Session command failed") from error
     if output.timed_out:
         raise LifecycleError("operation_failed", "Tmux Session command timed out")
+    if output.returncode < 0:
+        raise LifecycleError("operation_failed", "Tmux Session command was terminated by a signal")
     if output.returncode != 0:
         raise _error_response(output)
     return _success_response(output, host_id, revision, opening=opening)
@@ -402,6 +524,7 @@ def fast_open_selection(
     identifier = selection.get("id")
     if (
         not isinstance(host_id, str)
+        or len(host_id) > _MAX_FIELD
         or not _HOST_ID.fullmatch(host_id)
         or kind not in _PROVIDER_OPTIONS
         or not isinstance(identifier, str)
@@ -500,22 +623,47 @@ class ContractLifecycle:
             raise LifecycleError("operation_failed", "contract lifecycle backend is unavailable")
         self.deadline = time.monotonic() + timeout
 
-    def _refresh_row(self, selection: Mapping[str, object]) -> dict[str, object]:
+    def _refresh_row(
+        self, selection: Mapping[str, object], *, whole_mesh: bool = False
+    ) -> dict[str, object]:
         try:
             host_id = selection.get("hostId")
-            if not isinstance(host_id, str) or not _HOST_ID.fullmatch(host_id):
+            if (
+                not isinstance(host_id, str)
+                or len(host_id) > _MAX_FIELD
+                or not _HOST_ID.fullmatch(host_id)
+            ):
                 raise LifecycleError("operation_failed", "selected contract session is invalid")
+            context = self.context
+            if whole_mesh:
+                try:
+                    self.backend.prepare(deadline=self.deadline)  # type: ignore[attr-defined]
+                except TypeError:
+                    # Keep narrow fake backends and older injected adapters
+                    # usable while the real ContractBackend consumes the
+                    # enclosing action deadline.
+                    self.backend.prepare()  # type: ignore[attr-defined]
+                self.identity = _backend_identity(self.backend.identity)  # type: ignore[attr-defined]
+                context = PresentationContext(
+                    self.config.fingerprint,
+                    dict(self.identity),
+                    selected=self.backend,
+                )
+                self.context = context
             snapshot = self.store.refresh(
                 self.config,
                 force=True,
                 require_fresh=True,
-                context=self.context,
+                context=context,
                 deadline=self.deadline,
-                host_ids=(host_id,),
+                host_ids=None if whole_mesh else (host_id,),
             )
         except engine.PickerError as error:
             raise LifecycleError("operation_failed", str(error)) from error
-        return _provider_row(snapshot, self.identity, selection)
+        lookup = dict(selection)
+        if whole_mesh:
+            lookup["backend"] = dict(self.identity)
+        return _provider_row(snapshot, self.identity, lookup)
 
     def _reconcile(
         self,
@@ -614,10 +762,15 @@ class ContractLifecycle:
             try:
                 result = self._open(selection, reference)
             except LifecycleError as error:
-                if error.code != "stale_session":
+                if error.code not in {
+                    "stale_session",
+                    "session_not_found",
+                    "stale_mesh",
+                }:
                     raise
-                retry_row = self._refresh_row(selection)
-                retry_reference = _reference(retry_row.get("tmux"), host_id, revision)
+                retry_row = self._refresh_row(selection, whole_mesh=error.code == "stale_mesh")
+                retry_revision = self.identity["meshRevision"]
+                retry_reference = _reference(retry_row.get("tmux"), host_id, retry_revision)
                 if retry_reference == reference:
                     raise
                 result = self._open(selection, retry_reference)
@@ -628,5 +781,24 @@ class ContractLifecycle:
             raise LifecycleError(
                 "operation_failed", "selected provider session is active outside tmux"
             )
-        result = self._create(selection, row)
+        try:
+            result = self._create(selection, row)
+        except LifecycleError as error:
+            # A producer can reject a pre-action revision before creating
+            # anything.  Re-observe the whole Mesh once, then perform at most
+            # one action against the newly authoritative row.  All transport,
+            # malformed, unknown, and other typed failures remain terminal.
+            if error.code != "stale_mesh":
+                raise
+            retry_row = self._refresh_row(selection, whole_mesh=True)
+            retry_tmux = retry_row.get("tmux")
+            if retry_tmux is not None:
+                retry_reference = _reference(retry_tmux, host_id, self.identity["meshRevision"])
+                result = self._open(selection, retry_reference)
+            else:
+                if retry_row.get("active") is True:
+                    raise LifecycleError(
+                        "operation_failed", "selected provider session is active outside tmux"
+                    ) from None
+                result = self._create(selection, retry_row)
         self._reconcile(selection, result)

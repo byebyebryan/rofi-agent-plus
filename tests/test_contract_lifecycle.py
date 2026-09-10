@@ -17,6 +17,7 @@ from rofi_agent_plus.contract_backend import CommandOutput
 from rofi_agent_plus.contract_lifecycle import (
     ContractLifecycle,
     LifecycleError,
+    _run_json,
     _success_response,
     fast_open_selection,
 )
@@ -24,7 +25,7 @@ from rofi_agent_plus.rofi import _open_selection, run_rofi, selection_payload
 
 ROOT = Path(__file__).parent / "fixtures" / "contract" / "lifecycle"
 THREAD = "11111111-1111-1111-1111-111111111111"
-REVISION = "sha256:mesh-v1"
+REVISION = "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262"
 BACKEND = {
     "kind": "contract",
     "capability": "host-mesh-v1+tmux-session-v1",
@@ -162,8 +163,12 @@ class FakeBackend:
             return response
         if isinstance(response, tuple):
             code, payload = response
-            return CommandOutput(tuple(argv), code, json.dumps(payload), "failure")
-        return CommandOutput(tuple(argv), 0, json.dumps(response), "")
+            encoded = json.dumps(payload, separators=(",", ":")) + "\n"
+            return CommandOutput(
+                tuple(argv), code, encoded, "failure", stdout_bytes=encoded.encode()
+            )
+        encoded = json.dumps(response, separators=(",", ":")) + "\n"
+        return CommandOutput(tuple(argv), 0, encoded, "", stdout_bytes=encoded.encode())
 
 
 class ContractLifecycleTest(unittest.TestCase):
@@ -193,6 +198,46 @@ class ContractLifecycleTest(unittest.TestCase):
             "kind": kind,
             "id": THREAD,
         }
+
+    def test_lifecycle_exit_and_body_envelopes_must_match(self) -> None:
+        for returncode, payload in (
+            (2, success(descriptor())),
+            (0, failure("operation_failed")),
+        ):
+            with self.subTest(returncode=returncode):
+                encoded = json.dumps(payload, separators=(",", ":")) + "\n"
+                command = CommandOutput(
+                    ("rofi-tmux-plus", "open"),
+                    returncode,
+                    encoded,
+                    "",
+                    stdout_bytes=encoded.encode(),
+                )
+                lifecycle, _store, backend, _context = self.harness([row()], [command])
+                with self.assertRaises(LifecycleError):
+                    _run_json(
+                        backend,
+                        ("rofi-tmux-plus", "open", "--json"),
+                        time.monotonic() + 1,
+                        "alpha",
+                        REVISION,
+                        opening=True,
+                    )
+
+    def test_lifecycle_signal_exit_is_terminal_without_retry(self) -> None:
+        payload = success(descriptor())
+        encoded = json.dumps(payload, separators=(",", ":")) + "\n"
+        command = CommandOutput(
+            ("rofi-tmux-plus", "open"),
+            -9,
+            encoded,
+            "",
+            stdout_bytes=encoded.encode(),
+        )
+        lifecycle, _store, backend, _context = self.harness([row()], [command])
+        with self.assertRaisesRegex(LifecycleError, "signal"):
+            lifecycle.open_or_create(self.selection())
+        self.assertEqual(1, len(backend.calls))
 
     def test_open_uses_exact_reference_without_expected_name_and_reconciles_rename(self) -> None:
         lifecycle, store, backend, context = self.harness(
@@ -382,6 +427,26 @@ class ContractLifecycleTest(unittest.TestCase):
             ["$4", "$5"], [call[0][call[0].index("--session-id") + 1] for call in backend.calls]
         )
         self.assertEqual(2, backend.streams)
+
+    def test_guarded_open_retries_once_for_session_not_found(self) -> None:
+        lifecycle, _store, backend, _context = self.harness(
+            [[row(session_id="$4")], [row(session_id="$5", created_at=6)]],
+            [
+                (2, failure("session_not_found", "pre-action")),
+                success(descriptor(session_id="$5", created_at=6)),
+            ],
+        )
+        lifecycle.open_or_create(self.selection())
+        self.assertEqual(2, len(backend.calls))
+        self.assertEqual("$5", backend.calls[1][0][backend.calls[1][0].index("--session-id") + 1])
+
+    def test_guarded_open_invalid_input_is_terminal_on_full_path(self) -> None:
+        lifecycle, _store, backend, _context = self.harness(
+            [row()], [(2, failure("invalid_input", "compatibility input rejected"))]
+        )
+        with self.assertRaisesRegex(LifecycleError, "compatibility input rejected"):
+            lifecycle.open_or_create(self.selection())
+        self.assertEqual(1, len(backend.calls))
 
     def test_nonstructured_or_unchanged_stale_response_never_retries_or_creates(self) -> None:
         for response, rows in (
@@ -727,7 +792,7 @@ class ContractLifecycleTest(unittest.TestCase):
         assert isinstance(deferred_session, dict)
         deferred_session["hostId"] = "alpha"
         reference = _success_response(
-            CommandOutput((), 0, json.dumps(deferred), ""),
+            CommandOutput((), 0, json.dumps(deferred) + "\n", ""),
             "alpha",
             REVISION,
             opening=False,
@@ -743,7 +808,7 @@ class ContractLifecycleTest(unittest.TestCase):
         assert isinstance(opened_session, dict)
         opened_session["hostId"] = "alpha"
         renamed = _success_response(
-            CommandOutput((), 0, json.dumps(opened), ""),
+            CommandOutput((), 0, json.dumps(opened) + "\n", ""),
             "alpha",
             REVISION,
             opening=True,
@@ -800,7 +865,10 @@ class ContractLifecycleTest(unittest.TestCase):
     def test_selection_must_match_the_prepared_authority(self) -> None:
         lifecycle, _store, backend, _context = self.harness([row()], [])
         selected = self.selection()
-        selected["backend"] = {**BACKEND, "meshRevision": "sha256:old"}
+        selected["backend"] = {
+            **BACKEND,
+            "meshRevision": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        }
         with self.assertRaisesRegex(LifecycleError, "older Mesh revision"):
             lifecycle.open_or_create(selected)
         self.assertEqual([], backend.calls)
@@ -832,7 +900,10 @@ class ContractLifecycleTest(unittest.TestCase):
         self.assertEqual(123, current["generatedAt"])
         changed = PresentationContext(
             self.config.fingerprint,
-            {**BACKEND, "meshRevision": "sha256:new"},
+            {
+                **BACKEND,
+                "meshRevision": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            },
             selected=lifecycle.backend,
         )
         self.assertFalse(

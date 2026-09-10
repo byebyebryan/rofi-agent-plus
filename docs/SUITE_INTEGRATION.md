@@ -2,10 +2,12 @@
 
 Status: the P7 contract-only cutover and guarded-open performance follow-up are
 complete in version `0.3.0`; the P8 flat-scope navigation implementation is
-complete in version `0.4.0`. P8 is published and pinned for coordinated managed
-deployment; host-specific rollout and operator acceptance are tracked by the
-deployment owner. Agent Plus consumes Tmux Session v1 through its public
-process contract on every product path; Tmux Plus is mandatory. It consumes
+complete in version `0.4.0`. The coordinated P8 cutover is published, deployed,
+and operator-accepted. P9 locked CLI contracts are implemented here as an
+independent consumer with exact released producer provenance; managed suite
+deployment is coordinated through chezmoi.
+Agent Plus consumes Tmux Session v1 through its public process contract on every
+product path; Tmux Plus is mandatory. It consumes
 Host Mesh v1 when SSH Plus is available and otherwise uses the shared
 local-only identity with a `null` Mesh revision. A present malformed or
 unsupported companion is visible and never enables a fallback. Tmux Plus
@@ -73,6 +75,32 @@ cancel action. Neither cancellation key is a script callback.
 P8 changes only presentation and interaction. Agent discovery and correlation,
 Host Mesh v1, Tmux Session v1, stable typed selection identity, and guarded
 lifecycle operations remain unchanged.
+
+## P9 locked CLI contracts
+
+P9 implements Agent Plus as an independent consumer of two local process
+contracts. Tmux Session v1 remains required. Host Mesh v1 remains optional,
+with a missing SSH Plus selecting local-only identity and any present contract
+failure remaining visible rather than triggering fallback.
+
+Agent Plus vendors each complete canonical producer bundle with one exact
+`SOURCE.json` provenance record, validates it offline, and retains its own
+strict parsing and bounded subprocess implementation. It does not import
+either sibling package, read sibling configuration or state, add a shared
+virtual environment, or publish its private provider refresh/cache format as
+another suite contract.
+
+Strict UTF-8 JSON, single-document stdout, duplicate-key rejection, published
+command-specific byte and field caps, generic handling for unknown typed
+errors, and exact Mesh/session identity are explicit conformance cases.
+Documented pre-action errors retain their bounded refresh or modified-request
+recovery; ambiguous process or response failures never repeat a lifecycle
+action. Stderr text and process exit numbers never authorize fallback, route
+health, or mutation.
+
+P9 changes no provider discovery, correlation, resume command, cache, Rofi row,
+or P8 navigation behavior. The coordinated suite design and rollout boundary
+live in the managed `rofi-plus-p9-cli-contracts.md` document.
 
 The canonical `rofi-ssh-plus`, `rofi-tmux-plus`, and `rofi-agent-plus`
 commands are resolved through `PATH`. A suite deployment installs public
@@ -177,7 +205,7 @@ tmux reference is subordinate data:
   "providerSessionId": "00000000-0000-0000-0000-000000000000",
   "hostId": "desktop-a",
   "tmux": {
-    "meshRevision": "sha256:0123456789abcdef",
+    "meshRevision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "serverGeneration": "tmux-v1:1722741000:1234:/run/user/1000/tmux-1000/default",
     "sessionId": "$6",
     "createdAt": 1722742000,

@@ -8,7 +8,6 @@ identity rather than reviving an Agent-owned SSH or tmux path.
 from __future__ import annotations
 
 import errno
-import json
 import os
 import re
 import secrets
@@ -32,14 +31,19 @@ from . import engine
 from .claude_probe import SESSION_PROBE as CLAUDE_SESSION_PROBE
 from .codex import AppServerClient
 from .opencode_probe import SESSION_PROBE as OPENCODE_SESSION_PROBE
+from .wire import WireError, decode_document, validate_string_bounds
 
 _MAX_STDOUT = 1 << 20
 _MAX_STDERR = 1 << 16
+_MAX_HOST_STDOUT = 512 * 1024
+_MAX_INVENTORY_STDOUT = 1 << 20
 _MAX_FIELD = 16 * 1024
 _MAX_HOSTS = 128
 _HOST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", re.ASCII)
 _SESSION_ID = re.compile(r"^\$[0-9]+$", re.ASCII)
 _PANE_ID = re.compile(r"^%[0-9]+$", re.ASCII)
+_REVISION = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
+_ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$", re.ASCII)
 _UUID = engine.UUID_PATTERN
 _OPENCODE = engine.OPENCODE_ID_PATTERN
 _MARKER_PREFIX = "\x1eROFI_PLUS_REACHED_V1:"
@@ -85,6 +89,11 @@ class CommandOutput:
     stdout: str
     stderr: str
     timed_out: bool = False
+    # The text attributes preserve the pre-contract provider/probe API.  JSON
+    # contract consumers use these exact bytes so a test double cannot hide
+    # missing final LF, replacement decoding, or other wire damage.
+    stdout_bytes: bytes | None = None
+    stderr_bytes: bytes | None = None
 
 
 def _bounded_text(value: object, limit: int = _MAX_FIELD) -> str:
@@ -193,6 +202,9 @@ def _run_bounded(
             returncode,
             stdout,
             buffers["stderr"].decode("utf-8", "replace"),
+            False,
+            bytes(buffers["stdout"]),
+            bytes(buffers["stderr"]),
         )
     except (TimeoutError, BufferError) as error:
         terminate()
@@ -252,6 +264,13 @@ def _text(value: object, label: str, *, empty: bool = False) -> str:
     return value
 
 
+def _display(value: object, label: str = "host display") -> str:
+    result = _text(value, label)
+    if result.strip() != result:
+        raise ContractError(f"Host Mesh {label} is invalid")
+    return result
+
+
 def _host_id(value: object, label: str = "host id") -> str:
     result = _text(value, label)
     if result.startswith("-") or not _HOST_ID.fullmatch(result):
@@ -268,6 +287,37 @@ def _mesh_token(value: object, label: str) -> str:
     return result
 
 
+def _revision(value: object, label: str = "revision") -> str:
+    result = _text(value, label)
+    if not _REVISION.fullmatch(result):
+        raise ContractError(f"Host Mesh {label} is invalid")
+    return result
+
+
+def _error_code(value: object, label: str = "error code") -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or not _ERROR_CODE.fullmatch(value)
+    ):
+        raise ContractError(f"Host Mesh {label} is invalid")
+    return value
+
+
+def _error_host_id(value: object) -> str:
+    """Validate the optional Tmux error host identity at its smaller bound."""
+
+    if not isinstance(value, str) or len(value) > 4096:
+        raise ContractError("Tmux Session error host id is invalid")
+    return _host_id(value, "Tmux Session error host id")
+
+
+def _required(mapping: Mapping[str, object], *names: str) -> None:
+    if any(name not in mapping for name in names):
+        raise ContractError("Host Mesh response omitted a required field")
+
+
 def _timestamp(value: object, label: str, *, nullable: bool = False) -> int | None:
     if nullable and value is None:
         return None
@@ -277,19 +327,32 @@ def _timestamp(value: object, label: str, *, nullable: bool = False) -> int | No
 
 
 def parse_mesh(payload: object) -> Mesh:
-    if not isinstance(payload, Mapping) or payload.get("schemaVersion") != 1:
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schemaVersion") != 1
+        or isinstance(payload.get("schemaVersion"), bool)
+        or not isinstance(payload.get("schemaVersion"), int)
+    ):
         raise ContractError("Host Mesh returned an unsupported schema")
-    _timestamp(payload.get("generatedAt"), "Host Mesh generatedAt")
-    revision = _mesh_token(payload.get("meshRevision"), "revision")
-    local_id = _host_id(payload.get("localHostId"), "local host id")
-    policy = payload.get("sshPolicy")
-    hosts_value = payload.get("hosts")
+    _required(payload, "generatedAt", "meshRevision", "localHostId", "sshPolicy", "hosts")
+    _timestamp(payload["generatedAt"], "Host Mesh generatedAt")
+    revision = _revision(payload["meshRevision"])
+    local_id = _host_id(payload["localHostId"], "local host id")
+    policy = payload["sshPolicy"]
+    hosts_value = payload["hosts"]
     if not isinstance(policy, Mapping) or not isinstance(hosts_value, list):
         raise ContractError("Host Mesh returned malformed inventory")
-    executable = _mesh_token(policy.get("executable"), "SSH executable")
-    timeout = policy.get("connectTimeoutSeconds")
-    attempts = policy.get("connectionAttempts")
-    route_health_ttl = policy.get("routeHealthTtlSeconds")
+    _required(
+        policy,
+        "executable",
+        "connectTimeoutSeconds",
+        "connectionAttempts",
+        "routeHealthTtlSeconds",
+    )
+    executable = _mesh_token(policy["executable"], "SSH executable")
+    timeout = policy["connectTimeoutSeconds"]
+    attempts = policy["connectionAttempts"]
+    route_health_ttl = policy["routeHealthTtlSeconds"]
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, int)
@@ -303,29 +366,38 @@ def parse_mesh(payload: object) -> Mesh:
         or not 1 <= len(hosts_value) <= _MAX_HOSTS
     ):
         raise ContractError("Host Mesh SSH policy is invalid")
-    hosts: list[MeshHost] = []
+
+    # Reserve all logical host IDs up front.  This makes an alias or route
+    # belonging to an earlier host collide with an ID declared later too.
     owners: dict[str, str] = {}
+    seen_host_ids: set[str] = set()
     for item in hosts_value:
         if not isinstance(item, Mapping):
             raise ContractError("Host Mesh host is invalid")
-        host_id = _host_id(item.get("id"))
-        display = _text(item.get("display"), "host display")
-        local = item.get("local")
-        aliases = item.get("aliases")
-        routes_value = item.get("routes")
+        _required(item, "id", "display", "local", "aliases", "routes")
+        host_id = _host_id(item["id"])
+        if host_id in seen_host_ids:
+            raise ContractError("Host Mesh identities are ambiguous")
+        seen_host_ids.add(host_id)
+        owners[host_id] = host_id
+
+    hosts: list[MeshHost] = []
+    for item in hosts_value:
+        assert isinstance(item, Mapping)
+        host_id = _host_id(item["id"])
+        display = _display(item["display"])
+        local = item["local"]
+        aliases = item["aliases"]
+        routes_value = item["routes"]
         if (
             not isinstance(local, bool)
             or not isinstance(aliases, list)
             or not isinstance(routes_value, list)
         ):
             raise ContractError("Host Mesh host is invalid")
-        for token, label in ((host_id, "host id"), *((alias, "host alias") for alias in aliases)):
-            safe = (
-                _host_id(token, label)
-                if label == "host id"
-                else _mesh_token(token, label).casefold()
-            )
-            owner = owners.setdefault(safe, host_id)
+        for alias in aliases:
+            key = _mesh_token(alias, "host alias").casefold()
+            owner = owners.setdefault(key, host_id)
             if owner != host_id:
                 raise ContractError("Host Mesh identities are ambiguous")
         routes: list[Route] = []
@@ -333,8 +405,15 @@ def parse_mesh(payload: object) -> Mesh:
         for route_value in routes_value:
             if not isinstance(route_value, Mapping):
                 raise ContractError("Host Mesh route is invalid")
-            destination = _mesh_token(route_value.get("destination"), "route")
-            index = route_value.get("configuredIndex")
+            _required(
+                route_value,
+                "destination",
+                "configuredIndex",
+                "lastReachableAt",
+                "lastUnreachableAt",
+            )
+            destination = _mesh_token(route_value["destination"], "route")
+            index = route_value["configuredIndex"]
             if (
                 isinstance(index, bool)
                 or not isinstance(index, int)
@@ -347,24 +426,24 @@ def parse_mesh(payload: object) -> Mesh:
             owner = owners.setdefault(key, host_id)
             if owner != host_id:
                 raise ContractError("Host Mesh identities are ambiguous")
-            if "lastReachableAt" not in route_value or "lastUnreachableAt" not in route_value:
-                raise ContractError("Host Mesh route is invalid")
             routes.append(
                 Route(
                     destination,
                     index,
                     _timestamp(
-                        route_value.get("lastReachableAt"),
+                        route_value["lastReachableAt"],
                         "Host Mesh route timestamp",
                         nullable=True,
                     ),
                     _timestamp(
-                        route_value.get("lastUnreachableAt"),
+                        route_value["lastUnreachableAt"],
                         "Host Mesh route timestamp",
                         nullable=True,
                     ),
                 )
             )
+        if route_indices and route_indices != set(range(len(route_indices))):
+            raise ContractError("Host Mesh route order is invalid")
         if local and routes:
             raise ContractError("Host Mesh local host has routes")
         if not local and not routes:
@@ -372,17 +451,19 @@ def parse_mesh(payload: object) -> Mesh:
         hosts.append(MeshHost(host_id, display, local, tuple(aliases), tuple(routes)))
     if sum(host.local for host in hosts) != 1 or hosts[0].host_id != local_id or not hosts[0].local:
         raise ContractError("Host Mesh must declare its local host first")
-    if len({host.host_id.casefold() for host in hosts}) != len(hosts):
-        raise ContractError("Host Mesh host ids are ambiguous")
+    try:
+        validate_string_bounds(payload, limit=_MAX_FIELD)
+    except WireError as error:
+        raise ContractError("Host Mesh response contains an oversized string") from error
     return Mesh(revision, executable, timeout, attempts, tuple(hosts))
 
 
-def _local_mesh() -> Mesh:
+def _local_mesh(hostname: str | None = None) -> Mesh:
     """Mirror the suite's local-only identity without importing Tmux Plus."""
 
-    short_source = socket.gethostname()
+    short_source = hostname if hostname is not None else socket.gethostname()
     raw_short = short_source.split(".", 1)[0] or "localhost"
-    raw_full = socket.getfqdn() or raw_short
+    raw_full = hostname if hostname is not None else socket.getfqdn() or raw_short
     host_id = raw_short.casefold() if _HOST_ID.fullmatch(raw_short) else "localhost"
     aliases = tuple(
         dict.fromkeys(
@@ -414,47 +495,104 @@ def _local_mesh() -> Mesh:
     )
 
 
-def _json(command: CommandOutput, source: str) -> Mapping[str, object]:
+def _command_bytes(command: CommandOutput, stream: str) -> bytes:
+    raw = getattr(command, f"{stream}_bytes", None)
+    if raw is not None:
+        if not isinstance(raw, bytes):
+            raise WireError(f"{stream} is not bytes")
+        return raw
+    value = getattr(command, stream)
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        try:
+            return value.encode("utf-8", "strict")
+        except UnicodeEncodeError as error:
+            raise WireError(f"{stream} is not UTF-8") from error
+    raise WireError(f"{stream} is not bytes")
+
+
+def _json(
+    command: CommandOutput,
+    source: str,
+    *,
+    limit: int = _MAX_STDOUT,
+) -> Mapping[str, object]:
+    if command.timed_out:
+        raise ContractError(f"{source} timed out")
     if command.returncode != 0:
         raise ContractError(f"{source} failed: {_bounded_text(command.stderr or command.stdout)}")
     try:
-        payload = json.loads(command.stdout)
-    except json.JSONDecodeError as error:
+        payload = decode_document(_command_bytes(command, "stdout"), limit=limit)
+        validate_string_bounds(payload, limit=_MAX_FIELD)
+    except (WireError, UnicodeEncodeError) as error:
         raise ContractError(f"{source} returned invalid JSON") from error
     if not isinstance(payload, Mapping):
         raise ContractError(f"{source} returned invalid JSON")
     return payload
 
 
-def _error_envelope_code(command: CommandOutput) -> str | None:
+def _error_envelope_code(
+    command: CommandOutput,
+    *,
+    limit: int = _MAX_HOST_STDOUT,
+    validate_host_id: bool = False,
+) -> str | None:
     """Return only a structurally valid v1 error code.
 
     Producer diagnostics are untrusted text.  In particular, a sentence that
     happens to contain ``stale_mesh`` cannot change the refresh transaction.
     """
 
+    if command.timed_out or command.returncode <= 0:
+        return None
     try:
-        payload = json.loads(command.stdout)
-    except json.JSONDecodeError:
+        payload = decode_document(_command_bytes(command, "stdout"), limit=limit)
+        validate_string_bounds(payload, limit=_MAX_FIELD)
+    except (WireError, UnicodeEncodeError):
         return None
     if (
         not isinstance(payload, Mapping)
         or payload.get("schemaVersion") != 1
+        or isinstance(payload.get("schemaVersion"), bool)
+        or not isinstance(payload.get("schemaVersion"), int)
         or payload.get("ok") is not False
         or not isinstance(payload.get("error"), Mapping)
     ):
         return None
-    code = payload["error"].get("code")
-    if not isinstance(code, str):
+    error = payload["error"]
+    if "code" not in error or "message" not in error:
         return None
     try:
-        return _mesh_token(code, "error code")
+        if validate_host_id and "hostId" in error:
+            _error_host_id(error["hostId"])
+        message = error["message"]
+        if (
+            not isinstance(message, str)
+            or not message
+            or len(message) > 4096
+            or any(unicodedata.category(char).startswith("C") for char in message)
+        ):
+            return None
+        return _error_code(error["code"])
     except ContractError:
         return None
 
 
-def _raise_command_failure(command: CommandOutput, source: str) -> None:
-    code = _error_envelope_code(command)
+def _raise_command_failure(
+    command: CommandOutput,
+    source: str,
+    *,
+    limit: int = _MAX_HOST_STDOUT,
+    validate_host_id: bool = False,
+) -> None:
+    if command.timed_out:
+        raise ContractError(f"{source} timed out")
+    code = _error_envelope_code(
+        command,
+        limit=limit,
+        validate_host_id=validate_host_id,
+    )
     if code == "stale_mesh":
         raise StaleMeshError("Host Mesh revision changed")
     suffix = f" [{code}]" if code else ""
@@ -680,7 +818,7 @@ def _inventory_args(tmux_command: str, mesh: Mesh) -> list[str]:
     return argv
 
 
-def _inventory_text(value: object, label: str, *, empty: bool = True) -> str:
+def _inventory_text(value: object, label: str, *, empty: bool = False) -> str:
     return _text(value, f"Tmux Session {label}", empty=empty)
 
 
@@ -689,6 +827,21 @@ def _nonnegative(value: object, label: str, *, nullable: bool = False) -> int | 
         return _timestamp(value, f"Tmux Session inventory {label}", nullable=nullable)
     except ContractError as error:
         raise ContractError(f"Tmux Session inventory {label} is invalid") from error
+
+
+def _count(value: object, label: str, *, nullable: bool = False) -> int | None:
+    if nullable and value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**31 - 1:
+        raise ContractError(f"Tmux Session inventory {label} is invalid")
+    return value
+
+
+def _generation(value: object, label: str = "server generation") -> str:
+    result = _text(value, f"Tmux Session {label}")
+    if any(unicodedata.category(char).startswith("C") for char in result):
+        raise ContractError(f"Tmux Session {label} is invalid")
+    return result
 
 
 def _nullable_inventory_text(value: object, label: str) -> str | None:
@@ -700,113 +853,193 @@ def _nullable_inventory_text(value: object, label: str) -> str | None:
 def _validate_inventory_session(session: object, host: MeshHost, generation: str) -> None:
     if not isinstance(session, Mapping):
         raise ContractError("Tmux Session inventory session is invalid")
-    if session.get("hostId") != host.host_id or session.get("serverGeneration") != generation:
+    _required(
+        session,
+        "hostId",
+        "serverGeneration",
+        "sessionId",
+        "createdAt",
+        "name",
+        "activityAt",
+        "lastAttachedAt",
+        "attachedClients",
+        "pending",
+        "windowCount",
+        "sessionPath",
+        "currentWindow",
+        "currentPath",
+        "panes",
+        "options",
+    )
+    if session["hostId"] != host.host_id or session["serverGeneration"] != generation:
         raise ContractError("Tmux Session inventory session is invalid")
     session_id = session.get("sessionId")
-    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+    if (
+        not isinstance(session_id, str)
+        or len(session_id) > 4096
+        or not _SESSION_ID.fullmatch(session_id)
+    ):
         raise ContractError("Tmux Session inventory session is invalid")
-    _nonnegative(session.get("createdAt"), "createdAt")
-    _nullable_inventory_text(session.get("name"), "session name")
-    _nonnegative(session.get("activityAt"), "activityAt", nullable=True)
-    _nonnegative(session.get("lastAttachedAt"), "lastAttachedAt", nullable=True)
-    _nonnegative(session.get("attachedClients"), "attachedClients", nullable=True)
-    _nonnegative(session.get("windowCount"), "windowCount", nullable=True)
-    if not isinstance(session.get("pending"), bool):
+    _nonnegative(session["createdAt"], "createdAt")
+    _nullable_inventory_text(session["name"], "session name")
+    _nonnegative(session["activityAt"], "activityAt", nullable=True)
+    _nonnegative(session["lastAttachedAt"], "lastAttachedAt", nullable=True)
+    _count(session["attachedClients"], "attachedClients", nullable=True)
+    _count(session["windowCount"], "windowCount", nullable=True)
+    if not isinstance(session["pending"], bool):
         raise ContractError("Tmux Session inventory pending state is invalid")
     for field in ("sessionPath", "currentWindow", "currentPath"):
-        _nullable_inventory_text(session.get(field), field)
-    panes = session.get("panes")
-    options = session.get("options")
+        _nullable_inventory_text(session[field], field)
+    panes = session["panes"]
+    options = session["options"]
     if not isinstance(panes, list) or not isinstance(options, Mapping):
         raise ContractError("Tmux Session inventory omitted requested pane metadata")
+    if len(panes) > 512:
+        raise ContractError("Tmux Session inventory has too many panes")
     seen_panes: set[str] = set()
     for pane in panes:
         if not isinstance(pane, Mapping):
             raise ContractError("Tmux Session pane is invalid")
+        _required(pane, "paneId", "pid", "currentPath", "currentCommand")
         pane_id = pane.get("paneId")
-        if not isinstance(pane_id, str) or not _PANE_ID.fullmatch(pane_id) or pane_id in seen_panes:
+        if (
+            not isinstance(pane_id, str)
+            or len(pane_id) > 4096
+            or not _PANE_ID.fullmatch(pane_id)
+            or pane_id in seen_panes
+        ):
             raise ContractError("Tmux Session pane is invalid")
         seen_panes.add(pane_id)
-        _nonnegative(pane.get("pid"), "pane pid", nullable=True)
-        _nullable_inventory_text(pane.get("currentPath"), "pane path")
-        _nullable_inventory_text(pane.get("currentCommand"), "pane command")
+        _count(pane["pid"], "pane pid", nullable=True)
+        _nullable_inventory_text(pane["currentPath"], "pane path")
+        _nullable_inventory_text(pane["currentCommand"], "pane command")
     for option in _OPTIONS:
         if option not in options:
             raise ContractError("Tmux Session inventory omitted requested option")
         if options[option] is not None:
             _inventory_text(options[option], "session option")
+    for option, option_value in options.items():
+        if (
+            not isinstance(option, str)
+            or len(option) > 4096
+            or not re.fullmatch(r"@[A-Za-z0-9_.-]+", option, re.ASCII)
+        ):
+            raise ContractError("Tmux Session inventory option name is invalid")
+        if option_value is not None:
+            _inventory_text(option_value, "session option")
 
 
 def _inventory(payload: object, mesh: Mesh) -> dict[str, dict[str, object]]:
     if (
         not isinstance(payload, Mapping)
         or payload.get("schemaVersion") != 1
+        or isinstance(payload.get("schemaVersion"), bool)
+        or not isinstance(payload.get("schemaVersion"), int)
         or payload.get("meshRevision") != mesh.revision
     ):
         raise ContractError("Tmux Session inventory returned an unsupported schema")
-    _nonnegative(payload.get("generatedAt"), "generatedAt")
+    _required(payload, "generatedAt", "meshRevision", "hosts")
+    _nonnegative(payload["generatedAt"], "generatedAt")
     hosts = payload.get("hosts")
-    if not isinstance(hosts, list) or len(hosts) != len(mesh.hosts):
+    if (
+        not isinstance(hosts, list)
+        or not 1 <= len(hosts) <= _MAX_HOSTS
+        or len(hosts) != len(mesh.hosts)
+    ):
         raise ContractError("Tmux Session inventory host coverage is invalid")
     result: dict[str, dict[str, object]] = {}
     for expected, value in zip(mesh.hosts, hosts, strict=True):
+        if not isinstance(value, Mapping):
+            raise ContractError("Tmux Session inventory host coverage is invalid")
+        _required(
+            value,
+            "hostId",
+            "display",
+            "local",
+            "status",
+            "observedAt",
+            "nativeHostname",
+            "serverGeneration",
+            "route",
+            "sessions",
+        )
         if (
-            not isinstance(value, Mapping)
-            or value.get("hostId") != expected.host_id
-            or value.get("display") != expected.display
-            or value.get("local") is not expected.local
+            value["hostId"] != expected.host_id
+            or value["display"] != expected.display
+            or value["local"] is not expected.local
         ):
             raise ContractError("Tmux Session inventory host coverage is invalid")
         status = value.get("status")
         sessions = value.get("sessions")
         if not isinstance(status, str) or not isinstance(sessions, list):
             raise ContractError("Tmux Session inventory host is invalid")
-        _nonnegative(value.get("observedAt"), "observedAt")
-        native = value.get("nativeHostname")
-        if native is not None:
-            _mesh_token(native, "native hostname")
-        route = value.get("route")
+        if status not in {"ok", "unreachable", "error", "tmux_missing"}:
+            raise ContractError("Tmux Session inventory host status is invalid")
+        _nonnegative(value["observedAt"], "observedAt")
+        _nullable_inventory_text(value["nativeHostname"], "native hostname")
+        route = value["route"]
+        if route is not None:
+            _inventory_text(route, "route")
         if expected.local:
             if route is not None:
                 raise ContractError("Tmux Session inventory local route is invalid")
         elif status == "unreachable":
             if route is not None:
                 raise ContractError("Tmux Session inventory unreachable route is invalid")
-        elif route not in {item.destination for item in expected.routes}:
+        elif route is not None and route not in {item.destination for item in expected.routes}:
             raise ContractError("Tmux Session inventory route is invalid")
+        generation_value = value["serverGeneration"]
         if status == "ok":
-            generation = value.get("serverGeneration")
+            generation = generation_value
             if generation is None and sessions:
                 raise ContractError("Tmux Session server generation is invalid")
-            if generation is not None and (
-                not isinstance(generation, str)
-                or not generation
-                or len(generation) > _MAX_FIELD
-                or any(unicodedata.category(char).startswith("C") for char in generation)
-            ):
+            if generation is not None and not isinstance(generation, str):
                 raise ContractError("Tmux Session server generation is invalid")
-        elif status not in {"unreachable", "error", "tmux_missing"}:
-            raise ContractError("Tmux Session inventory host status is invalid")
+            if isinstance(generation, str):
+                generation = _generation(generation)
         else:
-            if sessions or value.get("serverGeneration") is not None:
+            if sessions or generation_value is not None:
                 raise ContractError("Tmux Session inventory failure host is invalid")
             error = value.get("error")
             if not isinstance(error, Mapping):
                 raise ContractError("Tmux Session inventory error is invalid")
-            _inventory_text(error.get("code"), "error code", empty=False)
-            _inventory_text(error.get("message"), "error message", empty=False)
-        if status == "ok" and value.get("error") is not None:
+            _required(error, "code", "message")
+            try:
+                _error_code(error["code"], "Tmux Session error code")
+            except ContractError as exc:
+                raise ContractError("Tmux Session inventory error is invalid") from exc
+            message = error["message"]
+            if (
+                not isinstance(message, str)
+                or not message
+                or len(message) > 4096
+                or any(unicodedata.category(char).startswith("C") for char in message)
+            ):
+                raise ContractError("Tmux Session inventory error is invalid")
+        if status == "ok" and "error" in value:
             raise ContractError("Tmux Session inventory ok host is invalid")
+        if len(sessions) > 256:
+            raise ContractError("Tmux Session inventory has too many sessions")
+        pane_total = 0
         if isinstance(generation := value.get("serverGeneration"), str):
             seen_refs: set[tuple[str, int]] = set()
             for session in sessions:
                 _validate_inventory_session(session, expected, generation)
                 assert isinstance(session, Mapping)
+                pane_total += len(session["panes"])
                 reference = (str(session["sessionId"]), int(session["createdAt"]))
                 if reference in seen_refs:
                     raise ContractError("Tmux Session inventory duplicate session reference")
                 seen_refs.add(reference)
+        elif sessions:
+            raise ContractError("Tmux Session server generation is invalid")
+        if pane_total > 512:
+            raise ContractError("Tmux Session inventory has too many panes for host")
         result[expected.host_id] = dict(value)
+    try:
+        validate_string_bounds(payload, limit=_MAX_FIELD)
+    except WireError as error:
+        raise ContractError("Tmux Session inventory contains an oversized string") from error
     return result
 
 
@@ -827,20 +1060,24 @@ def _tmux_reference(session: Mapping[str, object], revision: str | None) -> dict
         not isinstance(reference[0], str)
         or not reference[0]
         or not isinstance(reference[1], str)
+        or len(reference[1]) > 4096
         or not _SESSION_ID.fullmatch(reference[1])
         or isinstance(reference[2], bool)
         or not isinstance(reference[2], int)
         or reference[2] < 0
     ):
         raise ContractError("Tmux Session inventory session reference is invalid")
+    generation = _generation(reference[0])
+    created_at = _nonnegative(reference[2], "createdAt")
+    assert created_at is not None
     observed_name = session.get("name")
     if observed_name is not None:
         _inventory_text(observed_name, "session name")
     return {
         "meshRevision": revision,
-        "serverGeneration": reference[0],
+        "serverGeneration": generation,
         "sessionId": reference[1],
-        "createdAt": reference[2],
+        "createdAt": created_at,
         "observedName": observed_name,
     }
 
@@ -980,10 +1217,12 @@ class ContractBackend:
         output = self._run(
             [self.ssh_command, "mesh", "list", "--json"],
             timeout=min(5.0, self._remaining(self._stream_deadline)),
+            stdout_limit=_MAX_HOST_STDOUT,
+            stderr_limit=_MAX_STDERR,
         )
         if output.returncode != 0:
             _raise_command_failure(output, "Host Mesh")
-        self.mesh = parse_mesh(_json(output, "Host Mesh"))
+        self.mesh = parse_mesh(_json(output, "Host Mesh", limit=_MAX_HOST_STDOUT))
 
     @staticmethod
     def _remaining(deadline: float) -> float:
@@ -1010,12 +1249,16 @@ class ContractBackend:
                 self._now_millis(),
             ),
             timeout=min(5.0, self._remaining(deadline)),
+            stdout_limit=_MAX_HOST_STDOUT,
+            stderr_limit=_MAX_STDERR,
         )
         if output.returncode != 0:
             _raise_command_failure(output, "Host Mesh route report")
-        response = _json(output, "Host Mesh route report")
+        response = _json(output, "Host Mesh route report", limit=_MAX_HOST_STDOUT)
         if (
             response.get("schemaVersion") != 1
+            or isinstance(response.get("schemaVersion"), bool)
+            or not isinstance(response.get("schemaVersion"), int)
             or response.get("ok") is not True
             or not isinstance(response.get("accepted"), bool)
         ):
@@ -1079,8 +1322,19 @@ class ContractBackend:
                 self._report_hint(host, route, "reachable", deadline)
                 # Deliberately return the completed domain command even when
                 # nonzero: the marker makes it authoritative and terminal.
+                stderr_bytes = output.stderr_bytes
+                if stderr_bytes is not None:
+                    marker_bytes = _marker(nonce).encode("utf-8")
+                    if stderr_bytes.count(marker_bytes) == 1:
+                        stderr_bytes = stderr_bytes.replace(marker_bytes, b"", 1)
                 return route.destination, CommandOutput(
-                    output.argv, output.returncode, output.stdout, stderr, output.timed_out
+                    output.argv,
+                    output.returncode,
+                    output.stdout,
+                    stderr,
+                    output.timed_out,
+                    output.stdout_bytes,
+                    stderr_bytes,
                 )
             if _transport_failure(output.stderr):
                 self._report_hint(host, route, "unreachable", deadline)
@@ -1391,10 +1645,20 @@ class ContractBackend:
             inventory_command = self._run(
                 _inventory_args(self.tmux_command, mesh),
                 timeout=min(15.0, self._remaining(deadline)),
+                stdout_limit=_MAX_INVENTORY_STDOUT,
+                stderr_limit=_MAX_STDERR,
             )
             if inventory_command.returncode != 0:
-                _raise_command_failure(inventory_command, "Tmux Session inventory")
-            return _inventory(_json(inventory_command, "Tmux Session inventory"), mesh)
+                _raise_command_failure(
+                    inventory_command,
+                    "Tmux Session inventory",
+                    limit=_MAX_INVENTORY_STDOUT,
+                    validate_host_id=True,
+                )
+            return _inventory(
+                _json(inventory_command, "Tmux Session inventory", limit=_MAX_INVENTORY_STDOUT),
+                mesh,
+            )
 
         # Inventory does not depend on provider-native results.  Start it with
         # host probes, while retaining one shared deadline and joining every

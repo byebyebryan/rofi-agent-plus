@@ -1133,11 +1133,11 @@ class RofiProtocolTest(unittest.TestCase):
             backend={
                 "kind": "contract",
                 "capability": "host-mesh-v1+tmux-session-v1",
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
             },
             providerOptionVerified=True,
             tmux={
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
                 "serverGeneration": "tmux-v1:remote",
                 "sessionId": "$4",
                 "createdAt": 5,
@@ -1198,11 +1198,11 @@ class RofiProtocolTest(unittest.TestCase):
             backend={
                 "kind": "contract",
                 "capability": "host-mesh-v1+tmux-session-v1",
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
             },
             providerOptionVerified=True,
             tmux={
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
                 "serverGeneration": "tmux-v1:remote",
                 "sessionId": "$4",
                 "createdAt": 5,
@@ -1238,11 +1238,11 @@ class RofiProtocolTest(unittest.TestCase):
             backend={
                 "kind": "contract",
                 "capability": "host-mesh-v1+tmux-session-v1",
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
             },
             providerOptionVerified=True,
             tmux={
-                "meshRevision": "sha256:mesh-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
                 "serverGeneration": "tmux-v1:remote",
                 "sessionId": "$4",
                 "createdAt": 5,

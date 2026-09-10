@@ -10,6 +10,7 @@ ruff format --check .
 
 test -x bin/rofi-agent-plus
 test -x scripts/check
+test -x scripts/check-contract-sync
 test -f README.md
 test -f LICENSE
 test -f pyproject.toml
@@ -26,6 +27,7 @@ test -f tests/fixtures/contract/lifecycle/README.md
 # tracked or candidate-untracked shell file.  The latter is deliberately based
 # on Git's combined file view instead of git ls-files alone.
 shellcheck scripts/check
+shellcheck scripts/check-contract-sync
 git ls-files --cached --others --exclude-standard -- '*.sh' |
     while IFS= read -r shell_file; do
         [ -z "$shell_file" ] || shellcheck "$shell_file" || exit 1
@@ -55,6 +57,8 @@ for name in paths:
         # A tracked path removed by an unstaged rename is not part of the
         # candidate working tree; the replacement path is listed separately.
         continue
+    if path.suffix == ".bin":
+        continue
     try:
         data = path.read_bytes()
     except OSError as exc:
@@ -76,6 +80,74 @@ if problems:
     print("candidate text-file check failed:", file=sys.stderr)
     print("\n".join(problems), file=sys.stderr)
     raise SystemExit(1)
+PY
+
+# Verify the vendored public bundles without needing a sibling checkout or a
+# schema package.  The explicit sync gate compares bytes to producer trees.
+PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from pathlib import Path
+
+
+root = Path.cwd()
+digest_pattern = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
+repositories = {
+    "host-mesh-v1": "https://github.com/byebyebryan/rofi-ssh-plus",
+    "tmux-session-v1": "https://github.com/byebyebryan/rofi-tmux-plus",
+}
+for contract in ("host-mesh-v1", "tmux-session-v1"):
+    directory = root / "contracts" / contract
+    manifest_path = directory / "SHA256SUMS"
+    raw = manifest_path.read_bytes()
+    if not raw.endswith(b"\n") or b"\r" in raw:
+        raise SystemExit(f"{manifest_path}: malformed checksum bytes")
+    entries: list[tuple[str, str]] = []
+    for line in raw.splitlines():
+        try:
+            digest, name = line.decode("ascii").split("  ", 1)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SystemExit(f"{manifest_path}: malformed checksum line") from error
+        if not re.fullmatch(r"[0-9a-f]{64}", digest, re.ASCII) or name == "SHA256SUMS":
+            raise SystemExit(f"{manifest_path}: invalid checksum entry")
+        entries.append((name, digest))
+    names = [name for name, _digest in entries]
+    if len(names) != len(set(names)) or names != sorted(names, key=lambda item: item.encode()):
+        raise SystemExit(f"{manifest_path}: entries are not sorted and unique")
+    for name, expected in entries:
+        candidate = directory / name
+        if not candidate.is_file() or hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
+            raise SystemExit(f"{candidate}: checksum mismatch or missing")
+    actual_files = {
+        candidate.relative_to(directory).as_posix()
+        for candidate in directory.rglob("*")
+        if candidate.is_file()
+        and candidate not in {directory / "SHA256SUMS", directory / "SOURCE.json"}
+    }
+    if actual_files != set(names):
+        raise SystemExit(f"{directory}: SHA256SUMS coverage mismatch")
+    source_path = directory / "SOURCE.json"
+    try:
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"{source_path}: invalid SOURCE.json") from error
+    if (
+        not isinstance(source, dict)
+        or source.get("contract") != contract
+        or source.get("upstreamRepository") != repositories[contract]
+        or source.get("sourceState") != "released"
+    ):
+        raise SystemExit(f"{source_path}: released provenance is required")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(source.get("sourceCommit"))) or not digest_pattern.fullmatch(
+        str(source.get("bundleDigest"))
+    ):
+        raise SystemExit(f"{source_path}: invalid released provenance")
+    expected_digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    if source.get("bundleDigest") != expected_digest:
+        raise SystemExit(f"{source_path}: bundle digest mismatch")
 PY
 
 # Keep Git's staged/unstaged checks as an additional guard once files are

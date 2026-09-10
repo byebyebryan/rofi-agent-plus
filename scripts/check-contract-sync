@@ -1,0 +1,152 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: $0 SSH_CHECKOUT TMUX_CHECKOUT" >&2
+    exit 2
+fi
+
+script_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+exec python3 - "$script_root" "$@" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+
+ROOT = Path(sys.argv[1]).resolve()
+HEX = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
+EXPECTED = {
+    "host-mesh-v1": "https://github.com/byebyebryan/rofi-ssh-plus",
+    "tmux-session-v1": "https://github.com/byebyebryan/rofi-tmux-plus",
+}
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(message)
+
+
+def manifest(directory: Path) -> tuple[dict[str, str], str]:
+    path = directory / "SHA256SUMS"
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        fail(f"{path}: {error}")
+    if not raw or not raw.endswith(b"\n") or b"\r" in raw:
+        fail(f"{path}: malformed checksum bytes")
+    rows: list[tuple[str, str]] = []
+    for line in raw.splitlines():
+        try:
+            digest, name = line.decode("ascii").split("  ", 1)
+        except (UnicodeDecodeError, ValueError):
+            fail(f"{path}: malformed checksum line")
+        if not HEX.fullmatch(digest) or not name or name == "SHA256SUMS":
+            fail(f"{path}: invalid checksum entry {line!r}")
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != name:
+            fail(f"{path}: unsafe checksum path {name!r}")
+        rows.append((name, digest))
+    names = [name for name, _digest in rows]
+    if len(set(names)) != len(names) or names != sorted(names, key=lambda item: item.encode()):
+        fail(f"{path}: entries are not unique and bytewise sorted")
+    expected = {name: digest for name, digest in rows}
+    for name, digest in expected.items():
+        candidate = directory / name
+        if not candidate.is_file():
+            fail(f"{directory}: checksum file is missing {name}")
+        actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        if actual != digest:
+            fail(f"{candidate}: checksum mismatch")
+    files = {
+        candidate.relative_to(directory).as_posix()
+        for candidate in directory.rglob("*")
+        if candidate.is_file() and candidate not in {directory / "SHA256SUMS", directory / "SOURCE.json"}
+    }
+    if files != set(expected):
+        fail(f"{directory}: checksum coverage mismatch")
+    return expected, hashlib.sha256(raw).hexdigest()
+
+
+def source_record(directory: Path, contract: str, digest: str) -> str:
+    path = directory / "SOURCE.json"
+    try:
+        source = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"{path}: invalid provenance ({error})")
+    if (
+        not isinstance(source, dict)
+        or set(source)
+        != {
+            "contract",
+            "upstreamRepository",
+            "sourceState",
+            "sourceCommit",
+            "bundleDigest",
+        }
+        or source.get("contract") != contract
+        or source.get("upstreamRepository") != EXPECTED[contract]
+        or source.get("sourceState") != "released"
+        or re.fullmatch(r"[0-9a-f]{40}", str(source.get("sourceCommit"))) is None
+        or source.get("bundleDigest") != f"sha256:{digest}"
+        or not DIGEST.fullmatch(str(source.get("bundleDigest")))
+    ):
+        fail(f"{path}: provenance does not identify the released bundle")
+    return str(source["sourceCommit"])
+
+
+def git(checkout: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(checkout), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        fail(f"{checkout}: git {' '.join(args)} failed")
+    return result.stdout
+
+
+def compare(name: str, source_checkout: Path, target_root: Path) -> None:
+    source_root = source_checkout / "contracts" / name
+    source_files, source_digest = manifest(source_root)
+    target_files, target_digest = manifest(target_root)
+    if source_files != target_files or source_digest != target_digest:
+        fail(f"{name}: target bundle differs from producer bundle")
+    for relative in source_files:
+        if (source_root / relative).read_bytes() != (target_root / relative).read_bytes():
+            fail(f"{name}: byte mismatch in {relative}")
+    target_names = {
+        candidate.relative_to(target_root).as_posix()
+        for candidate in target_root.rglob("*")
+        if candidate.is_file()
+    }
+    if target_names != set(target_files) | {"SHA256SUMS", "SOURCE.json"}:
+        fail(f"{name}: target has files outside the complete bundle")
+    source_commit = source_record(target_root, name, target_digest)
+    if git(source_checkout, "rev-parse", "HEAD").strip() != source_commit:
+        fail(f"{name}: producer checkout HEAD differs from released provenance")
+    if git(
+        source_checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        f"contracts/{name}",
+    ):
+        fail(f"{name}: producer checkout bundle differs from its released commit")
+    print(f"{name} released bundle matches {source_commit}")
+
+
+ssh_checkout = Path(sys.argv[2]).resolve()
+tmux_checkout = Path(sys.argv[3]).resolve()
+compare("host-mesh-v1", ssh_checkout, ROOT / "contracts" / "host-mesh-v1")
+compare("tmux-session-v1", tmux_checkout, ROOT / "contracts" / "tmux-session-v1")
+print(f"Host Mesh bundle sha256:{hashlib.sha256((ROOT / 'contracts/host-mesh-v1/SHA256SUMS').read_bytes()).hexdigest()}")
+print(f"Tmux Session bundle sha256:{hashlib.sha256((ROOT / 'contracts/tmux-session-v1/SHA256SUMS').read_bytes()).hexdigest()}")
+PY
