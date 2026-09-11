@@ -116,8 +116,8 @@ live in the managed `rofi-plus-p9-cli-contracts.md` document.
 P9 itself did not change picker presentation. A subsequent post-P9 SSH-only
 refinement makes SSH recent-only and restores its native filter arrows; it
 leaves Agent/Tmux behavior, Host Mesh v1, and both P9 wire contracts unchanged.
-That SSH refinement remains a separate candidate requiring publication,
-deployment, and acceptance.
+That SSH refinement is published separately and awaits managed deployment and
+acceptance.
 
 The canonical `rofi-ssh-plus`, `rofi-tmux-plus`, and `rofi-agent-plus`
 commands are resolved through `PATH`. A suite deployment installs public
