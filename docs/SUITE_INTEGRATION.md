@@ -2,9 +2,11 @@
 
 Status: the P7 contract-only cutover and guarded-open performance follow-up are
 complete in version `0.3.0`; the P8 flat-scope navigation implementation is
-complete in version `0.4.0`. The coordinated P8 cutover is published, deployed,
-and operator-accepted. P9 locked CLI contracts are implemented here as an
-independent consumer with exact released producer provenance; managed suite
+complete in version `0.4.0`. The coordinated P8 cutover is published and
+deployed, with operator acceptance complete on Snap and Starship; Carbon is in
+a daily-drive soak for the published suite/P9 behavior. P9 locked CLI
+contracts are implemented here as an independent consumer with exact released
+producer provenance; managed suite
 deployment is coordinated through chezmoi.
 Agent Plus consumes Tmux Session v1 through its public process contract on every
 product path; Tmux Plus is mandatory. It consumes
@@ -98,9 +100,24 @@ recovery; ambiguous process or response failures never repeat a lifecycle
 action. Stderr text and process exit numbers never authorize fallback, route
 health, or mutation.
 
+The consumer's `SOURCE.json` records the exact released producer commit and
+checksum-manifest digest for each vendored bundle. `scripts/check-contract-sync`
+also accepts a later producer `HEAD` when the recorded commit resolves and is
+an ancestor, the manifest at that commit is byte-identical to the clean
+current producer manifest, and the current bundle is byte-identical to the
+vendored bundle. A missing, non-ancestor, dirty, or contract-changing
+producer checkout fails the gate; contract changes therefore still require a
+new released tuple and consumer repin.
+
 P9 changes no provider discovery, correlation, resume command, cache, Rofi row,
 or P8 navigation behavior. The coordinated suite design and rollout boundary
 live in the managed `rofi-plus-p9-cli-contracts.md` document.
+
+P9 itself did not change picker presentation. A subsequent post-P9 SSH-only
+refinement makes SSH recent-only and restores its native filter arrows; it
+leaves Agent/Tmux behavior, Host Mesh v1, and both P9 wire contracts unchanged.
+That SSH refinement remains a separate candidate requiring publication,
+deployment, and acceptance.
 
 The canonical `rofi-ssh-plus`, `rofi-tmux-plus`, and `rofi-agent-plus`
 commands are resolved through `PATH`. A suite deployment installs public

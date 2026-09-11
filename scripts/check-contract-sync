@@ -112,10 +112,22 @@ def git(checkout: Path, *args: str) -> str:
     return result.stdout
 
 
+def git_bytes(checkout: Path, *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", str(checkout), *args],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        fail(f"{checkout}: git {' '.join(args)} failed")
+    return result.stdout
+
+
 def compare(name: str, source_checkout: Path, target_root: Path) -> None:
     source_root = source_checkout / "contracts" / name
     source_files, source_digest = manifest(source_root)
     target_files, target_digest = manifest(target_root)
+    source_manifest = (source_root / "SHA256SUMS").read_bytes()
     if source_files != target_files or source_digest != target_digest:
         fail(f"{name}: target bundle differs from producer bundle")
     for relative in source_files:
@@ -129,8 +141,6 @@ def compare(name: str, source_checkout: Path, target_root: Path) -> None:
     if target_names != set(target_files) | {"SHA256SUMS", "SOURCE.json"}:
         fail(f"{name}: target has files outside the complete bundle")
     source_commit = source_record(target_root, name, target_digest)
-    if git(source_checkout, "rev-parse", "HEAD").strip() != source_commit:
-        fail(f"{name}: producer checkout HEAD differs from released provenance")
     if git(
         source_checkout,
         "status",
@@ -139,8 +149,41 @@ def compare(name: str, source_checkout: Path, target_root: Path) -> None:
         "--",
         f"contracts/{name}",
     ):
-        fail(f"{name}: producer checkout bundle differs from its released commit")
-    print(f"{name} released bundle matches {source_commit}")
+        fail(f"{name}: producer checkout bundle is not clean")
+    head = git(source_checkout, "rev-parse", "HEAD").strip()
+    if head != source_commit:
+        resolved = subprocess.run(
+            ["git", "-C", str(source_checkout), "cat-file", "-e", f"{source_commit}^{{commit}}"],
+            check=False,
+            capture_output=True,
+        )
+        if resolved.returncode != 0:
+            fail(f"{name}: released provenance does not resolve to a commit")
+        ancestor = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_checkout),
+                "merge-base",
+                "--is-ancestor",
+                source_commit,
+                head,
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if ancestor.returncode != 0:
+            fail(f"{name}: producer HEAD does not descend from released provenance")
+        released_manifest = git_bytes(
+            source_checkout,
+            "show",
+            f"{source_commit}:contracts/{name}/SHA256SUMS",
+        )
+        if released_manifest != source_manifest:
+            fail(f"{name}: checksum manifest changed after released provenance")
+        print(f"{name} released bundle remains unchanged through {head}")
+    else:
+        print(f"{name} released bundle matches {head}")
 
 
 ssh_checkout = Path(sys.argv[2]).resolve()
