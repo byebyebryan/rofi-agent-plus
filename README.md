@@ -71,10 +71,18 @@ active/idle state.  The provider is represented by a bundled icon; provider
 names and aliases remain in the row's filter text and invisible Rofi metadata,
 so searching for `codex`, `claude`, `Claude Code`, or `opencode` still works.
 The complete session identity is carried in Rofi's `info` metadata, not parsed
-from visible text.  Active rows are marked with Rofi's active-row metadata.  A
-selection uses Tmux Plus to focus or launch the terminal, or to create a
-deferred provider-resume wrapper with typed provider options. Icon provenance
-and trademark notes are in [`ASSETS.md`](ASSETS.md).
+from visible text.  Session recency and activity state are independent from
+observation confidence.  Rows with current provider and supporting evidence
+are ordinary; while an automatic stale-cache refresh or explicit `Alt+R` check
+is running, current rows show `Checking` and retained rows show `Rechecking ·
+last seen …`.  After a check, retained provider rows show `Last known · seen
+…`, activity-only rows show `Activity seen · details unavailable`, and rows
+with current provider data but secondary activity or Tmux failures show
+`Details limited`.  Active-row styling
+is emitted only when current activity evidence supports it.  A selection uses
+Tmux Plus to focus or launch the terminal, or to create a deferred
+provider-resume wrapper with typed provider options. Icon provenance and
+trademark notes are in [`ASSETS.md`](ASSETS.md).
 
 When discovery correlated a session through its exact provider tmux option,
 the row carries a private `providerOptionVerified` marker. Selecting that row
@@ -120,21 +128,29 @@ discovery-affecting configuration or authority change causes a synchronous
 refresh.
 
 On a cache miss, the first invocation refreshes synchronously.  A fresh cache
-renders immediately.  A stale cache renders immediately with a short
-`Refreshing in background` message and starts at most one detached refresh.
-While that worker is running, the open dialog polls the marker about once per
-second and replaces the cached rows as soon as the fresh snapshot is written;
-the status then clears and polling stops.  A failed or stalled worker also
-stops polling and clears the transient status while leaving the cached rows
-usable.  Current refresh/provider errors are shown for about three seconds and
-then cleared automatically; the rows remain available throughout.  The new
-result is also visible the next time the picker opens or after the background
-refresh started by `Alt+R` completes.
-Per-host snapshots and rows from failed provider stages are retained while a
-host is unavailable, and current errors are summarized in the message area.
-The detached-refresh marker is scoped to the cache fingerprint and backend
-authority; an old owner cannot suppress or overwrite a newer Mesh refresh.
-There is intentionally no resident process or push-update channel.
+renders immediately.  Cache age triggers a check but never, by itself, makes a
+row warning or `Last known`.  A stale cache renders immediately with a short
+`Checking sessions…` message and starts at most one detached refresh; explicit
+`Alt+R` starts the same background check even when the cache is fresh.  While
+that worker is running, the open dialog polls its private marker about once per
+second.  Rows continue to come from the committed snapshot and publish
+together when the complete authority-scoped transaction is written; there is
+no resident process, push-update channel, or progressive row publication.
+Successful completion shows a bounded `Checked just now` acknowledgement,
+then polling stops and the acknowledgement clears.  A failed, stopped, or
+stalled worker stops polling and shows a visible check failure while leaving
+usable last-known rows in place.  Current refresh/provider errors are shown
+for about three seconds and then cleared automatically; the rows remain
+available throughout.
+
+The private v4 cache accepts a valid v3 snapshot in memory without rewriting it
+on read or causing a cache miss; a later legitimate cache mutation persists
+the v4 form.  Per-host snapshots and rows from failed provider stages are
+retained while a host is unavailable, and current errors are summarized in the
+message area.  The v4 observation fields are presentation provenance only:
+they do not authorize selection or lifecycle actions.  The detached-refresh
+marker is scoped to the cache fingerprint and backend authority; an old owner
+cannot suppress or overwrite a newer Mesh refresh.
 
 ## Diagnostic CLI
 

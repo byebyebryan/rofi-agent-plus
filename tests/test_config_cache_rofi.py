@@ -191,7 +191,7 @@ class ProjectMetadataTest(unittest.TestCase):
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
-        readme = (self.root / "README.md").read_text()
+        readme = " ".join((self.root / "README.md").read_text().split())
         workflow = (self.root / ".github" / "workflows" / "ci.yml").read_text()
         self.assertIn("config.toml", readme)
         self.assertIn("XDG_CACHE_HOME", readme)
@@ -199,6 +199,25 @@ class ProjectMetadataTest(unittest.TestCase):
         self.assertIn("canonical implementation of Agent Plus", readme)
         self.assertIn("Current refresh/provider errors are shown for about three seconds", readme)
         self.assertIn("./scripts/check", workflow)
+
+    def test_readme_documents_refresh_observation_semantics(self) -> None:
+        readme = " ".join((self.root / "README.md").read_text().split())
+        for phrase in (
+            "Session recency and activity state are independent from observation confidence",
+            "automatic stale-cache refresh or explicit `Alt+R` check",
+            "current rows show `Checking` and retained rows show `Rechecking",
+            "retained provider rows show `Last known · seen",
+            "activity-only rows show `Activity seen · details unavailable`",
+            "current provider data but secondary activity or Tmux failures show",
+            "Cache age triggers a check but never, by itself, makes a row warning",
+            "private v4 cache accepts a valid v3 snapshot in memory without rewriting it",
+            "no resident process, push-update channel, or progressive row publication",
+            "Successful completion shows a bounded `Checked just now` acknowledgement",
+            "do not authorize selection or lifecycle actions",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme)
+        self.assertNotIn("`Refreshing in background`", readme)
 
     def test_readme_keeps_tab_for_rows_and_left_right_for_views(self) -> None:
         readme = (self.root / "README.md").read_text()

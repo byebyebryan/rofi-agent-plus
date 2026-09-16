@@ -113,6 +113,16 @@ P9 changes no provider discovery, correlation, resume command, cache, Rofi row,
 or P8 navigation behavior. The coordinated suite design and rollout boundary
 live in the managed `rofi-plus-p9-cli-contracts.md` document.
 
+Agent Plus's private v4 observation metadata remains outside both public
+process contracts.  Cache-age checks and background-check failures may retain
+usable per-host or provider rows and label them as last known, but never change
+Host Mesh or Tmux identity authority.  A background check is authority-scoped
+and commits one complete snapshot, so rows publish together; Rofi polls the
+private worker marker at roughly one-second intervals and has no resident push
+channel or progressive row publication.  Observation labels are presentation
+only and never lifecycle or selection authority; selected rows continue through
+the existing Tmux Session revalidation path.
+
 P9 itself did not change picker presentation. A subsequent post-P9 SSH-only
 refinement makes SSH recent-only and restores its native filter arrows; it
 leaves Agent/Tmux behavior, Host Mesh v1, and both P9 wire contracts unchanged.
@@ -194,7 +204,9 @@ retried from one new Host Mesh observation rather than merging generations.
 
 Agent Plus retains its private cache because provider history is its domain.
 The Tmux Session inventory command is live; Agent Plus decides whether to
-retain stale agent rows after a host or provider failure.
+retain last-known agent rows after a host or provider failure.  Cache-age alone
+does not make a row warning; only failed observation evidence adds a retained or
+limited presentation label.
 
 ## Correlation model
 
