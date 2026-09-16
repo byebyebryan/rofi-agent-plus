@@ -24,7 +24,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 
 from . import engine
@@ -37,6 +37,8 @@ _MAX_STDOUT = 1 << 20
 _MAX_STDERR = 1 << 16
 _MAX_HOST_STDOUT = 512 * 1024
 _MAX_INVENTORY_STDOUT = 1 << 20
+_MAX_COMPOSITE_STAGE_STDOUT = 128 * 1024
+_MAX_COMPOSITE_STAGE_STDERR = 16 * 1024
 _MAX_FIELD = 16 * 1024
 _MAX_HOSTS = 128
 _HOST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", re.ASCII)
@@ -94,6 +96,14 @@ class CommandOutput:
     # missing final LF, replacement decoding, or other wire damage.
     stdout_bytes: bytes | None = None
     stderr_bytes: bytes | None = None
+
+
+@dataclass
+class _ReportFlight:
+    """One route-health update currently owned by a domain command."""
+
+    completed: Event
+    stale: StaleMeshError | None = None
 
 
 def _bounded_text(value: object, limit: int = _MAX_FIELD) -> str:
@@ -753,6 +763,154 @@ print(json.dumps({"nativeHostname":socket.gethostname(),"parents":parents,"activ
 """
 
 
+# Remote process discovery is deliberately one bounded SSH domain command.
+# The child probes remain separate processes: a corrupted transcript, an
+# unavailable binary, or an activity-table failure must not turn into a false
+# failure for a successful sibling.  The parent prints the *only* JSON record
+# on stdout after it has reaped every child.
+_COMPOSITE_PROBE_TEMPLATE = r"""
+import json, os, selectors, signal, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+
+STAGE_STDOUT_LIMIT = __STAGE_STDOUT_LIMIT__
+STAGE_STDERR_LIMIT = __STAGE_STDERR_LIMIT__
+SOURCES = {
+    "active": __ACTIVE_SOURCE__,
+    "claude": __CLAUDE_SOURCE__,
+    "opencode": __OPENCODE_SOURCE__,
+}
+
+
+class StageTimeout(Exception):
+    pass
+
+
+class StageLimit(Exception):
+    pass
+
+
+def clean(value):
+    return " ".join(str(value).split())[:1024] or "stage failed"
+
+
+def terminate(process):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        process.kill()
+    process.wait()
+
+
+def capture(source, arguments, timeout):
+    process = None
+    poller = None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", source, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+        )
+        poller = selectors.DefaultSelector()
+        poller.register(process.stdout, selectors.EVENT_READ, "stdout")
+        poller.register(process.stderr, selectors.EVENT_READ, "stderr")
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        deadline = time.monotonic() + timeout
+        while poller.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StageTimeout()
+            for key, _events in poller.select(remaining):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    poller.unregister(key.fileobj)
+                    continue
+                buffers[key.data].extend(chunk)
+                limit = STAGE_STDOUT_LIMIT if key.data == "stdout" else STAGE_STDERR_LIMIT
+                if len(buffers[key.data]) > limit:
+                    raise StageLimit(key.data)
+        try:
+            code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise StageTimeout() from error
+        return code, bytes(buffers["stdout"]), bytes(buffers["stderr"])
+    except (StageTimeout, StageLimit):
+        if process is not None:
+            terminate(process)
+        raise
+    finally:
+        if process is not None:
+            terminate(process)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        if poller is not None:
+            poller.close()
+
+
+def stage(name, source, arguments, timeout):
+    try:
+        code, stdout, stderr = capture(source, arguments, timeout)
+    except StageTimeout:
+        return {"ok": False, "error": {"code": "timed_out", "message": "stage timed out"}}
+    except StageLimit as error:
+        return {"ok": False, "error": {"code": "output_limit", "message": clean(error)}}
+    except Exception as error:
+        return {"ok": False, "error": {"code": "start_failed", "message": clean(error)}}
+    if code != 0:
+        return {"ok": False, "error": {"code": "exit_%d" % code, "message": clean(stderr)}}
+    try:
+        payload = json.loads(stdout.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return {"ok": False, "error": {"code": "invalid_json", "message": clean(error)}}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": {"code": "invalid_json", "message": "stage returned a non-object"}}
+    return {"ok": True, "payload": payload}
+
+
+def main():
+    timeout = max(0.05, float(sys.argv[1]))
+    maximum = str(max(1, int(sys.argv[2])))
+    arguments = {
+        "active": [],
+        "claude": [maximum, ""],
+        "opencode": [maximum, ""],
+    }
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="rofi-agent-composite") as pool:
+        futures = {
+            name: pool.submit(stage, name, source, arguments[name], timeout)
+            for name, source in SOURCES.items()
+        }
+        stages = {name: future.result() for name, future in futures.items()}
+    print(json.dumps({"schemaVersion": 1, "stages": stages}, separators=(",", ":")))
+
+
+main()
+"""
+
+
+def _composite_probe_input() -> bytes:
+    """Render the remote-only, self-contained provider probe transaction."""
+
+    source = (
+        _COMPOSITE_PROBE_TEMPLATE.replace(
+            "__STAGE_STDOUT_LIMIT__", str(_MAX_COMPOSITE_STAGE_STDOUT)
+        )
+        .replace("__STAGE_STDERR_LIMIT__", str(_MAX_COMPOSITE_STAGE_STDERR))
+        .replace("__ACTIVE_SOURCE__", repr(_ACTIVE_PROBE))
+        .replace("__CLAUDE_SOURCE__", repr(CLAUDE_SESSION_PROBE))
+        .replace("__OPENCODE_SOURCE__", repr(OPENCODE_SESSION_PROBE))
+    )
+    # The remote program gives its own children a bounded share of the same
+    # refresh budget.  The outer SSH command keeps the authoritative absolute
+    # deadline and reaps its local process group on a transport failure.
+    return source.encode("utf-8")
+
+
 def _validate_active(payload: object) -> dict[str, object]:
     if not isinstance(payload, Mapping):
         raise ContractError("provider activity probe returned invalid JSON")
@@ -805,6 +963,76 @@ def _validate_active(payload: object) -> dict[str, object]:
             }
         result[key] = clean
     return result
+
+
+def _validate_session_payload(payload: object, label: str) -> dict[str, object]:
+    """Validate the narrow common envelope shared by history probes."""
+
+    if not isinstance(payload, Mapping):
+        raise ContractError(f"{label} session query returned invalid data")
+    if not isinstance(payload.get("installed"), bool) or not isinstance(
+        payload.get("sessions"), list
+    ):
+        raise ContractError(f"{label} session query returned invalid data")
+    return dict(payload)
+
+
+def _composite_results(
+    command: CommandOutput,
+) -> tuple[dict[str, object] | Exception, object, object]:
+    """Project a composite envelope into independent provider-stage results."""
+
+    try:
+        payload = _json(
+            command,
+            "provider composite transaction",
+            limit=_MAX_HOST_STDOUT,
+        )
+        if (
+            payload.get("schemaVersion") != 1
+            or isinstance(payload.get("schemaVersion"), bool)
+            or not isinstance(payload.get("schemaVersion"), int)
+            or not isinstance(payload.get("stages"), Mapping)
+        ):
+            raise ContractError("provider composite transaction returned invalid data")
+        stages = payload["stages"]
+        assert isinstance(stages, Mapping)
+        if set(stages) != {"active", "claude", "opencode"}:
+            raise ContractError("provider composite transaction returned invalid data")
+    except ContractError as error:
+        return error, error, error
+
+    def stage(
+        name: str,
+        label: str,
+        validator: Callable[[object], object],
+    ) -> object:
+        entry = stages.get(name)
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("ok"), bool):
+            return ContractError(f"{label} session query returned invalid composite stage")
+        if entry["ok"] is True:
+            if set(entry) != {"ok", "payload"}:
+                return ContractError(f"{label} session query returned invalid composite stage")
+            try:
+                return validator(entry["payload"])
+            except ContractError as error:
+                return error
+        if set(entry) != {"ok", "error"} or not isinstance(entry.get("error"), Mapping):
+            return ContractError(f"{label} session query returned invalid composite stage")
+        error = entry["error"]
+        assert isinstance(error, Mapping)
+        try:
+            code = _error_code(error.get("code"), "provider composite stage error")
+            message = _text(error.get("message"), "provider composite stage error")
+        except ContractError:
+            return ContractError(f"{label} session query returned invalid composite stage")
+        return ContractError(f"{label} session query failed [{code}]: {message}")
+
+    return (
+        stage("active", "provider activity probe", _validate_active),
+        stage("claude", "Claude", lambda value: _validate_session_payload(value, "Claude")),
+        stage("opencode", "opencode", lambda value: _validate_session_payload(value, "opencode")),
+    )
 
 
 def _inventory_args(tmux_command: str, mesh: Mesh) -> list[str]:
@@ -1187,6 +1415,9 @@ class ContractBackend:
         self.mesh: Mesh | None = None
         self._report_errors: list[dict[str, str]] = []
         self._report_error_lock = Lock()
+        self._report_state_lock = Lock()
+        self._reported_hints: set[tuple[str, str, str]] = set()
+        self._report_flights: dict[tuple[str, str, str], _ReportFlight] = {}
         self._stream_deadline: float | None = None
 
     @property
@@ -1274,15 +1505,59 @@ class ContractBackend:
                 }
             )
 
-    def _report_hint(self, host: MeshHost, route: Route, status: str, deadline: float) -> None:
-        """Send a best-effort health hint without discarding domain truth."""
+    def _reset_report_transaction(self) -> None:
+        """Forget only successful hint dedupe at a refresh-attempt boundary."""
 
-        try:
-            self._report(host, route, status, deadline)
-        except StaleMeshError:
-            raise
-        except ContractError as error:
-            self._record_report_error(host, error)
+        with self._report_state_lock:
+            self._reported_hints = set()
+            self._report_flights = {}
+
+    def _report_hint(self, host: MeshHost, route: Route, status: str, deadline: float) -> None:
+        """Send one best-effort health hint without discarding domain truth.
+
+        The composite and Codex domain commands run concurrently, so both can
+        observe the same route.  A successful report is shared for this one
+        refresh attempt.  A failed report is deliberately *not* remembered:
+        the sibling remains allowed to retry and preserve the evidence.
+        """
+
+        key = (host.host_id, route.destination, status)
+        while True:
+            owner = False
+            with self._report_state_lock:
+                if key in self._reported_hints:
+                    return
+                flight = self._report_flights.get(key)
+                if flight is None:
+                    flight = _ReportFlight(Event())
+                    self._report_flights[key] = flight
+                    owner = True
+            if not owner:
+                if not flight.completed.wait(self._remaining(deadline)):
+                    raise ContractError("contract refresh timed out")
+                if flight.stale is not None:
+                    raise flight.stale
+                # A failed owner is diagnostic but intentionally not cached.
+                # Loop so this domain command can make its own bounded retry.
+                continue
+            try:
+                self._report(host, route, status, deadline)
+            except StaleMeshError as error:
+                with self._report_state_lock:
+                    flight.stale = error
+                raise
+            except ContractError as error:
+                self._record_report_error(host, error)
+                return
+            else:
+                with self._report_state_lock:
+                    self._reported_hints.add(key)
+                return
+            finally:
+                with self._report_state_lock:
+                    if self._report_flights.get(key) is flight:
+                        self._report_flights.pop(key, None)
+                    flight.completed.set()
 
     def _remote_command(
         self,
@@ -1292,6 +1567,7 @@ class ContractBackend:
         remote_argv: Sequence[str],
         input_data: bytes | None,
         label: str,
+        stdout_limit: int = _MAX_STDOUT,
     ) -> tuple[str | None, CommandOutput | ContractError]:
         """Run one real remote domain command through every eligible route.
 
@@ -1310,6 +1586,8 @@ class ContractBackend:
                     _ssh_argv(self.mesh, route, nonce, remote_argv),
                     input_data=input_data,
                     timeout=min(float(self.mesh.connect_timeout + 4), self._remaining(deadline)),
+                    stdout_limit=stdout_limit,
+                    stderr_limit=_MAX_STDERR,
                 )
             except ContractError as error:
                 if _transport_failure(str(error), "timed out" in str(error)):
@@ -1362,6 +1640,38 @@ class ContractBackend:
             return route, _validate_active(_json(result, "provider activity probe"))
         except ContractError as error:
             return route, error
+
+    def _remote_composite(
+        self,
+        host: MeshHost,
+        config: Any,
+        deadline: float,
+    ) -> tuple[str | None, object, object, object]:
+        """Collect active, Claude, and opencode through one marked command."""
+
+        assert self.mesh is not None
+        child_timeout = min(
+            engine.DEFAULT_TIMEOUT,
+            float(self.mesh.connect_timeout + 3),
+            self._remaining(deadline),
+        )
+        route, command = self._remote_command(
+            host,
+            deadline,
+            remote_argv=(
+                "python3",
+                "-",
+                f"{max(0.05, child_timeout):.3f}",
+                str(config.max_sessions),
+            ),
+            input_data=_composite_probe_input(),
+            label="provider composite transaction",
+            stdout_limit=_MAX_HOST_STDOUT,
+        )
+        if isinstance(command, ContractError):
+            return route, command, command, command
+        active, claude, opencode = _composite_results(command)
+        return route, active, claude, opencode
 
     def _active(
         self, host: MeshHost, deadline: float
@@ -1461,45 +1771,26 @@ class ContractBackend:
     ) -> tuple[object, object, object]:
         assert self.mesh is not None
 
+        if not host.local:
+            _route, codex, claude, opencode, _active = self._remote_provider_results(
+                host, config, deadline
+            )
+            return codex, claude, opencode
+
         def session_probe(probe: str, label: str) -> object:
             timeout = min(engine.DEFAULT_TIMEOUT, self._remaining(deadline))
             arguments = [str(config.max_sessions), ""]
-            if host.local:
-                argv = [sys.executable, "-", *arguments]
-                command = self._run(argv, input_data=probe.encode(), timeout=timeout)
-            else:
-                route, command = self._remote_command(
-                    host,
-                    deadline,
-                    remote_argv=("python3", "-", *arguments),
-                    input_data=probe.encode(),
-                    label=f"{label} session query",
-                )
-                if isinstance(command, ContractError):
-                    raise command
-                # A reached domain failure is final: do not send a second
-                # provider query to another route merely because it failed.
-                if route is None:
-                    raise ContractError(f"{label} session query could not reach host")
+            argv = [sys.executable, "-", *arguments]
+            command = self._run(argv, input_data=probe.encode(), timeout=timeout)
             payload = _json(
                 command,
                 f"{label} session query",
             )
-            if not isinstance(payload.get("installed"), bool) or not isinstance(
-                payload.get("sessions"), list
-            ):
-                raise ContractError(f"{label} session query returned invalid data")
-            return dict(payload)
+            return _validate_session_payload(payload, label)
 
         def codex_threads() -> object:
             timeout = min(engine.DEFAULT_TIMEOUT, self._remaining(deadline))
-            if host.local:
-                command = ["codex", "app-server", "--stdio"]
-            else:
-                # Codex's JSON-RPC stream itself is the marked domain command;
-                # the marker is verified immediately after initialize before
-                # thread/list is allowed to consume its result.
-                return self._remote_codex_threads(host, config, deadline)
+            command = ["codex", "app-server", "--stdio"]
             with AppServerClient(
                 command,
                 timeout,
@@ -1544,6 +1835,37 @@ class ContractBackend:
                 )
             ]
             return tuple(future.result() for future in futures)  # type: ignore[return-value]
+
+    def _remote_provider_results(
+        self,
+        host: MeshHost,
+        config: Any,
+        deadline: float,
+    ) -> tuple[str | None, object, object, object, object]:
+        """Run the two independent remote discovery domains concurrently."""
+
+        def composite() -> tuple[str | None, object, object, object]:
+            try:
+                return self._remote_composite(host, config, deadline)
+            except StaleMeshError:
+                raise
+            except Exception as error:  # noqa: BLE001 - Codex may still succeed
+                return None, error, error, error
+
+        def codex() -> object:
+            try:
+                return self._remote_codex_threads(host, config, deadline)
+            except StaleMeshError:
+                raise
+            except Exception as error:  # noqa: BLE001 - a composite sibling may still succeed
+                return error
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rofi-agent-remote") as pool:
+            composite_future = pool.submit(composite)
+            codex_future = pool.submit(codex)
+            route, active, claude, opencode = composite_future.result()
+            codex_threads = codex_future.result()
+        return route, codex_threads, claude, opencode, active
 
     @staticmethod
     def _append_active_only_rows(
@@ -1620,23 +1942,25 @@ class ContractBackend:
         self._remaining(deadline)
         with self._report_error_lock:
             self._report_errors = []
+        self._reset_report_transaction()
         stages: dict[str, tuple[str | None, object, object, object, object]] = {}
 
         def host_stage(
             host: MeshHost,
         ) -> tuple[str, tuple[str | None, object, object, object, object]]:
-            route, active = self._active(host, deadline)
-            if isinstance(active, StaleMeshError):
-                raise active
-            if not host.local and route is None:
-                unavailable = (
-                    active
-                    if isinstance(active, Exception)
-                    else ContractError("host is unreachable")
+            if host.local:
+                route, active = self._active(host, deadline)
+                if isinstance(active, StaleMeshError):
+                    raise active
+                codex, claude, opencode = self._provider_results(host, config, deadline)
+            else:
+                # The marked composite and Codex app-server transports are
+                # independent authority domains.  Do not use activity as a
+                # reachability gate: either successful side remains useful.
+                route, codex, claude, opencode, active = self._remote_provider_results(
+                    host, config, deadline
                 )
-                return host.host_id, (route, unavailable, unavailable, unavailable, active)
-            codex, claude, opencode = self._provider_results(host, config, deadline)
-            for stage in (codex, claude, opencode):
+            for stage in (codex, claude, opencode, active):
                 if isinstance(stage, StaleMeshError):
                     raise stage
             return host.host_id, (route, codex, claude, opencode, active)

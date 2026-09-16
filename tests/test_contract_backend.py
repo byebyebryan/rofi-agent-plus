@@ -25,6 +25,8 @@ from rofi_agent_plus.contract_backend import (
     ContractBackend,
     ContractError,
     StaleMeshError,
+    _composite_probe_input,
+    _composite_results,
     _error_envelope_code,
     _inventory,
     _inventory_args,
@@ -550,27 +552,93 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
         self.assertIsInstance(active, ContractError)
         table.assert_not_called()
 
-    def test_each_remote_provider_stage_uses_marked_domain_transport(self) -> None:
+    def test_remote_provider_results_join_one_composite_with_codex(self) -> None:
         mesh = parse_mesh(fixture("mesh-v1.json"))
         backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=lambda *_a, **_k: None)
         backend.mesh = mesh
-        calls: list[dict[str, object]] = []
-
-        def marked(_host: object, _deadline: float, **kwargs: object):
-            calls.append(kwargs)
-            return "beta-first.test", output([], {"installed": False, "sessions": []})
-
-        backend._remote_command = marked  # type: ignore[method-assign]
+        active = {
+            "nativeHostname": "beta-native",
+            "active": {},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        backend._remote_composite = mock.Mock(  # type: ignore[method-assign]
+            return_value=(
+                "beta-first.test",
+                active,
+                {"installed": False, "sessions": []},
+                {"installed": False, "sessions": []},
+            )
+        )
         backend._remote_codex_threads = mock.Mock(return_value=[])  # type: ignore[method-assign]
-        codex, claude, opencode = backend._provider_results(
+        route, codex, claude, opencode, observed_active = backend._remote_provider_results(
             mesh.hosts[1], PickerConfig(), time.monotonic() + 2
         )
+        self.assertEqual("beta-first.test", route)
         self.assertEqual([], codex)
         self.assertFalse(claude["installed"])
         self.assertFalse(opencode["installed"])
-        self.assertEqual(2, len(calls))
-        self.assertTrue(all(call["remote_argv"][:2] == ("python3", "-") for call in calls))
+        self.assertEqual(active, observed_active)
+        backend._remote_composite.assert_called_once()
         backend._remote_codex_threads.assert_called_once()
+
+    def test_composite_probe_reaps_timed_out_child_and_preserves_siblings(self) -> None:
+        slow_active = "import time; time.sleep(10)"
+        with mock.patch("rofi_agent_plus.contract_backend._ACTIVE_PROBE", slow_active):
+            started = time.monotonic()
+            command = _run_bounded(
+                [sys.executable, "-", "0.05", "1"],
+                input_data=_composite_probe_input(),
+                timeout=2,
+                stdout_limit=512 * 1024,
+            )
+        self.assertLess(time.monotonic() - started, 1.0)
+        active, claude, opencode = _composite_results(command)
+        self.assertIsInstance(active, ContractError)
+        self.assertIsInstance(claude, dict)
+        self.assertIsInstance(opencode, dict)
+
+    def test_composite_probe_isolates_invalid_child_json(self) -> None:
+        with mock.patch("rofi_agent_plus.contract_backend._ACTIVE_PROBE", "print('not JSON')"):
+            command = _run_bounded(
+                [sys.executable, "-", "1", "1"],
+                input_data=_composite_probe_input(),
+                timeout=2,
+                stdout_limit=512 * 1024,
+            )
+        active, claude, opencode = _composite_results(command)
+        self.assertIsInstance(active, ContractError)
+        self.assertIn("invalid_json", str(active))
+        self.assertIsInstance(claude, dict)
+        self.assertIsInstance(opencode, dict)
+
+    def test_composite_stage_failures_are_isolated_and_bounded(self) -> None:
+        valid_active = {
+            "nativeHostname": "beta-native",
+            "active": {},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        payload = {
+            "schemaVersion": 1,
+            "stages": {
+                "active": {"ok": True, "payload": valid_active},
+                "claude": {
+                    "ok": False,
+                    "error": {"code": "invalid_json", "message": "invalid JSON"},
+                },
+                "opencode": {
+                    "ok": False,
+                    "error": {"code": "output_limit", "message": "stdout limit"},
+                },
+            },
+        }
+        active, claude, opencode = _composite_results(output([], payload))
+        self.assertEqual(valid_active, active)
+        self.assertIsInstance(claude, ContractError)
+        self.assertIn("invalid_json", str(claude))
+        self.assertIsInstance(opencode, ContractError)
+        self.assertIn("output_limit", str(opencode))
 
     def test_bounded_process_rejects_output_and_reaps_timeout(self) -> None:
         noisy = [sys.executable, "-c", "import sys;sys.stdout.write('x'*100000)"]
@@ -765,6 +833,55 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
             backend._report(host, route, "reachable", time.monotonic() + 2)
         self.assertNotIsInstance(caught.exception, StaleMeshError)
 
+    def test_route_hint_dedupes_only_success_and_preserves_stale(self) -> None:
+        mesh = parse_mesh(fixture("mesh-v1.json"))
+        backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=lambda *_a, **_k: None)
+        backend.mesh = mesh
+        host, route = mesh.hosts[1], mesh.hosts[1].routes[0]
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[object] = []
+
+        def successful(*_args: object) -> None:
+            calls.append(object())
+            started.set()
+            self.assertTrue(release.wait(1))
+
+        backend._report = successful  # type: ignore[method-assign]
+        errors: list[Exception] = []
+
+        def send_hint() -> None:
+            try:
+                backend._report_hint(host, route, "reachable", time.monotonic() + 2)
+            except Exception as error:  # noqa: BLE001 - test records all result paths
+                errors.append(error)
+
+        first = threading.Thread(target=send_hint)
+        second = threading.Thread(target=send_hint)
+        first.start()
+        self.assertTrue(started.wait(1))
+        second.start()
+        release.set()
+        first.join(1)
+        second.join(1)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(calls))
+
+        backend._reset_report_transaction()
+        backend._report = mock.Mock(side_effect=[ContractError("offline"), None])  # type: ignore[method-assign]
+        backend._report_hint(host, route, "reachable", time.monotonic() + 2)
+        backend._report_hint(host, route, "reachable", time.monotonic() + 2)
+        self.assertEqual(2, backend._report.call_count)  # type: ignore[attr-defined]
+        self.assertTrue(backend._report_errors)
+
+        backend._reset_report_transaction()
+        backend._report = mock.Mock(side_effect=StaleMeshError("changed"))  # type: ignore[method-assign]
+        with self.assertRaises(StaleMeshError):
+            backend._report_hint(host, route, "reachable", time.monotonic() + 2)
+        backend._report.assert_called_once()  # type: ignore[attr-defined]
+
     def test_remote_probe_keeps_root_codex_and_claude_fd_fallback_without_tmux(self) -> None:
         root_id = THREAD
         child_id = "22222222-2222-2222-2222-222222222222"
@@ -830,6 +947,122 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
 
 
 class ContractBackendAssemblyTest(unittest.TestCase):
+    def test_remote_refresh_uses_two_domains_and_one_reachable_hint(self) -> None:
+        mesh = parse_mesh(fixture("mesh-v1.json"))
+        inventory = copy.deepcopy(fixture("tmux-inventory-v1.json"))
+        inventory["hosts"] = [inventory["hosts"][1]]
+        composite_commands: list[list[str]] = []
+        codex_commands: list[list[str]] = []
+        reports: list[list[str]] = []
+        active = {
+            "nativeHostname": "beta-native",
+            "active": {},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        composite = {
+            "schemaVersion": 1,
+            "stages": {
+                "active": {"ok": True, "payload": active},
+                "claude": {"ok": True, "payload": {"installed": False, "sessions": []}},
+                "opencode": {"ok": True, "payload": {"installed": False, "sessions": []}},
+            },
+        }
+
+        def runner(argv: list[str], **_kwargs: object) -> CommandOutput:
+            if argv[0] == "rofi-tmux-plus":
+                return output(argv, inventory)
+            if argv[1:3] == ["mesh", "report-route"]:
+                reports.append(argv)
+                return output(argv, {"schemaVersion": 1, "ok": True, "accepted": True})
+            if argv[0] == "ssh":
+                composite_commands.append(argv)
+                nonce = argv[-1].split("rofi-plus-reached ")[1].split(" ", 1)[0].strip("'")
+                return output(argv, composite, stderr=f"\x1eROFI_PLUS_REACHED_V1:{nonce}\x1f\n")
+            raise AssertionError(argv)
+
+        class RemoteClient:
+            def __init__(self, command: list[str], *_args: object, **_kwargs: object) -> None:
+                codex_commands.append(command)
+                self.timeout = 0.0
+
+            def wait_for_marker(self, _timeout: float) -> tuple[bool, str]:
+                return True, ""
+
+            def marker_result(self) -> tuple[bool, str]:
+                return True, ""
+
+            def initialize(self) -> None:
+                return None
+
+            def call(self, method: str, _params: object) -> object:
+                return (
+                    {"data": [{"id": THREAD, "name": "remote", "cwd": "/work"}]}
+                    if method == "thread/list"
+                    else {}
+                )
+
+            def close(self) -> None:
+                return None
+
+        backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=runner)
+        backend.mesh = mesh
+        with mock.patch("rofi_agent_plus.contract_backend.AppServerClient", RemoteClient):
+            events = backend._once(PickerConfig(), host_ids=("beta",))
+
+        self.assertEqual(1, len(composite_commands))
+        self.assertEqual(1, len(codex_commands))
+        self.assertIn("python3 -", composite_commands[0][-1])
+        self.assertIn("codex app-server --stdio", codex_commands[0][-1])
+        self.assertEqual(1, len(reports))
+        self.assertIn("reachable", reports[0])
+        self.assertEqual(THREAD, events[1]["sessions"][0]["id"])
+
+    def test_remote_domains_keep_a_successful_sibling_and_active_only_rows(self) -> None:
+        mesh = parse_mesh(fixture("mesh-v1.json"))
+        inventory = copy.deepcopy(fixture("tmux-inventory-v1.json"))
+        inventory["hosts"] = [inventory["hosts"][1]]
+        backend = ContractBackend(
+            "rofi-ssh-plus",
+            "rofi-tmux-plus",
+            runner=lambda argv, **_kwargs: output(argv, inventory),
+        )
+        backend.mesh = mesh
+        active = {
+            "nativeHostname": "beta-native",
+            "active": {THREAD: {"candidates": [{"pid": 9, "ancestors": [9]}]}},
+            "claudeActive": {},
+            "opencodeActive": {},
+        }
+        composite_failure = ContractError("provider composite transaction failed")
+        backend._remote_provider_results = mock.Mock(  # type: ignore[method-assign]
+            return_value=(
+                "beta-first.test",
+                [{"id": THREAD, "name": "remote", "cwd": "/work"}],
+                composite_failure,
+                composite_failure,
+                active,
+            )
+        )
+        events = backend._once(PickerConfig(), host_ids=("beta",))
+        self.assertEqual(THREAD, events[1]["sessions"][0]["id"])
+        self.assertTrue(any(error["stage"] == "claude" for error in events[1]["errors"]))
+
+        backend._remote_provider_results = mock.Mock(  # type: ignore[method-assign]
+            return_value=(
+                "beta-first.test",
+                ContractError("Codex unavailable"),
+                {"installed": False, "sessions": []},
+                {"installed": False, "sessions": []},
+                active,
+            )
+        )
+        events = backend._once(PickerConfig(), host_ids=("beta",))
+        row = events[1]["sessions"][0]
+        self.assertEqual(THREAD, row["id"])
+        self.assertTrue(row["active"])
+        self.assertTrue(any(error["stage"] == "threads" for error in events[1]["errors"]))
+
     def test_tmux_inventory_exit_and_body_envelopes_must_match(self) -> None:
         mesh = parse_mesh(fixture("mesh-v1.json"))
         inventory_payload = fixture("tmux-inventory-v1.json")
