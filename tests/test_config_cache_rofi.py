@@ -744,6 +744,243 @@ class RofiProtocolTest(unittest.TestCase):
         decoded = json.loads(options["info"])
         self.assertEqual(THREAD_ID, decoded["id"])
 
+    def test_observation_status_is_display_only_and_keeps_current_rows_plain(self) -> None:
+        selected = session(
+            active=True,
+            activityState="active",
+            recencyAt=200,
+            sourceObservation="current",
+        )
+        snapshot = {
+            "sessions": [selected],
+            "hosts": {
+                "workstation": {
+                    "sessions": [selected],
+                    "errors": [],
+                    "observations": {
+                        stage: {
+                            "lastAttemptAt": 200,
+                            "lastSuccessAt": 200,
+                            "outcome": "ok",
+                        }
+                        for stage in ("codex", "claude", "opencode", "activity", "tmux")
+                    },
+                }
+            },
+            "lastRefresh": {
+                "attemptedAt": 200,
+                "completedAt": 200,
+                "outcome": "complete",
+            },
+            "errors": [],
+        }
+        output = render_snapshot(snapshot, now=200)
+        _, rows = parse_rendered_records(output)
+        visible, options = parse_row_options(rows[0])
+        self.assertNotIn("Checking", visible)
+        self.assertNotIn("Last known", visible)
+        self.assertNotIn("Checking", options["info"])
+        self.assertNotIn("sourceObservation", options["info"])
+        self.assertNotIn("urgent", options)
+        self.assertEqual("true", options["active"])
+        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  active", options["display"])
+
+    def test_observation_statuses_distinguish_retained_global_failure_and_activity_only(
+        self,
+    ) -> None:
+        def render(
+            row: dict[str, object],
+            *,
+            outcome: str = "complete",
+            activity_outcome: str = "ok",
+        ) -> tuple[str, dict[str, str]]:
+            snapshot = {
+                "sessions": [row],
+                "hosts": {
+                    "workstation": {
+                        "sessions": [row],
+                        "errors": [],
+                        "observations": {
+                            stage: {
+                                "lastAttemptAt": 200,
+                                "lastSuccessAt": 150,
+                                "outcome": (activity_outcome if stage == "activity" else "ok"),
+                            }
+                            for stage in ("codex", "claude", "opencode", "activity", "tmux")
+                        },
+                    }
+                },
+                "lastRefresh": {
+                    "attemptedAt": 200,
+                    "completedAt": None if outcome == "failed" else 200,
+                    "outcome": outcome,
+                },
+                "errors": [],
+            }
+            _, rows = parse_rendered_records(render_snapshot(snapshot, now=200))
+            return parse_row_options(rows[0])
+
+        visible, options = render(session(sourceObservation="retained", active=False))
+        self.assertNotIn("Last known", visible)
+        self.assertIn("◷ Last known · seen 50s", options["display"])
+        self.assertEqual("true", options["urgent"])
+
+        visible, options = render(
+            session(sourceObservation="current", active=True), outcome="failed"
+        )
+        self.assertIn("◷ Last known · seen 50s", options["display"])
+        self.assertEqual("true", options["urgent"])
+        self.assertNotIn("active", options)
+        self.assertNotIn("Last known", visible)
+
+        visible, options = render(session(sourceObservation="activity-only", active=False))
+        self.assertIn("Activity seen · details unavailable", options["display"])
+        self.assertEqual("true", options["urgent"])
+
+    def test_checking_and_rechecking_statuses_are_compact_and_truthful(self) -> None:
+        current = session(sourceObservation="current")
+        retained = session(
+            identifier="00000000-0000-0000-0000-000000000002",
+            name="retained",
+            sourceObservation="retained",
+        )
+        snapshot = {
+            "sessions": [current, retained],
+            "hosts": {
+                "workstation": {
+                    "sessions": [current, retained],
+                    "errors": [],
+                    "observations": {
+                        stage: {
+                            "lastAttemptAt": 200,
+                            "lastSuccessAt": 150,
+                            "outcome": "ok",
+                        }
+                        for stage in ("codex", "claude", "opencode", "activity", "tmux")
+                    },
+                }
+            },
+            "lastRefresh": {
+                "attemptedAt": 200,
+                "completedAt": 200,
+                "outcome": "complete",
+            },
+            "errors": [],
+        }
+        _, rows = parse_rendered_records(render_snapshot(snapshot, checking=True, now=200))
+        rendered = {
+            parse_row_options(row)[0].split("  ·  ")[0]: parse_row_options(row)[1] for row in rows
+        }
+        self.assertIn("◌ Checking", rendered["hello world"]["display"])
+        self.assertIn("◌ Rechecking · last seen 50s", rendered["retained"]["display"])
+
+        limited = session(sourceObservation="current", tmuxStale=True)
+        snapshot["sessions"] = [limited]
+        snapshot["hosts"]["workstation"]["sessions"] = [limited]
+        _, rows = parse_rendered_records(render_snapshot(snapshot, checking=True, now=200))
+        _, options = parse_row_options(rows[0])
+        self.assertIn("◌ Checking · Details limited", options["display"])
+        self.assertEqual("true", options["urgent"])
+
+        activity_only = session(
+            identifier="00000000-0000-0000-0000-000000000003",
+            name="activity-only",
+            sourceObservation="activity-only",
+        )
+        snapshot["sessions"] = [activity_only]
+        snapshot["hosts"]["workstation"]["sessions"] = [activity_only]
+        _, rows = parse_rendered_records(render_snapshot(snapshot, checking=True, now=200))
+        _, options = parse_row_options(rows[0])
+        self.assertIn(
+            "◌ Checking · Activity seen · details unavailable",
+            options["display"],
+        )
+        self.assertEqual("true", options["urgent"])
+
+    def test_activity_failure_suppresses_active_but_missing_metadata_preserves_it(self) -> None:
+        selected = session(active=True, activityState="active")
+        snapshot = {
+            "sessions": [selected],
+            "hosts": {
+                "workstation": {
+                    "sessions": [selected],
+                    "observations": {
+                        "activity": {
+                            "lastAttemptAt": 200,
+                            "lastSuccessAt": 150,
+                            "outcome": "failed",
+                        }
+                    },
+                }
+            },
+            "lastRefresh": {
+                "attemptedAt": 200,
+                "completedAt": 200,
+                "outcome": "partial",
+            },
+            "errors": [],
+        }
+        _, rows = parse_rendered_records(render_snapshot(snapshot, now=200))
+        _, options = parse_row_options(rows[0])
+        self.assertNotIn("active", options)
+        self.assertEqual("true", options["urgent"])
+        self.assertIn("Details limited", options["display"])
+
+        output = render_snapshot({"sessions": [selected]}, now=200)
+        _, rows = parse_rendered_records(output)
+        _, options = parse_row_options(rows[0])
+        self.assertEqual("true", options["active"])
+        self.assertNotIn("urgent", options)
+
+    def test_tmux_missing_and_route_health_do_not_make_rows_limited(self) -> None:
+        selected = session(active=False, tmuxMissing=True)
+        snapshot = {
+            "sessions": [selected],
+            "hosts": {
+                "workstation": {
+                    "sessions": [selected],
+                    "errors": [
+                        {"host": "workstation", "stage": "tmux-missing", "message": "none"},
+                        {"host": "workstation", "stage": "route-health", "message": "hint"},
+                    ],
+                    "observations": {},
+                }
+            },
+            "lastRefresh": {
+                "attemptedAt": 200,
+                "completedAt": 200,
+                "outcome": "complete",
+            },
+            "errors": [],
+        }
+        _, rows = parse_rendered_records(render_snapshot(snapshot, now=200))
+        _, options = parse_row_options(rows[0])
+        self.assertNotIn("Details limited", options["display"])
+        self.assertNotIn("urgent", options)
+
+    def test_empty_success_is_not_urgent_but_unavailable_and_error_are(self) -> None:
+        healthy = {
+            "sessions": [],
+            "lastRefresh": {"attemptedAt": 200, "completedAt": 200, "outcome": "complete"},
+            "errors": [],
+        }
+        _, rows = parse_rendered_records(render_snapshot(healthy, now=200))
+        _, options = parse_row_options(rows[0])
+        self.assertEqual({"nonselectable": "true"}, options)
+
+        failed = {
+            "sessions": [],
+            "lastRefresh": {"attemptedAt": 200, "completedAt": None, "outcome": "failed"},
+            "errors": [],
+        }
+        _, rows = parse_rendered_records(render_snapshot(failed, now=200))
+        _, options = parse_row_options(rows[0])
+        self.assertEqual("true", options["urgent"])
+
+        _, rows = parse_rendered_records(render_snapshot(None, now=200))
+        _, options = parse_row_options(rows[0])
+        self.assertEqual({"nonselectable": "true", "urgent": "true"}, options)
+
     def test_display_escapes_markup_and_hides_provider_while_filtering_keeps_it(self) -> None:
         selected = session(
             kind="claude",

@@ -545,7 +545,107 @@ def _row_text(session: Mapping[str, Any], now: float | None = None) -> str:
     return f"{name}  ·  {provider}  ·  {host}  ·  {cwd}  ·  {age}  ·  {activity}"
 
 
-def _row_display(session: Mapping[str, Any], now: float | None = None) -> str:
+def _refresh_outcome(snapshot: Mapping[str, Any] | None) -> str | None:
+    """Return a recognized all-host refresh outcome, if one is present."""
+
+    last_refresh = snapshot.get("lastRefresh") if isinstance(snapshot, Mapping) else None
+    outcome = last_refresh.get("outcome") if isinstance(last_refresh, Mapping) else None
+    return outcome if outcome in {"complete", "partial", "failed"} else None
+
+
+def _stage_observation(
+    snapshot: Mapping[str, Any] | None,
+    session: Mapping[str, Any],
+    stage: str,
+) -> Mapping[str, Any] | None:
+    """Return one host/stage observation without trusting malformed metadata."""
+
+    host = _host_record(snapshot, _session_host(session))
+    observations = host.get("observations") if isinstance(host, Mapping) else None
+    value = observations.get(stage) if isinstance(observations, Mapping) else None
+    return value if isinstance(value, Mapping) else None
+
+
+def _observation_failed(value: Mapping[str, Any] | None) -> bool:
+    return isinstance(value, Mapping) and value.get("outcome") == "failed"
+
+
+def _observation_age(value: Mapping[str, Any] | None, now: float | None) -> str:
+    """Format the last successful observation time, preserving unknown history."""
+
+    if not isinstance(value, Mapping):
+        return "unknown"
+    return _age(value.get("lastSuccessAt"), now)
+
+
+def _row_observation(
+    session: Mapping[str, Any],
+    snapshot: Mapping[str, Any] | None,
+    now: float | None,
+    *,
+    refresh_active: bool = False,
+) -> tuple[str, bool, bool]:
+    """Return ``(status, urgent, active)`` for one presentation row.
+
+    Observation metadata is private cache provenance, not selection or
+    lifecycle authority.  Missing metadata deliberately preserves the legacy
+    ordinary-row presentation.
+    """
+
+    source = session.get("sourceObservation")
+    refresh_outcome = _refresh_outcome(snapshot)
+    provider = str(session.get("kind") or "")
+    provider_observation = _stage_observation(snapshot, session, provider)
+    activity_observation = _stage_observation(snapshot, session, "activity")
+    global_failed = refresh_outcome == "failed"
+    retained = source == "retained" or global_failed
+    activity_only = source == "activity-only"
+    limited = (
+        not retained
+        and not activity_only
+        and (
+            _observation_failed(activity_observation)
+            or session.get("tmuxStale") is True
+            or session.get("tmuxAmbiguous") is True
+        )
+    )
+
+    if retained:
+        age = _observation_age(provider_observation, now)
+        status = (
+            f"◌ Rechecking · last seen {age}" if refresh_active else f"◷ Last known · seen {age}"
+        )
+    elif activity_only:
+        status = "Activity seen · details unavailable"
+        if refresh_active:
+            status = "◌ Checking · " + status
+    elif limited:
+        status = "Details limited"
+        if refresh_active:
+            status = "◌ Checking · " + status
+    elif refresh_active:
+        status = "◌ Checking"
+    else:
+        status = ""
+
+    # A current activity probe is the only basis for the active Rofi state.
+    # A failed activity stage or failed all-host transaction cannot safely
+    # carry an old active marker into a new observation cycle.  Legacy rows
+    # without observation metadata retain their prior behavior.
+    active = bool(session.get("active")) and not (
+        _observation_failed(activity_observation) or global_failed
+    )
+    urgent = retained or activity_only or limited
+    return status, urgent, active
+
+
+def _row_display(
+    session: Mapping[str, Any],
+    now: float | None = None,
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+    refresh_active: bool = False,
+) -> str:
     """Return the two-line Pango presentation for one session row."""
 
     name = sanitize(session.get("name") or session.get("id") or "Agent")
@@ -555,7 +655,16 @@ def _row_display(session: Mapping[str, Any], now: float | None = None) -> str:
     activity = sanitize(
         session.get("activityState") or ("active" if session.get("active") else "idle")
     )
-    secondary = "  ·  ".join((host, cwd, age, activity))
+    secondary_parts = [host, cwd, age, activity]
+    status, _, _ = _row_observation(
+        session,
+        snapshot,
+        now,
+        refresh_active=refresh_active,
+    )
+    if status:
+        secondary_parts.append(status)
+    secondary = "  ·  ".join(secondary_parts)
     return (
         f"<b>{_pango_escape(name)}</b>"
         f'{ROW_SEPARATOR}<span size="smaller" alpha="75%">'
@@ -752,6 +861,7 @@ def render_snapshot(
     timeout: bool | None = None,
     refresh_deadline: float | None = None,
     error_deadline: float | None = None,
+    checking: bool = False,
     clear_message: bool = False,
     navigation: NavigationState | None = None,
     keep_filter: bool | None = None,
@@ -844,10 +954,26 @@ def render_snapshot(
             ("info", info),
             ("meta", search_metadata),
             ("icon", _provider_icon(kind)),
-            ("display", _row_display(session, now)),
+            (
+                "display",
+                _row_display(
+                    session,
+                    now,
+                    snapshot=snapshot,
+                    refresh_active=checking,
+                ),
+            ),
         ]
-        if session.get("active"):
+        _, row_urgent, row_active = _row_observation(
+            session,
+            snapshot,
+            now,
+            refresh_active=checking,
+        )
+        if row_active:
             options.append(("active", "true"))
+        if row_urgent:
+            options.append(("urgent", "true"))
         rendered_rows.append(_row_text(session, now) + _row_options(options))
         emitted += 1
 
@@ -861,7 +987,16 @@ def render_snapshot(
             status = "No agent sessions found"
         if effective_message:
             status = "No sessions · " + effective_message
-        rendered_rows.append(status + _row_options([("nonselectable", "true"), ("urgent", "true")]))
+        empty_options: list[tuple[str, object]] = [("nonselectable", "true")]
+        refresh_outcome = _refresh_outcome(snapshot)
+        empty_urgent = (
+            snapshot is None
+            or refresh_outcome in {"failed", "partial"}
+            or (not checking and bool(effective_message))
+        )
+        if empty_urgent:
+            empty_options.append(("urgent", "true"))
+        rendered_rows.append(status + _row_options(empty_options))
 
     if continuation:
         return ROFI_RECORD_SEPARATOR.join((*headers, *rendered_rows)) + ROFI_RECORD_SEPARATOR
