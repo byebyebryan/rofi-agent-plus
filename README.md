@@ -47,8 +47,9 @@ The picker opens in `Agents › All`, a mixed newest-first list.  Left and Right
 cycle `All`, `Local`, and the remote hosts in stable Host Mesh order.  Enter
 opens the selected session.  Escape and `Ctrl+G` use Rofi's native cancel
 path and always close; `Tab` and `Shift+Tab` use Rofi's normal row navigation.
-View changes preserve the filter and reset the selection.  `Alt+R` performs a
-bounded foreground refresh. Custom input and deletion remain disabled. Rofi
+View changes preserve the filter and reset the selection.  `Alt+R` starts a
+background refresh while retaining the current rows, filter, and selection.
+Custom input and deletion remain disabled. Rofi
 must be launched with `-eh 2` so each list element reserves height for both
 display lines.
 
@@ -127,7 +128,8 @@ the status then clears and polling stops.  A failed or stalled worker also
 stops polling and clears the transient status while leaving the cached rows
 usable.  Current refresh/provider errors are shown for about three seconds and
 then cleared automatically; the rows remain available throughout.  The new
-result is also visible the next time the picker opens or after `Alt+R`.
+result is also visible the next time the picker opens or after the background
+refresh started by `Alt+R` completes.
 Per-host snapshots and rows from failed provider stages are retained while a
 host is unavailable, and current errors are summarized in the message area.
 The detached-refresh marker is scoped to the cache fingerprint and backend

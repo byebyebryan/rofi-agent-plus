@@ -887,7 +887,34 @@ class RofiProtocolTest(unittest.TestCase):
             rendered,
         )
 
-    def test_forced_refresh_retains_host_navigation_state(self) -> None:
+    def test_poll_callback_reuses_prepared_presentation_context(self) -> None:
+        store = mock.Mock(spec=CacheStore)
+        context = PresentationContext(
+            self._config().fingerprint,
+            {
+                "kind": "contract",
+                "capability": "host-mesh-v1+tmux-session-v1",
+                "meshRevision": "sha256:mesh",
+            },
+        )
+        snapshot = {"sessions": [], "hostCatalog": [], "hosts": {}, "errors": []}
+        store.presentation_context.return_value = context
+        store.load_current.return_value = snapshot
+        store.is_fresh.return_value = True
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                    "ROFI_DATA": _navigation_data(NavigationState()),
+                },
+                store=store,
+                config=self._config(),
+            )
+        store.presentation_context.assert_called_once_with(self._config())
+        store.load_current.assert_called_once_with(self._config(), context)
+
+    def test_alt_r_starts_async_refresh_and_retains_current_rows(self) -> None:
         nested = NavigationState("host", "alpha")
         selected = session("claude", THREAD_ID, host="alpha", hostId="alpha")
         snapshot = {
@@ -900,8 +927,19 @@ class RofiProtocolTest(unittest.TestCase):
             "errors": [],
         }
         store = mock.Mock(spec=CacheStore)
-        store.refresh.return_value = snapshot
-        store.is_fresh.return_value = True
+        context = PresentationContext(
+            self._config().fingerprint,
+            {
+                "kind": "contract",
+                "capability": "host-mesh-v1+tmux-session-v1",
+                "meshRevision": "sha256:mesh",
+            },
+        )
+        scope = {"fingerprint": self._config().fingerprint, "backend": context.backend}
+        store.presentation_context.return_value = context
+        store.load_current.return_value = snapshot
+        store.cache_scope.return_value = scope
+        store.spawn_background.return_value = True
         output = io.StringIO()
         with mock.patch("sys.stdout", output):
             run_rofi(
@@ -913,9 +951,38 @@ class RofiProtocolTest(unittest.TestCase):
                 config=self._config(),
             )
         rendered = output.getvalue()
+        store.spawn_background.assert_called_once()
+        self.assertEqual(scope, store.spawn_background.call_args.kwargs["scope"])
+        store.refresh.assert_not_called()
         self.assertIn("Agents › Alpha", rendered)
         self.assertIn("navigation:", rendered)
         self.assertIn("claude", rendered)
+        self.assertIn("Refreshing in background", rendered)
+        self.assertIn("background-refresh:", rendered)
+        self.assertIn("\x00keep-filter\x1ftrue", rendered)
+        self.assertIn("\x00keep-selection\x1ftrue", rendered)
+
+    def test_alt_r_reports_worker_start_failure_without_refreshing(self) -> None:
+        snapshot = {"sessions": [session()], "errors": []}
+        store = mock.Mock(spec=CacheStore)
+        store.load.return_value = snapshot
+        store.spawn_background.return_value = False
+        store.background_active.return_value = False
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_1),
+                    "ROFI_DATA": _navigation_data(NavigationState()),
+                },
+                store=store,
+                config=self._config(),
+            )
+        rendered = output.getvalue()
+        store.spawn_background.assert_called_once()
+        store.refresh.assert_not_called()
+        self.assertIn("Unable to start background refresh", rendered)
+        self.assertIn("hello", rendered)
 
     def test_left_right_cycle_host_scope_ring_and_wrap_in_both_directions(self) -> None:
         store = mock.Mock(spec=CacheStore)
@@ -1275,11 +1342,13 @@ class RofiProtocolTest(unittest.TestCase):
         full_open.assert_not_called()
         self.assertIn("Unable to open session", output.getvalue())
 
-    def test_initial_mode_refreshes_cache_and_alt_r_forces_refresh(self) -> None:
+    def test_initial_mode_refreshes_cache_and_alt_r_starts_background_refresh(self) -> None:
         store = mock.Mock(spec=CacheStore)
-        store.load.return_value = None
-        store.refresh.return_value = {"sessions": [session()], "errors": []}
+        snapshot = {"sessions": [session()], "errors": []}
+        store.load.side_effect = [None, snapshot]
+        store.refresh.return_value = snapshot
         store.is_fresh.return_value = True
+        store.spawn_background.return_value = True
         output = io.StringIO()
         with mock.patch("sys.stdout", output):
             result = run_rofi({"ROFI_RETV": "0"}, store=store, config=self._config())
@@ -1296,10 +1365,12 @@ class RofiProtocolTest(unittest.TestCase):
         with mock.patch("sys.stdout", output):
             result = run_rofi({"ROFI_RETV": "10"}, store=store, config=self._config())
         self.assertEqual(0, result)
-        self.assertEqual(2, store.refresh.call_count)
+        self.assertEqual(1, store.refresh.call_count)
+        store.spawn_background.assert_called_once()
         callback_output = output.getvalue()
         self.assertIn("\x00keep-selection\x1ftrue", callback_output)
         self.assertIn("\x00keep-filter\x1ftrue", callback_output)
+        self.assertIn("Refreshing in background", callback_output)
         callback_headers, callback_rows = parse_rendered_records(callback_output)
         self.assertNotIn(f"\x00delim\x1f{ROFI_DELIMITER_VALUE}", callback_headers)
         self.assertTrue(callback_output.endswith(ROFI_RECORD_SEPARATOR))
@@ -1307,12 +1378,14 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn(ROW_SEPARATOR, parse_row_options(callback_rows[0])[1]["display"])
 
         failing_store = mock.Mock(spec=CacheStore)
-        failing_store.refresh.side_effect = engine.PickerError("offline")
         failing_store.load.return_value = {"sessions": [session()], "errors": []}
+        failing_store.spawn_background.return_value = False
+        failing_store.background_active.return_value = False
         output = io.StringIO()
         with mock.patch("sys.stdout", output):
             run_rofi({"ROFI_RETV": "10"}, store=failing_store, config=self._config())
-        self.assertIn("Refresh failed", output.getvalue())
+        self.assertIn("Unable to start background refresh", output.getvalue())
+        failing_store.refresh.assert_not_called()
         self.assertIn("\x00keep-selection\x1ftrue", output.getvalue())
         self.assertIn("\x00keep-filter\x1ftrue", output.getvalue())
 
@@ -1547,14 +1620,15 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn(f"\x00data\x1f{ERROR_NOTICE_DATA_PREFIX}", rendered)
         self.assertNotIn(f"\x00data\x1f{AUTO_REFRESH_DATA_PREFIX}", rendered)
 
-    def test_alt_r_error_uses_the_same_bounded_notice_contract(self) -> None:
+    def test_alt_r_worker_start_failure_uses_the_same_bounded_notice_contract(self) -> None:
         snapshot = {
             "sessions": [session()],
             "errors": [{"host": "local", "stage": "threads", "message": "offline"}],
         }
         store = mock.Mock(spec=CacheStore)
-        store.refresh.return_value = snapshot
-        store.is_fresh.return_value = True
+        store.load.return_value = snapshot
+        store.spawn_background.return_value = False
+        store.background_active.return_value = False
         output = io.StringIO()
         with mock.patch("sys.stdout", output):
             result = run_rofi(
@@ -1564,9 +1638,10 @@ class RofiProtocolTest(unittest.TestCase):
             )
         self.assertEqual(0, result)
         rendered = output.getvalue()
-        self.assertIn("Refresh errors: local/threads: offline", rendered)
+        self.assertIn("Unable to start background refresh", rendered)
         self.assertIn(f"\x00data\x1f{ERROR_NOTICE_DATA_PREFIX}", rendered)
         self.assertIn("\x00keep-selection\x1ftrue", rendered)
+        store.refresh.assert_not_called()
 
     def test_background_callback_rereads_after_marker_stop_and_prefers_fresh_cache(self) -> None:
         stale = {"sessions": [session(name="stale")], "errors": []}

@@ -6,7 +6,6 @@ import json
 import math
 import os
 import re
-import signal
 import sys
 import time
 import unicodedata
@@ -32,7 +31,6 @@ ROFI_RETV_CUSTOM_3 = 12
 ROFI_RETV_CUSTOM_6 = 15
 ROFI_RETV_CUSTOM_19 = 28
 MAX_MESSAGE_LENGTH = 360
-FORCED_REFRESH_TIMEOUT_SECONDS = 30
 AUTO_REFRESH_POLL_SECONDS = 1
 AUTO_REFRESH_MAX_SECONDS = 30
 AUTO_REFRESH_DATA_PREFIX = "background-refresh:"
@@ -1144,10 +1142,10 @@ def _auto_refresh_callback(
     environ: Mapping[str, str],
     store: CacheStore,
     config: PickerConfig,
+    context: PresentationContext | None,
 ) -> str:
     """Inspect cache state for the timeout callback without doing discovery."""
 
-    context = _presentation_context(store, config)
     snapshot = _presentation_snapshot(store, config, context)
     if context is not None and context.error and snapshot is None:
         return _render_error_notice(
@@ -1295,36 +1293,6 @@ def _auto_refresh_callback(
         continuation=True,
         navigation=navigation,
     )
-
-
-def _forced_refresh(
-    store: CacheStore,
-    config: PickerConfig,
-    context: PresentationContext | None = None,
-) -> dict[str, Any]:
-    """Refresh with a hard foreground bound for the Alt+R callback."""
-
-    if not hasattr(signal, "SIGALRM"):
-        return (
-            store.refresh(config, force=True, context=context)
-            if context
-            else store.refresh(config, force=True)
-        )
-
-    def timeout_handler(_signum: int, _frame: object) -> None:
-        raise engine.PickerError("refresh timed out")
-
-    previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.setitimer(signal.ITIMER_REAL, FORCED_REFRESH_TIMEOUT_SECONDS)
-    try:
-        return (
-            store.refresh(config, force=True, context=context)
-            if context
-            else store.refresh(config, force=True)
-        )
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def run_rofi(
@@ -1574,7 +1542,7 @@ def run_rofi(
 
     if retv == ROFI_RETV_CUSTOM_19:
         try:
-            rendered = _auto_refresh_callback(environ, store, config)
+            rendered = _auto_refresh_callback(environ, store, config, context)
         except Exception as exc:  # noqa: BLE001 - timeout callback boundary
             rendered = _render_error_notice(
                 None,
@@ -1589,44 +1557,22 @@ def run_rofi(
 
     if retv == ROFI_RETV_CUSTOM_1:
         try:
-            snapshot = _forced_refresh(store, config, context)
-            fresh = store.is_fresh(snapshot, config.refresh_seconds)
-            polling = False
-            deadline = None
-            if not fresh and _background_active(store, _refresh_scope(store, config, context)):
-                polling = True
-                deadline = _parse_refresh_deadline(environ.get("ROFI_DATA"))
-                if deadline is None:
-                    deadline = time.time() + AUTO_REFRESH_MAX_SECONDS
-            message = _message_for_cache(store, snapshot, config, fresh=fresh)
-            if fresh and message:
+            # Keep the current authoritative rows in place and hand the
+            # potentially slow discovery to the existing detached worker.
+            # This applies even when the cache is fresh: Alt+R is an explicit
+            # refresh request, not permission to block Rofi on network I/O.
+            snapshot = _presentation_snapshot(store, config, context)
+            polling, deadline = _start_background_refresh(
+                store,
+                _refresh_scope(store, config, context),
+            )
+            if not polling:
                 print(
                     _render_error_notice(
                         snapshot,
-                        message,
+                        "Unable to start background refresh",
                         preserve=True,
                         continuation=True,
-                        refresh_deadline=continuation_state.active().refresh_deadline,
-                        navigation=navigation,
-                    ),
-                    end="",
-                )
-                return 0
-            if not fresh and not polling:
-                message = summarize_errors(snapshot.get("errors", []))
-            elif not fresh:
-                # Errors in this snapshot belong to the previous refresh;
-                # current provider errors are reported when the new snapshot
-                # completes and receive their own bounded notice.
-                message = "Refreshing in background"
-            if not fresh and not polling and message:
-                print(
-                    _render_error_notice(
-                        snapshot,
-                        message,
-                        preserve=True,
-                        continuation=True,
-                        refresh_deadline=continuation_state.active().refresh_deadline,
                         navigation=navigation,
                     ),
                     end="",
@@ -1635,9 +1581,9 @@ def run_rofi(
             print(
                 render_snapshot(
                     snapshot,
-                    message=message,
+                    message="Refreshing in background",
                     preserve=True,
-                    timeout=polling,
+                    timeout=True,
                     refresh_deadline=deadline,
                     clear_message=True,
                     continuation=True,
