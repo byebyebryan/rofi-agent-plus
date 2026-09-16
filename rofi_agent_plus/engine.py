@@ -18,7 +18,7 @@ from typing import Any
 
 DEFAULT_LIMIT = 40
 DEFAULT_TIMEOUT = 4.0
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 UUID_PATTERN = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
