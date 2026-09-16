@@ -40,6 +40,8 @@ FAST_OPEN_FALLBACK_CODES = frozenset(
     {"stale_session", "session_not_found", "stale_mesh", "invalid_input"}
 )
 ERROR_NOTICE_DATA_PREFIX = "error-notice:"
+CHECK_NOTICE_SECONDS = 2
+CHECK_NOTICE_DATA_PREFIX = "check-notice:"
 NAVIGATION_DATA_PREFIX = "navigation:"
 NAVIGATION_DATA_VERSION = 2
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
@@ -140,10 +142,15 @@ class ContinuationState:
     refresh_deadline: float | None = None
     error_deadline: float | None = None
     error_message: str = ""
+    check_deadline: float | None = None
 
     @property
     def has_lifecycle(self) -> bool:
-        return self.refresh_deadline is not None or self.error_deadline is not None
+        return (
+            self.refresh_deadline is not None
+            or self.error_deadline is not None
+            or self.check_deadline is not None
+        )
 
     def active(self, now: float | None = None) -> ContinuationState:
         """Return only unexpired refresh/notice components."""
@@ -164,6 +171,7 @@ class ContinuationState:
             refresh_deadline=live(self.refresh_deadline),
             error_deadline=error_deadline,
             error_message=self.error_message if error_deadline is not None else "",
+            check_deadline=live(self.check_deadline),
         )
 
 
@@ -719,9 +727,10 @@ def _refresh_data(
     error_message: str = "",
     *,
     deadline: float | None = None,
+    check_deadline: float | None = None,
     navigation: NavigationState | None = None,
 ) -> str:
-    """Encode refresh, notice, and optional navigation state for Rofi."""
+    """Encode refresh, notices, and optional navigation state for Rofi."""
 
     if refresh_deadline is None:
         refresh_deadline = deadline
@@ -734,6 +743,8 @@ def _refresh_data(
             f"{ERROR_NOTICE_DATA_PREFIX}{max(0, int(error_deadline))}"
             f"{':' + encoded_message if encoded_message else ''}"
         )
+    if check_deadline is not None:
+        values.append(f"{CHECK_NOTICE_DATA_PREFIX}{max(0, int(check_deadline))}")
     if navigation is not None and not navigation.is_default:
         values.append(_navigation_data(navigation))
     if not values:
@@ -783,16 +794,22 @@ def _parse_error_notice(value: object) -> tuple[float | None, str]:
     return None, ""
 
 
+def _parse_check_notice(value: object) -> float | None:
+    return _parse_deadline(value, CHECK_NOTICE_DATA_PREFIX)
+
+
 def _parse_continuation_state(value: object) -> ContinuationState:
     """Parse current and older Rofi continuation components together."""
 
     refresh_deadline = _parse_refresh_deadline(value)
     error_deadline, error_message = _parse_error_notice(value)
+    check_deadline = _parse_check_notice(value)
     return ContinuationState(
         navigation=_parse_navigation_state(value),
         refresh_deadline=refresh_deadline,
         error_deadline=error_deadline,
         error_message=error_message,
+        check_deadline=check_deadline,
     )
 
 
@@ -824,7 +841,9 @@ def _render_continuation(
     if active.error_deadline is not None:
         message = active.error_message
     elif active.refresh_deadline is not None:
-        message = "Refreshing in background"
+        message = "Checking sessions…"
+    elif active.check_deadline is not None:
+        message = "Checked just now"
     else:
         message = ""
     if active.has_lifecycle:
@@ -844,6 +863,8 @@ def _render_continuation(
         timeout=timeout,
         refresh_deadline=active.refresh_deadline,
         error_deadline=active.error_deadline,
+        check_deadline=active.check_deadline,
+        checking=active.refresh_deadline is not None,
         clear_message=clear_message,
         continuation=continuation,
         navigation=target,
@@ -862,6 +883,7 @@ def render_snapshot(
     refresh_deadline: float | None = None,
     error_deadline: float | None = None,
     checking: bool = False,
+    check_deadline: float | None = None,
     clear_message: bool = False,
     navigation: NavigationState | None = None,
     keep_filter: bool | None = None,
@@ -896,12 +918,14 @@ def render_snapshot(
         headers.append(_protocol("message", effective_message))
     if timeout is not None:
         if timeout:
-            if refresh_deadline is None and error_deadline is None:
+            if refresh_deadline is None and error_deadline is None and check_deadline is None:
                 refresh_deadline = time.time() + AUTO_REFRESH_MAX_SECONDS
             if refresh_deadline is not None:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
             elif error_deadline is not None:
                 timeout_delay = max(1, math.ceil(error_deadline - time.time()))
+            elif check_deadline is not None:
+                timeout_delay = max(1, math.ceil(check_deadline - time.time()))
             else:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
         else:
@@ -914,6 +938,7 @@ def render_snapshot(
                     refresh_deadline if timeout else None,
                     error_deadline if timeout else None,
                     effective_message if timeout and error_deadline is not None else "",
+                    check_deadline=check_deadline if timeout else None,
                     navigation=navigation,
                 ),
             )
@@ -1216,7 +1241,7 @@ def _message_for_cache(
     if fresh is None:
         fresh = store.is_fresh(snapshot, config.refresh_seconds)
     if not fresh:
-        prefix = "Refreshing in background"
+        prefix = "Checking sessions…"
         return prefix + (" · " + errors if errors else "")
     return errors
 
@@ -1229,6 +1254,7 @@ def _render_error_notice(
     continuation: bool = False,
     refresh_deadline: float | None = None,
     error_deadline: float | None = None,
+    check_deadline: float | None = None,
     navigation: NavigationState | None = None,
     keep_filter: bool | None = None,
     keep_selection: bool | None = None,
@@ -1242,6 +1268,8 @@ def _render_error_notice(
         timeout=True,
         refresh_deadline=refresh_deadline,
         error_deadline=error_deadline or time.time() + ERROR_NOTICE_SECONDS,
+        check_deadline=check_deadline,
+        checking=refresh_deadline is not None,
         clear_message=True,
         continuation=continuation,
         navigation=navigation,
@@ -1281,6 +1309,11 @@ def _auto_refresh_callback(
 ) -> str:
     """Inspect cache state for the timeout callback without doing discovery."""
 
+    rofi_data = environ.get("ROFI_DATA")
+    continuation_state = _parse_continuation_state(rofi_data)
+    navigation = continuation_state.navigation
+    now = time.time()
+    active_state = continuation_state.active(now)
     snapshot = _presentation_snapshot(store, config, context)
     if context is not None and context.error and snapshot is None:
         return _render_error_notice(
@@ -1288,46 +1321,54 @@ def _auto_refresh_callback(
             f"Contract refresh failed: {sanitize(context.error)}",
             preserve=True,
             continuation=True,
-            navigation=_parse_continuation_state(environ.get("ROFI_DATA")).navigation,
+            refresh_deadline=active_state.refresh_deadline,
+            check_deadline=active_state.check_deadline,
+            navigation=navigation,
         )
     fresh = snapshot is not None and store.is_fresh(snapshot, config.refresh_seconds)
-    rofi_data = environ.get("ROFI_DATA")
-    continuation_state = _parse_continuation_state(rofi_data)
-    navigation = continuation_state.navigation
-    error_deadline = continuation_state.error_deadline
-    error_message = continuation_state.error_message
-    now = time.time()
-    if fresh:
-        errors = summarize_errors(snapshot.get("errors", []))
+
+    error_deadline = active_state.error_deadline
+    error_message = active_state.error_message
+
+    def render_fresh(candidate: Mapping[str, Any]) -> str:
+        """Render a completed cache, including its bounded check notice."""
+
+        errors = summarize_errors(candidate.get("errors", []))
         if errors:
             # A completed background refresh can introduce errors after the
             # original one-second polling deadline was encoded.  Start a new
             # bounded notice for those current errors, then keep that same
-            # deadline across subsequent callbacks.
-            if error_deadline is not None and now >= error_deadline and error_message == errors:
+            # deadline across subsequent callbacks.  A check notice is never
+            # carried alongside a completed snapshot with current errors.
+            if (
+                continuation_state.error_deadline is not None
+                and error_deadline is None
+                and continuation_state.error_message == errors
+            ):
                 return render_snapshot(
-                    snapshot,
+                    candidate,
                     preserve=True,
                     timeout=False,
                     clear_message=True,
                     continuation=True,
                     navigation=navigation,
                 )
-            if error_deadline is None or error_message != errors:
-                error_deadline = now + ERROR_NOTICE_SECONDS
-            if now < error_deadline:
+            notice_deadline = error_deadline
+            if notice_deadline is None or error_message != errors:
+                notice_deadline = now + ERROR_NOTICE_SECONDS
+            if now < notice_deadline:
                 return render_snapshot(
-                    snapshot,
+                    candidate,
                     message=errors,
                     preserve=True,
                     timeout=True,
-                    error_deadline=error_deadline,
+                    error_deadline=notice_deadline,
                     clear_message=True,
                     continuation=True,
                     navigation=navigation,
                 )
             return render_snapshot(
-                snapshot,
+                candidate,
                 preserve=True,
                 timeout=False,
                 clear_message=True,
@@ -1338,9 +1379,9 @@ def _auto_refresh_callback(
         # Foreground operation failures carry their message in continuation
         # data.  Keep that notice visible until its own deadline even when
         # the cache itself has no refresh errors.
-        if error_deadline is not None and now < error_deadline and error_message:
+        if error_deadline is not None and error_message:
             return render_snapshot(
-                snapshot,
+                candidate,
                 message=error_message,
                 preserve=True,
                 timeout=True,
@@ -1349,14 +1390,56 @@ def _auto_refresh_callback(
                 continuation=True,
                 navigation=navigation,
             )
+
+        # An active completion notice is independent from the worker refresh
+        # deadline.  When it expires, explicitly clear Rofi's old timeout,
+        # data, and message in one callback.
+        if continuation_state.check_deadline is not None:
+            if active_state.check_deadline is not None:
+                return render_snapshot(
+                    candidate,
+                    message="Checked just now",
+                    preserve=True,
+                    timeout=True,
+                    check_deadline=active_state.check_deadline,
+                    clear_message=True,
+                    continuation=True,
+                    navigation=navigation,
+                )
+            return render_snapshot(
+                candidate,
+                preserve=True,
+                timeout=False,
+                clear_message=True,
+                continuation=True,
+                navigation=navigation,
+            )
+
+        # A refresh deadline in ROFI_DATA is the witness that this picker
+        # started/continued a refresh.  Fresh ordinary opens have no such
+        # component and therefore never display a completion acknowledgement.
+        if continuation_state.refresh_deadline is not None:
+            return render_snapshot(
+                candidate,
+                message="Checked just now",
+                preserve=True,
+                timeout=True,
+                check_deadline=now + CHECK_NOTICE_SECONDS,
+                clear_message=True,
+                continuation=True,
+                navigation=navigation,
+            )
         return render_snapshot(
-            snapshot,
+            candidate,
             preserve=True,
             timeout=False,
             clear_message=True,
             continuation=True,
             navigation=navigation,
         )
+
+    if fresh:
+        return render_fresh(snapshot)
 
     deadline = continuation_state.refresh_deadline
     timed_out = deadline is not None and now >= deadline
@@ -1368,12 +1451,12 @@ def _auto_refresh_callback(
         if deadline is None:
             deadline = now + AUTO_REFRESH_MAX_SECONDS
         if snapshot is None:
-            background_message = "Refreshing in background"
+            background_message = "Checking sessions…"
         else:
             # Errors in a stale snapshot belong to the previous refresh.  A
             # current error notice is emitted once the new worker snapshot is
             # fresh, so keep the polling status unambiguous here.
-            background_message = "Refreshing in background"
+            background_message = "Checking sessions…"
         notice_active = error_deadline is not None and now < error_deadline and bool(error_message)
         return render_snapshot(
             snapshot,
@@ -1382,6 +1465,7 @@ def _auto_refresh_callback(
             timeout=True,
             refresh_deadline=deadline,
             error_deadline=error_deadline if notice_active else None,
+            checking=True,
             continuation=True,
             navigation=navigation,
         )
@@ -1400,14 +1484,7 @@ def _auto_refresh_callback(
                 continuation=True,
                 navigation=navigation,
             )
-        return render_snapshot(
-            latest,
-            preserve=True,
-            timeout=False,
-            clear_message=True,
-            continuation=True,
-            navigation=navigation,
-        )
+        return render_fresh(latest)
 
     if error_deadline is not None and now < error_deadline and error_message:
         return render_snapshot(
@@ -1417,6 +1494,29 @@ def _auto_refresh_callback(
             timeout=True,
             error_deadline=error_deadline,
             clear_message=True,
+            continuation=True,
+            navigation=navigation,
+        )
+    if continuation_state.check_deadline is not None:
+        return render_snapshot(
+            snapshot,
+            preserve=True,
+            timeout=False,
+            clear_message=True,
+            continuation=True,
+            navigation=navigation,
+        )
+    if continuation_state.refresh_deadline is not None:
+        outcome = _refresh_outcome(latest or snapshot)
+        message = (
+            "Check failed · showing last-known results"
+            if outcome == "failed"
+            else "Check stopped · showing last-known results"
+        )
+        return _render_error_notice(
+            latest or snapshot,
+            message,
+            preserve=True,
             continuation=True,
             navigation=navigation,
         )
@@ -1468,10 +1568,16 @@ def run_rofi(
                 # background worker remains visible and keeps its poll alive.
                 rendered = render_snapshot(
                     None,
-                    message="Refreshing in background" if active.refresh_deadline else "",
+                    message=(
+                        "Checking sessions…"
+                        if active.refresh_deadline
+                        else ("Checked just now" if active.check_deadline else "")
+                    ),
                     preserve=True,
-                    timeout=True if active.refresh_deadline else False,
+                    timeout=True if active.refresh_deadline or active.check_deadline else False,
                     refresh_deadline=active.refresh_deadline,
+                    check_deadline=active.check_deadline,
+                    checking=active.refresh_deadline is not None,
                     clear_message=True,
                     continuation=True,
                     navigation=navigation,
@@ -1489,6 +1595,7 @@ def run_rofi(
                     continuation=True,
                     refresh_deadline=active.refresh_deadline,
                     error_deadline=active.error_deadline,
+                    check_deadline=active.check_deadline,
                     navigation=navigation,
                 )
         else:
@@ -1498,6 +1605,7 @@ def run_rofi(
                 preserve=retv != 0,
                 continuation=retv != 0,
                 refresh_deadline=continuation_state.active().refresh_deadline,
+                check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
             )
         print(rendered, end="")
@@ -1526,6 +1634,7 @@ def run_rofi(
                 preserve=False,
                 continuation=True,
                 refresh_deadline=continuation_state.active().refresh_deadline,
+                check_deadline=continuation_state.active().check_deadline,
                 navigation=next_navigation,
                 keep_filter=True,
                 keep_selection=False,
@@ -1565,6 +1674,7 @@ def run_rofi(
                 preserve=retv != 0,
                 continuation=retv != 0,
                 refresh_deadline=continuation_state.active().refresh_deadline,
+                check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
             ),
             end="",
@@ -1587,6 +1697,7 @@ def run_rofi(
                     preserve=retv != 0,
                     continuation=retv != 0,
                     refresh_deadline=continuation_state.active().refresh_deadline,
+                    check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
                 ),
                 end="",
@@ -1625,6 +1736,7 @@ def run_rofi(
                     preserve=True,
                     continuation=True,
                     refresh_deadline=continuation_state.active().refresh_deadline,
+                    check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
                 ),
                 end="",
@@ -1669,6 +1781,7 @@ def run_rofi(
                     preserve=True,
                     continuation=True,
                     refresh_deadline=continuation_state.active().refresh_deadline,
+                    check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
                 ),
                 end="",
@@ -1685,6 +1798,7 @@ def run_rofi(
                 preserve=True,
                 continuation=True,
                 refresh_deadline=continuation_state.active().refresh_deadline,
+                check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
             )
         print(rendered, end="")
@@ -1716,10 +1830,11 @@ def run_rofi(
             print(
                 render_snapshot(
                     snapshot,
-                    message="Refreshing in background",
+                    message="Checking sessions…",
                     preserve=True,
                     timeout=True,
                     refresh_deadline=deadline,
+                    checking=True,
                     clear_message=True,
                     continuation=True,
                     navigation=navigation,
@@ -1738,6 +1853,7 @@ def run_rofi(
                     preserve=True,
                     continuation=True,
                     refresh_deadline=continuation_state.active().refresh_deadline,
+                    check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
                 ),
                 end="",
@@ -1752,6 +1868,7 @@ def run_rofi(
                 None,
                 f"Model refresh failed: {sanitize(exc)}",
                 refresh_deadline=continuation_state.active().refresh_deadline,
+                check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
             ),
             end="",
@@ -1768,6 +1885,7 @@ def run_rofi(
                     None,
                     f"Refresh failed: {sanitize(exc)}",
                     refresh_deadline=continuation_state.active().refresh_deadline,
+                    check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
                 ),
                 end="",
@@ -1795,9 +1913,7 @@ def run_rofi(
                     )
                     return 0
             message = (
-                "Refreshing in background"
-                if polling
-                else summarize_errors(snapshot.get("errors", []))
+                "Checking sessions…" if polling else summarize_errors(snapshot.get("errors", []))
             )
             if not polling and message:
                 print(_render_error_notice(snapshot, message, navigation=navigation), end="")
@@ -1808,6 +1924,7 @@ def run_rofi(
                     message=message,
                     timeout=True if polling else None,
                     refresh_deadline=refresh_deadline,
+                    checking=polling,
                     navigation=navigation,
                 ),
                 end="",
