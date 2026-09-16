@@ -1063,6 +1063,19 @@ class ContractBackendAssemblyTest(unittest.TestCase):
         self.assertTrue(row["active"])
         self.assertTrue(any(error["stage"] == "threads" for error in events[1]["errors"]))
 
+    def test_active_only_rows_carry_private_cache_provenance(self) -> None:
+        rows: list[dict[str, object]] = []
+        ContractBackend._append_active_only_rows(
+            rows,
+            {
+                "active": {THREAD: {"candidates": [{"pid": 1, "ancestors": [1]}]}},
+                "claudeActive": {},
+                "opencodeActive": {},
+            },
+        )
+        self.assertEqual(1, len(rows))
+        self.assertEqual("activity-only", rows[0]["sourceObservation"])
+
     def test_tmux_inventory_exit_and_body_envelopes_must_match(self) -> None:
         mesh = parse_mesh(fixture("mesh-v1.json"))
         inventory_payload = fixture("tmux-inventory-v1.json")

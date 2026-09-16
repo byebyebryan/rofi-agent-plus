@@ -21,15 +21,28 @@ from typing import Any
 from . import engine
 from .config import PickerConfig
 
-# v3 adds the ordered Host Mesh presentation catalog.  A Host Mesh revision
-# (or the explicit local-only ``null`` identity) is part of cache validity.
-CACHE_VERSION = 3
+# v4 adds private refresh-observation provenance.  A Host Mesh revision (or
+# the explicit local-only ``null`` identity) remains part of cache validity.
+# v3 snapshots are upgraded in memory on read and rewritten as v4 only by a
+# later legitimate cache mutation.
+CACHE_VERSION = 4
+_PREVIOUS_CACHE_VERSION = 3
 DEFAULT_CACHE_DIR = Path("rofi-agent-plus")
 SNAPSHOT_NAME = "snapshot.json"
 LOCK_NAME = "refresh.lock"
 BACKGROUND_MARKER_NAME = "refresh.background"
 LOCK_WAIT_SECONDS = 30.0
 _PROVIDER_FOR_STAGE = {"threads": "codex", "claude": "claude", "opencode": "opencode"}
+_OBSERVATION_STAGES = ("codex", "claude", "opencode", "activity", "tmux")
+_OBSERVATION_STAGE_FOR_ERROR = {
+    "threads": "codex",
+    "claude": "claude",
+    "opencode": "opencode",
+    "active": "activity",
+    "tmux": "tmux",
+}
+_OBSERVATION_OUTCOMES = {"ok", "failed", "unknown"}
+_SOURCE_OBSERVATIONS = {"current", "retained", "activity-only"}
 _ROFI_CALLBACK_ENVIRONMENT = (
     "ROFI_DATA",
     "ROFI_INFO",
@@ -133,6 +146,114 @@ def _provider_for_session(session: Mapping[str, Any]) -> str:
     return kind if kind in {"codex", "claude", "opencode"} else ""
 
 
+def _timestamp(value: object, default: int = 0) -> int:
+    """Return a non-negative integer timestamp without accepting booleans."""
+
+    if isinstance(value, bool):
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _stage_observation(value: object) -> dict[str, object]:
+    """Copy one private stage observation, treating malformed history as unknown."""
+
+    if not isinstance(value, Mapping):
+        return {"lastAttemptAt": 0, "lastSuccessAt": 0, "outcome": "unknown"}
+    outcome = value.get("outcome")
+    if outcome not in _OBSERVATION_OUTCOMES:
+        outcome = "unknown"
+    return {
+        "lastAttemptAt": _timestamp(value.get("lastAttemptAt")),
+        "lastSuccessAt": _timestamp(value.get("lastSuccessAt")),
+        "outcome": outcome,
+    }
+
+
+def _host_observations(value: object) -> dict[str, dict[str, object]]:
+    """Copy every canonical stage while leaving absent legacy history unknown."""
+
+    raw = value if isinstance(value, Mapping) else {}
+    return {stage: _stage_observation(raw.get(stage)) for stage in _OBSERVATION_STAGES}
+
+
+def _error_stages(errors: object) -> set[str]:
+    """Return canonical stages whose host-wide observations failed."""
+
+    if not isinstance(errors, list):
+        return set()
+    return {
+        canonical
+        for error in errors
+        if isinstance(error, Mapping)
+        and isinstance(error.get("stage"), str)
+        and (canonical := _OBSERVATION_STAGE_FOR_ERROR.get(error["stage"])) is not None
+    }
+
+
+def _observation_outcome(errors: object) -> str:
+    """Classify a completed all-host transaction without counting diagnostics."""
+
+    if isinstance(errors, list) and any(
+        isinstance(error, Mapping) and error.get("stage") in {"contract", "refresh"}
+        for error in errors
+    ):
+        # These errors mean no complete authority-scoped transaction reached
+        # the cache.  A retained generatedAt belongs to an older success and
+        # must not make a v3 migration look complete.
+        return "failed"
+    if _error_stages(errors):
+        return "partial"
+    if isinstance(errors, list) and any(
+        isinstance(error, Mapping) and error.get("stage") == "tmux-correlation" for error in errors
+    ):
+        # Correlation uncertainty is row-specific, but the all-host attempt is
+        # still not fully evidenced.  It must not downgrade the host-wide
+        # ``tmux`` observation itself.
+        return "partial"
+    return "complete"
+
+
+def _observations_for_attempt(
+    previous: Mapping[str, Any] | None,
+    errors: object,
+    observed_at: int,
+) -> dict[str, dict[str, object]]:
+    """Record one completed host attempt while retaining prior success times."""
+
+    prior = _host_observations(previous.get("observations") if previous else None)
+    failed = _error_stages(errors)
+    observations: dict[str, dict[str, object]] = {}
+    for stage in _OBSERVATION_STAGES:
+        if stage in failed:
+            observations[stage] = {
+                "lastAttemptAt": observed_at,
+                "lastSuccessAt": prior[stage]["lastSuccessAt"],
+                "outcome": "failed",
+            }
+        else:
+            # ``tmux-missing`` is a reached authoritative result, and
+            # ``tmux-correlation`` is a row-specific uncertainty.  Neither
+            # makes the host-wide inventory stage unavailable.
+            observations[stage] = {
+                "lastAttemptAt": observed_at,
+                "lastSuccessAt": observed_at,
+                "outcome": "ok",
+            }
+    return observations
+
+
+def _source_from_current_event(value: object) -> str:
+    """Accept only the backend's synthetic-row marker from current events."""
+
+    # ``retained`` is cache-owned history, never an event-stream claim.  This
+    # prevents a backend or malformed test event from blessing old provider
+    # data as retained without the merge preserving its observation history.
+    return "activity-only" if value == "activity-only" else "current"
+
+
 def _merge_host_snapshot(
     previous: Mapping[str, Any] | None,
     current: Mapping[str, Any],
@@ -145,9 +266,13 @@ def _merge_host_snapshot(
     current metadata for the row.
     """
 
-    current_sessions = [
-        dict(item) for item in current.get("sessions", []) if isinstance(item, dict)
-    ]
+    current_sessions = []
+    for item in current.get("sessions", []):
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        row["sourceObservation"] = _source_from_current_event(row.get("sourceObservation"))
+        current_sessions.append(row)
     current_errors = [dict(item) for item in current.get("errors", []) if isinstance(item, dict)]
     failed_stages = {str(error.get("stage")) for error in current_errors if error.get("stage")}
     current_by_key = {_as_session_key(item): item for item in current_sessions}
@@ -194,7 +319,12 @@ def _merge_host_snapshot(
                 continue
             key = _as_session_key(old)
             provider = _provider_for_session(old)
-            preserve = any(_PROVIDER_FOR_STAGE.get(stage) == provider for stage in failed_stages)
+            # A synthetic activity-only row has no provider-native metadata to
+            # retain.  Keeping it through a later provider failure would make
+            # an old process probe look like a current session listing.
+            preserve = old.get("sourceObservation") != "activity-only" and any(
+                _PROVIDER_FOR_STAGE.get(stage) == provider for stage in failed_stages
+            )
             fresh = current_by_key.get(key)
             current_had_tmux = fresh is not None and "tmux" in fresh
             if preserve and fresh is not None:
@@ -228,8 +358,10 @@ def _merge_host_snapshot(
                         retained.pop("providerOptionVerified", None)
                 fresh.clear()
                 fresh.update(retained)
+                fresh["sourceObservation"] = "retained"
             elif preserve and fresh is None:
                 fresh = dict(old)
+                fresh["sourceObservation"] = "retained"
                 current_sessions.append(fresh)
                 current_by_key[key] = fresh
             if "active" in failed_stages and key in current_by_key:
@@ -259,6 +391,11 @@ def _merge_host_snapshot(
         "generatedAt": int(current.get("generatedAt") or time.time()),
         "sessions": current_sessions,
         "errors": current_errors,
+        "observations": _observations_for_attempt(
+            previous,
+            current_errors,
+            _timestamp(current.get("generatedAt"), int(time.time())),
+        ),
     }
     return result
 
@@ -287,11 +424,148 @@ def _backend_identity(value: object) -> dict[str, object] | None:
     return {"kind": kind, "capability": capability, "meshRevision": revision}
 
 
+def _last_refresh(
+    attempted_at: int,
+    *,
+    completed_at: int | None,
+    outcome: str,
+) -> dict[str, object]:
+    return {
+        "attemptedAt": attempted_at,
+        "completedAt": completed_at,
+        "outcome": outcome,
+    }
+
+
+def _valid_stage_observation(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("outcome") not in _OBSERVATION_OUTCOMES:
+        return False
+    return all(
+        isinstance(value.get(key), int) and not isinstance(value.get(key), bool) and value[key] >= 0
+        for key in ("lastAttemptAt", "lastSuccessAt")
+    )
+
+
+def _valid_observations(value: object) -> bool:
+    return isinstance(value, Mapping) and all(
+        _valid_stage_observation(value.get(stage)) for stage in _OBSERVATION_STAGES
+    )
+
+
+def _valid_last_refresh(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("outcome") not in {
+        "complete",
+        "partial",
+        "failed",
+    }:
+        return False
+    attempted = value.get("attemptedAt")
+    completed = value.get("completedAt")
+    if not isinstance(attempted, int) or isinstance(attempted, bool) or attempted < 0:
+        return False
+    if value["outcome"] == "failed":
+        # Failed attempts have no successful transaction completion.  This
+        # also keeps the empty, no-authority snapshot (0/None/failed) valid.
+        return completed is None
+    return isinstance(completed, int) and not isinstance(completed, bool) and completed >= attempted
+
+
+def _v3_row_source(row: Mapping[str, Any], errors: object) -> str:
+    """Recover the only trustworthy v3 row distinction from host errors."""
+
+    provider = _provider_for_session(row)
+    failed = _error_stages(errors)
+    return "retained" if provider in failed else "current"
+
+
+def _migrate_v3_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Create an in-memory v4 view of a valid v3 private snapshot.
+
+    v3 had no exact per-stage success history.  We recover current provider
+    failures from its host errors and leave their prior success timestamp at
+    zero instead of inventing a time.  The first normal refresh replaces that
+    legacy uncertainty with v4 observations.
+    """
+
+    # Snapshots enter this function from JSON or CacheStore.write, so this is
+    # also a convenient deep copy that guarantees a read never mutates disk
+    # data or caller-owned objects.
+    migrated = json.loads(json.dumps(payload, ensure_ascii=False))
+    migrated["version"] = CACHE_VERSION
+    generated_at = _timestamp(migrated.get("generatedAt"))
+    backend = _backend_identity(migrated.get("backend"))
+    if backend is None or backend["kind"] != "contract" or generated_at == 0:
+        migrated["lastRefresh"] = _last_refresh(0, completed_at=None, outcome="failed")
+    else:
+        outcome = _observation_outcome(migrated.get("errors"))
+        migrated["lastRefresh"] = (
+            _last_refresh(0, completed_at=None, outcome="failed")
+            if outcome == "failed"
+            else _last_refresh(generated_at, completed_at=generated_at, outcome=outcome)
+        )
+    hosts = migrated.get("hosts")
+    if not isinstance(hosts, dict):
+        return migrated
+    errors_by_host: dict[str, list[object]] = {}
+    row_sources: dict[tuple[str, str, str], str] = {}
+    for key, host in hosts.items():
+        if not isinstance(key, str) or not isinstance(host, dict):
+            continue
+        host_errors = host.get("errors") if isinstance(host.get("errors"), list) else []
+        errors_by_host[key] = host_errors
+        observed_at = _timestamp(host.get("generatedAt"), generated_at)
+        failed = _error_stages(host_errors)
+        host["observations"] = {
+            stage: {
+                "lastAttemptAt": observed_at,
+                "lastSuccessAt": 0 if stage in failed else observed_at,
+                "outcome": "failed" if stage in failed else "ok",
+            }
+            for stage in _OBSERVATION_STAGES
+        }
+        rows = host.get("sessions")
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    source = _v3_row_source(row, host_errors)
+                    row["sourceObservation"] = source
+                    row_sources[_as_session_key(row)] = source
+    rows = migrated.get("sessions")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            host_key = str(row.get("hostId") or row.get("windowHost") or row.get("host") or "local")
+            row["sourceObservation"] = row_sources.get(
+                _as_session_key(row), _v3_row_source(row, errors_by_host.get(host_key, []))
+            )
+    return migrated
+
+
+def _prior_last_refresh(previous: Mapping[str, Any] | None) -> dict[str, object]:
+    """Read v4 metadata or safely synthesize it for direct legacy callers."""
+
+    if previous is not None and _valid_last_refresh(previous.get("lastRefresh")):
+        value = previous["lastRefresh"]
+        assert isinstance(value, Mapping)
+        return dict(value)
+    generated_at = _timestamp(previous.get("generatedAt") if previous else None)
+    backend = _backend_identity(previous.get("backend")) if previous else None
+    if generated_at and backend is not None and backend["kind"] == "contract":
+        outcome = _observation_outcome(previous.get("errors") if previous else None)
+        if outcome != "failed":
+            return _last_refresh(generated_at, completed_at=generated_at, outcome=outcome)
+    return _last_refresh(0, completed_at=None, outcome="failed")
+
+
 def _failed_contract_snapshot(
     config: PickerConfig,
     previous: Mapping[str, Any] | None,
     backend: Mapping[str, object],
     errors: list[dict[str, str]],
+    *,
+    attempted_at: int | None = None,
+    retain_unselected_hosts: bool = False,
 ) -> dict[str, Any]:
     """Retain only compatible cache data without advancing freshness."""
 
@@ -302,6 +576,17 @@ def _failed_contract_snapshot(
     )
     hosts = dict(prior.get("hosts", {})) if isinstance(prior, Mapping) else {}
     catalog = _host_catalog(prior.get("hostCatalog")) if isinstance(prior, Mapping) else None
+    prior_refresh = _prior_last_refresh(prior)
+    if retain_unselected_hosts:
+        # A lifecycle revalidation is deliberately narrower than the picker
+        # transaction.  Its failure must not claim an all-host attempt.
+        last_refresh = prior_refresh
+    else:
+        last_refresh = _last_refresh(
+            _timestamp(attempted_at, int(time.time())),
+            completed_at=None,
+            outcome="failed",
+        )
     snapshot = {
         "version": CACHE_VERSION,
         "fingerprint": config.fingerprint,
@@ -312,6 +597,7 @@ def _failed_contract_snapshot(
         "hosts": hosts,
         "sessions": _flatten_hosts(hosts, config.max_sessions),
         "errors": _flatten_errors(hosts) + errors,
+        "lastRefresh": last_refresh,
     }
     return snapshot
 
@@ -402,6 +688,7 @@ def build_snapshot(
 ) -> dict[str, Any]:
     """Build a versioned snapshot from the engine's per-host event stream."""
 
+    attempted_at = int(now if now is not None else time.time())
     hosts: dict[str, dict[str, Any]] = {}
     refresh_errors: list[dict[str, str]] = []
     backend: dict[str, object] = {
@@ -432,6 +719,7 @@ def build_snapshot(
                 refresh_errors.append(
                     {"host": "local", "stage": "refresh", "message": "malformed refresh event"}
                 )
+                contract_aborted = backend["kind"] == "contract"
                 continue
             kind = event.get("event")
             if kind == "refresh-started":
@@ -505,7 +793,9 @@ def build_snapshot(
                     contract_aborted = backend["kind"] == "contract"
                     continue
                 current = {
-                    "generatedAt": int(event.get("generatedAt") or time.time()),
+                    "generatedAt": int(
+                        event.get("generatedAt") or (now if now is not None else time.time())
+                    ),
                     "sessions": event.get("sessions", []),
                     "errors": event.get("errors", []),
                 }
@@ -527,6 +817,7 @@ def build_snapshot(
                 refresh_errors.append(
                     {"host": "local", "stage": "refresh", "message": "unknown refresh event"}
                 )
+                contract_aborted = backend["kind"] == "contract"
     except Exception as exc:  # preserve prior hosts if a refresh aborts unexpectedly
         refresh_errors.append({"host": "local", "stage": "refresh", "message": str(exc)})
         contract_aborted = backend["kind"] == "contract"
@@ -545,7 +836,14 @@ def build_snapshot(
                     "message": "incomplete contract host coverage",
                 }
             )
-        return _failed_contract_snapshot(config, previous, backend, refresh_errors)
+        return _failed_contract_snapshot(
+            config,
+            previous,
+            backend,
+            refresh_errors,
+            attempted_at=attempted_at,
+            retain_unselected_hosts=retain_unselected_hosts,
+        )
 
     if (
         not host_catalog
@@ -562,13 +860,21 @@ def build_snapshot(
     # every retained peer as globally fresh and suppress the required next
     # all-host discovery.  An absent/incompatible prior authority falls back
     # to zero so this partial result is never treated as a full refresh.
+    completed_at = int(now if now is not None else time.time())
     generated_at = (
-        _scoped_generated_at(previous, backend)
-        if retain_unselected_hosts
-        else int(now if now is not None else time.time())
+        _scoped_generated_at(previous, backend) if retain_unselected_hosts else completed_at
     )
     errors = _flatten_errors(hosts)
     errors.extend(refresh_errors)
+    last_refresh = (
+        _prior_last_refresh(previous)
+        if retain_unselected_hosts
+        else _last_refresh(
+            attempted_at,
+            completed_at=completed_at,
+            outcome=_observation_outcome(errors),
+        )
+    )
     return {
         "version": CACHE_VERSION,
         "fingerprint": config.fingerprint,
@@ -578,6 +884,7 @@ def build_snapshot(
         "hosts": hosts,
         "sessions": _flatten_hosts(hosts, config.max_sessions),
         "errors": errors,
+        "lastRefresh": last_refresh,
     }
 
 
@@ -612,7 +919,10 @@ class CacheStore:
                 payload = json.load(stream)
         except (OSError, ValueError, json.JSONDecodeError):
             return None
-        if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION:
+        if not isinstance(payload, dict) or payload.get("version") not in {
+            _PREVIOUS_CACHE_VERSION,
+            CACHE_VERSION,
+        }:
             return None
         if fingerprint is not None and payload.get("fingerprint") != fingerprint:
             return None
@@ -637,6 +947,30 @@ class CacheStore:
                 host.get("errors", []), list
             ):
                 return None
+        if payload.get("version") == _PREVIOUS_CACHE_VERSION:
+            # Deliberately return the upgraded copy only.  Opening Rofi must
+            # not rewrite a valid old cache or turn migration into a cache
+            # miss; a later refresh/reconciliation write persists v4.
+            payload = _migrate_v3_snapshot(payload)
+        if not _valid_last_refresh(payload.get("lastRefresh")):
+            return None
+        for host in payload["hosts"].values():
+            assert isinstance(host, dict)
+            if not _valid_observations(host.get("observations")):
+                return None
+            rows = host.get("sessions", [])
+            if any(
+                not isinstance(row, dict)
+                or row.get("sourceObservation") not in _SOURCE_OBSERVATIONS
+                for row in rows
+            ):
+                return None
+        rows = payload.get("sessions", [])
+        if any(
+            not isinstance(row, dict) or row.get("sourceObservation") not in _SOURCE_OBSERVATIONS
+            for row in rows
+        ):
+            return None
         _safe_mode(self.snapshot_path, 0o600)
         return payload
 
@@ -719,7 +1053,10 @@ class CacheStore:
 
     def write(self, snapshot: Mapping[str, Any]) -> None:
         self.ensure_root()
-        encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        persisted: Mapping[str, Any] = snapshot
+        if snapshot.get("version") == _PREVIOUS_CACHE_VERSION:
+            persisted = _migrate_v3_snapshot(snapshot)
+        encoded = json.dumps(persisted, ensure_ascii=False, separators=(",", ":"))
         descriptor, temporary = tempfile.mkstemp(prefix=".snapshot.", suffix=".tmp", dir=self.root)
         temporary_path = Path(temporary)
         try:
@@ -968,6 +1305,9 @@ class CacheStore:
                                         "message": "discovery authority changed; refresh again",
                                     }
                                 ],
+                                "lastRefresh": _last_refresh(
+                                    int(time.time()), completed_at=None, outcome="failed"
+                                ),
                             }
                             if require_fresh:
                                 _require_complete_contract_transaction(authority_changed)
@@ -1168,4 +1508,5 @@ def _empty_snapshot(config: PickerConfig) -> dict[str, Any]:
         "hosts": {},
         "sessions": [],
         "errors": [],
+        "lastRefresh": _last_refresh(0, completed_at=None, outcome="failed"),
     }

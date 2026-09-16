@@ -1904,6 +1904,11 @@ class ContractBackend:
                         "active": True,
                         "activityState": "active",
                         "tmuxSession": None,
+                        # Private cache/event provenance: this row comes from
+                        # a successful activity probe, not provider history.
+                        # It is intentionally not a Host Mesh/Tmux contract
+                        # field or selection authority.
+                        "sourceObservation": "activity-only",
                     }
                 )
                 present.add((kind, identifier))

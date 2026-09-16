@@ -357,6 +357,29 @@ class CacheTest(unittest.TestCase):
         self.assertEqual(previous["hostCatalog"], current["hostCatalog"])
         self.assertEqual(previous["hosts"]["local"], current["hosts"]["local"])
         self.assertEqual(100, current["generatedAt"])
+        self.assertEqual(previous["lastRefresh"], current["lastRefresh"])
+        self.assertEqual(200, current["hosts"]["beta"]["observations"]["codex"]["lastSuccessAt"])
+
+        aborted = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["beta"],
+                        "hostCatalog": [
+                            {"hostId": "local", "display": "Local", "local": True},
+                            {"hostId": "beta", "display": "Beta", "local": False},
+                        ],
+                    }
+                ]
+            ),
+            current,
+            now=300,
+            retain_unselected_hosts=True,
+        )
+        self.assertEqual(100, aborted["generatedAt"])
+        self.assertEqual(previous["lastRefresh"], aborted["lastRefresh"])
 
     def test_partial_provider_failure_preserves_old_rows(self) -> None:
         old = session("codex", recencyAt=100)
@@ -373,6 +396,234 @@ class CacheTest(unittest.TestCase):
         )
         self.assertEqual(
             {"codex", "claude"}, {item["kind"] for item in current_snapshot["sessions"]}
+        )
+
+    def test_v3_cache_upgrades_in_memory_without_a_cache_miss_or_read_rewrite(self) -> None:
+        snapshot = build_snapshot(self.config, self.events(session()), now=100)
+        legacy = json.loads(json.dumps(snapshot))
+        legacy["version"] = 3
+        legacy.pop("lastRefresh")
+        for host in legacy["hosts"].values():
+            host.pop("observations")
+            for row in host["sessions"]:
+                row.pop("sourceObservation")
+        for row in legacy["sessions"]:
+            row.pop("sourceObservation")
+        self.store.ensure_root()
+        self.store.snapshot_path.write_text(json.dumps(legacy))
+
+        loaded = self.store.load(self.config.fingerprint)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(CACHE_VERSION, loaded["version"])
+        self.assertEqual("complete", loaded["lastRefresh"]["outcome"])
+        self.assertEqual("current", loaded["sessions"][0]["sourceObservation"])
+        self.assertEqual(3, json.loads(self.store.snapshot_path.read_text())["version"])
+
+        self.store.write(loaded)
+        self.assertEqual(CACHE_VERSION, json.loads(self.store.snapshot_path.read_text())["version"])
+
+    def test_v3_transaction_failure_keeps_retained_timestamp_but_normalizes_failed_attempt(
+        self,
+    ) -> None:
+        snapshot = build_snapshot(self.config, self.events(session()), now=100)
+        legacy = json.loads(json.dumps(snapshot))
+        legacy["version"] = 3
+        legacy.pop("lastRefresh")
+        legacy["errors"].append(
+            {"host": "local", "stage": "refresh", "message": "transaction aborted"}
+        )
+        for host in legacy["hosts"].values():
+            host.pop("observations")
+            for row in host["sessions"]:
+                row.pop("sourceObservation")
+        for row in legacy["sessions"]:
+            row.pop("sourceObservation")
+        self.store.ensure_root()
+        self.store.snapshot_path.write_text(json.dumps(legacy))
+
+        loaded = self.store.load(self.config.fingerprint)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(100, loaded["generatedAt"])
+        self.assertEqual(
+            {"attemptedAt": 0, "completedAt": None, "outcome": "failed"},
+            loaded["lastRefresh"],
+        )
+        on_disk = json.loads(self.store.snapshot_path.read_text())
+        self.assertEqual(3, on_disk["version"])
+        self.assertNotIn("lastRefresh", on_disk)
+
+    def test_v4_observation_metadata_fails_closed_when_malformed(self) -> None:
+        snapshot = build_snapshot(self.config, self.events(session()), now=100)
+        mutations = (
+            lambda value: value["lastRefresh"].update({"outcome": "unknown"}),
+            lambda value: value["lastRefresh"].update({"completedAt": None}),
+            lambda value: value["lastRefresh"].update({"outcome": "failed"}),
+            lambda value: value["hosts"]["local"]["observations"]["codex"].update(
+                {"lastSuccessAt": "not-a-time"}
+            ),
+            lambda value: value["hosts"]["local"]["sessions"][0].update(
+                {"sourceObservation": "untrusted"}
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                candidate = json.loads(json.dumps(snapshot))
+                mutate(candidate)
+                self.store.write(candidate)
+                self.assertIsNone(self.store.load(self.config.fingerprint))
+
+    def test_observations_classify_complete_partial_and_failed_all_host_attempts(self) -> None:
+        complete = build_snapshot(self.config, self.events(session()), now=100)
+        self.assertEqual(
+            {"attemptedAt": 100, "completedAt": 100, "outcome": "complete"},
+            complete["lastRefresh"],
+        )
+        self.assertTrue(
+            all(
+                stage == {"lastAttemptAt": 100, "lastSuccessAt": 100, "outcome": "ok"}
+                for stage in complete["hosts"]["local"]["observations"].values()
+            )
+        )
+
+        partial = build_snapshot(
+            self.config,
+            self.events(
+                session(),
+                errors=[{"host": "local", "stage": "threads", "message": "offline"}],
+            ),
+            complete,
+            now=200,
+        )
+        self.assertEqual("partial", partial["lastRefresh"]["outcome"])
+        self.assertEqual(
+            {"lastAttemptAt": 200, "lastSuccessAt": 100, "outcome": "failed"},
+            partial["hosts"]["local"]["observations"]["codex"],
+        )
+        self.assertEqual(
+            {"lastAttemptAt": 200, "lastSuccessAt": 200, "outcome": "ok"},
+            partial["hosts"]["local"]["observations"]["claude"],
+        )
+
+        aborted = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["local"],
+                        "hostCatalog": [{"hostId": "local", "display": "Local", "local": True}],
+                    }
+                ]
+            ),
+            partial,
+            now=300,
+        )
+        self.assertEqual(200, aborted["generatedAt"])
+        self.assertEqual(
+            {"attemptedAt": 300, "completedAt": None, "outcome": "failed"},
+            aborted["lastRefresh"],
+        )
+
+    def test_source_observation_preserves_provider_retention_and_activity_only_rows(self) -> None:
+        previous = build_snapshot(self.config, self.events(session(name="provider")), now=100)
+        current = build_snapshot(
+            self.config,
+            self.events(
+                session(
+                    name=THREAD_ID[:8],
+                    cwd="",
+                    recencyAt=0,
+                    updatedAt=0,
+                    active=True,
+                    activityState="active",
+                    sourceObservation="activity-only",
+                ),
+                errors=[{"host": "local", "stage": "threads", "message": "offline"}],
+            ),
+            previous,
+            now=200,
+        )
+        retained = current["sessions"][0]
+        self.assertEqual("provider", retained["name"])
+        self.assertEqual("retained", retained["sourceObservation"])
+        self.assertTrue(retained["active"])
+
+        activity_only = build_snapshot(
+            self.config,
+            self.events(
+                session(
+                    "claude",
+                    "00000000-0000-0000-0000-000000000002",
+                    cwd="",
+                    recencyAt=0,
+                    updatedAt=0,
+                    active=True,
+                    activityState="active",
+                    sourceObservation="activity-only",
+                )
+            ),
+            now=300,
+        )
+        self.assertEqual("activity-only", activity_only["sessions"][0]["sourceObservation"])
+        self.assertNotIn(
+            "sourceObservation", json.loads(selection_payload(activity_only["sessions"][0]))
+        )
+
+    def test_stage_classification_keeps_tmux_missing_authoritative_and_diagnostics_nonfatal(
+        self,
+    ) -> None:
+        snapshot = build_snapshot(
+            self.config,
+            self.events(
+                session(),
+                errors=[
+                    {"host": "local", "stage": "threads", "message": "offline"},
+                    {"host": "local", "stage": "active", "message": "offline"},
+                    {"host": "local", "stage": "tmux-missing", "message": "reached"},
+                    {"host": "local", "stage": "tmux-correlation", "message": "ambiguous"},
+                    {"host": "local", "stage": "route-health", "message": "hint failed"},
+                ],
+            ),
+            now=100,
+        )
+        observations = snapshot["hosts"]["local"]["observations"]
+        self.assertEqual("failed", observations["codex"]["outcome"])
+        self.assertEqual("failed", observations["activity"]["outcome"])
+        self.assertEqual("ok", observations["tmux"]["outcome"])
+        self.assertEqual("ok", observations["claude"]["outcome"])
+        self.assertEqual("ok", observations["opencode"]["outcome"])
+        self.assertEqual("partial", snapshot["lastRefresh"]["outcome"])
+
+        tmux_failed = build_snapshot(
+            self.config,
+            self.events(
+                session(),
+                errors=[{"host": "local", "stage": "tmux", "message": "offline"}],
+            ),
+            snapshot,
+            now=200,
+        )
+        self.assertEqual(
+            {"lastAttemptAt": 200, "lastSuccessAt": 100, "outcome": "failed"},
+            tmux_failed["hosts"]["local"]["observations"]["tmux"],
+        )
+
+        diagnostic_only = build_snapshot(
+            self.config,
+            self.events(
+                session(),
+                errors=[{"host": "local", "stage": "route-health", "message": "hint failed"}],
+            ),
+            now=300,
+        )
+        self.assertEqual("complete", diagnostic_only["lastRefresh"]["outcome"])
+        self.assertTrue(
+            all(
+                stage["outcome"] == "ok"
+                for stage in diagnostic_only["hosts"]["local"]["observations"].values()
+            )
         )
 
     def test_fresh_cache_skips_discovery_and_stale_cache_refreshes(self) -> None:
@@ -445,6 +696,11 @@ class CacheTest(unittest.TestCase):
         )
         self.assertTrue(current["sessions"][0]["active"])
         self.assertNotIn("tmux", current["sessions"][0])
+        self.assertEqual("current", current["sessions"][0]["sourceObservation"])
+        self.assertEqual(
+            {"lastAttemptAt": 200, "lastSuccessAt": 100, "outcome": "failed"},
+            current["hosts"]["local"]["observations"]["activity"],
+        )
 
 
 class RofiProtocolTest(unittest.TestCase):
