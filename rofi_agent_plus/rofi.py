@@ -70,6 +70,7 @@ VIEW_ALL = "all"
 VIEW_LOCAL = "local"
 VIEW_HOST = "host"
 _VIEWS = frozenset({VIEW_ALL, VIEW_LOCAL, VIEW_HOST})
+SessionIdentity = tuple[str, str, str]
 
 
 def sanitize(value: object) -> str:
@@ -248,6 +249,46 @@ def _session_key(session: Mapping[str, Any]) -> tuple[str, str, str]:
         str(session.get("kind") or ""),
         str(session.get("id") or ""),
     )
+
+
+def _session_identity(session: Mapping[str, Any]) -> SessionIdentity | None:
+    """Return the stable logical identity of one trusted presentation row."""
+
+    host_id = session.get("hostId")
+    kind = session.get("kind")
+    identifier = session.get("id")
+    if (
+        not isinstance(host_id, str)
+        or not host_id
+        or len(host_id) > 256
+        or not _HOST_ID.fullmatch(host_id)
+        or not isinstance(kind, str)
+        or kind not in PROVIDER_LABELS
+        or not isinstance(identifier, str)
+        or not identifier
+    ):
+        return None
+    pattern = engine.OPENCODE_ID_PATTERN if kind == "opencode" else engine.UUID_PATTERN
+    if pattern.fullmatch(identifier) is None:
+        return None
+    return host_id.casefold(), kind, identifier
+
+
+def _parse_selected_identity(raw: object) -> SessionIdentity | None:
+    """Parse only the row identity from untrusted callback metadata.
+
+    Automatic refresh callbacks must never treat ``ROFI_INFO`` as lifecycle or
+    authority data.  Invalid metadata simply disables the identity override;
+    Rofi's normal cursor fallback remains in charge.
+    """
+
+    if not isinstance(raw, str) or not raw or len(raw) > 64 * 1024:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return _session_identity(payload) if isinstance(payload, Mapping) else None
 
 
 def _recency_timestamp(value: object) -> float | None:
@@ -822,6 +863,7 @@ def _render_continuation(
     state: ContinuationState,
     *,
     navigation: NavigationState | None = None,
+    selected_identity: SessionIdentity | None = None,
     preserve: bool = False,
     preserve_filter: bool = False,
     clear_message: bool = True,
@@ -858,6 +900,7 @@ def _render_continuation(
     return render_snapshot(
         snapshot,
         message=message,
+        selected_identity=selected_identity,
         preserve=preserve,
         keep_filter=True if preserve_filter else None,
         timeout=timeout,
@@ -876,6 +919,7 @@ def render_snapshot(
     *,
     message: str = "",
     selected: Mapping[str, Any] | None = None,
+    selected_identity: SessionIdentity | None = None,
     preserve: bool = False,
     now: float | None = None,
     continuation: bool = False,
@@ -903,7 +947,7 @@ def render_snapshot(
     if keep_filter is None:
         keep_filter = preserve
     if keep_selection is None:
-        keep_selection = preserve or selected is not None
+        keep_selection = preserve or selected is not None or selected_identity is not None
     if keep_selection:
         # Rofi preserves the current filter and cursor across a script
         # callback when these headers are present.  This is especially useful
@@ -953,6 +997,13 @@ def render_snapshot(
     rendered_rows: list[str] = []
     emitted = 0
     rows = _sessions_for_navigation(sessions, navigation, snapshot)
+    selected_indices = [
+        index
+        for index, session in enumerate(rows)
+        if selected_identity is not None and _session_identity(session) == selected_identity
+    ]
+    if len(selected_indices) == 1 and keep_selection:
+        headers.append(_protocol("new-selection", selected_indices[0]))
     for session in rows:
         kind = str(session.get("kind") or "")
         info = selection_payload(session)
@@ -1250,6 +1301,7 @@ def _render_error_notice(
     snapshot: Mapping[str, Any] | None,
     message: str,
     *,
+    selected_identity: SessionIdentity | None = None,
     preserve: bool = False,
     continuation: bool = False,
     refresh_deadline: float | None = None,
@@ -1264,6 +1316,7 @@ def _render_error_notice(
     return render_snapshot(
         snapshot,
         message=message,
+        selected_identity=selected_identity,
         preserve=preserve,
         timeout=True,
         refresh_deadline=refresh_deadline,
@@ -1312,6 +1365,7 @@ def _auto_refresh_callback(
     rofi_data = environ.get("ROFI_DATA")
     continuation_state = _parse_continuation_state(rofi_data)
     navigation = continuation_state.navigation
+    selected_identity = _parse_selected_identity(environ.get("ROFI_INFO"))
     now = time.time()
     active_state = continuation_state.active(now)
     snapshot = _presentation_snapshot(store, config, context)
@@ -1319,6 +1373,7 @@ def _auto_refresh_callback(
         return _render_error_notice(
             None,
             f"Contract refresh failed: {sanitize(context.error)}",
+            selected_identity=selected_identity,
             preserve=True,
             continuation=True,
             refresh_deadline=active_state.refresh_deadline,
@@ -1347,6 +1402,7 @@ def _auto_refresh_callback(
             ):
                 return render_snapshot(
                     candidate,
+                    selected_identity=selected_identity,
                     preserve=True,
                     timeout=False,
                     clear_message=True,
@@ -1360,6 +1416,7 @@ def _auto_refresh_callback(
                 return render_snapshot(
                     candidate,
                     message=errors,
+                    selected_identity=selected_identity,
                     preserve=True,
                     timeout=True,
                     error_deadline=notice_deadline,
@@ -1369,6 +1426,7 @@ def _auto_refresh_callback(
                 )
             return render_snapshot(
                 candidate,
+                selected_identity=selected_identity,
                 preserve=True,
                 timeout=False,
                 clear_message=True,
@@ -1383,6 +1441,7 @@ def _auto_refresh_callback(
             return render_snapshot(
                 candidate,
                 message=error_message,
+                selected_identity=selected_identity,
                 preserve=True,
                 timeout=True,
                 error_deadline=error_deadline,
@@ -1399,6 +1458,7 @@ def _auto_refresh_callback(
                 return render_snapshot(
                     candidate,
                     message="Checked just now",
+                    selected_identity=selected_identity,
                     preserve=True,
                     timeout=True,
                     check_deadline=active_state.check_deadline,
@@ -1408,6 +1468,7 @@ def _auto_refresh_callback(
                 )
             return render_snapshot(
                 candidate,
+                selected_identity=selected_identity,
                 preserve=True,
                 timeout=False,
                 clear_message=True,
@@ -1422,6 +1483,7 @@ def _auto_refresh_callback(
             return render_snapshot(
                 candidate,
                 message="Checked just now",
+                selected_identity=selected_identity,
                 preserve=True,
                 timeout=True,
                 check_deadline=now + CHECK_NOTICE_SECONDS,
@@ -1431,6 +1493,7 @@ def _auto_refresh_callback(
             )
         return render_snapshot(
             candidate,
+            selected_identity=selected_identity,
             preserve=True,
             timeout=False,
             clear_message=True,
@@ -1461,6 +1524,7 @@ def _auto_refresh_callback(
         return render_snapshot(
             snapshot,
             message=error_message if notice_active else background_message,
+            selected_identity=selected_identity,
             preserve=True,
             timeout=True,
             refresh_deadline=deadline,
@@ -1480,6 +1544,7 @@ def _auto_refresh_callback(
             return _render_error_notice(
                 latest,
                 latest_message,
+                selected_identity=selected_identity,
                 preserve=True,
                 continuation=True,
                 navigation=navigation,
@@ -1490,6 +1555,7 @@ def _auto_refresh_callback(
         return render_snapshot(
             snapshot,
             message=error_message,
+            selected_identity=selected_identity,
             preserve=True,
             timeout=True,
             error_deadline=error_deadline,
@@ -1500,6 +1566,7 @@ def _auto_refresh_callback(
     if continuation_state.check_deadline is not None:
         return render_snapshot(
             snapshot,
+            selected_identity=selected_identity,
             preserve=True,
             timeout=False,
             clear_message=True,
@@ -1516,12 +1583,14 @@ def _auto_refresh_callback(
         return _render_error_notice(
             latest or snapshot,
             message,
+            selected_identity=selected_identity,
             preserve=True,
             continuation=True,
             navigation=navigation,
         )
     return render_snapshot(
         snapshot,
+        selected_identity=selected_identity,
         preserve=True,
         timeout=False,
         clear_message=True,
@@ -1551,6 +1620,11 @@ def run_rofi(
         return 0
     continuation_state = _parse_continuation_state(environ.get("ROFI_DATA"))
     navigation = continuation_state.navigation
+    callback_selection_identity = (
+        _parse_selected_identity(environ.get("ROFI_INFO"))
+        if retv in {ROFI_RETV_CUSTOM_1, ROFI_RETV_CUSTOM_19}
+        else None
+    )
     store = store or CacheStore()
     try:
         config = config or load_config()
@@ -1573,6 +1647,7 @@ def run_rofi(
                         if active.refresh_deadline
                         else ("Checked just now" if active.check_deadline else "")
                     ),
+                    selected_identity=callback_selection_identity,
                     preserve=True,
                     timeout=True if active.refresh_deadline or active.check_deadline else False,
                     refresh_deadline=active.refresh_deadline,
@@ -1591,6 +1666,7 @@ def run_rofi(
                     str(exc)
                     if active.refresh_deadline
                     else (continuation_state.error_message or str(exc)),
+                    selected_identity=callback_selection_identity,
                     preserve=True,
                     continuation=True,
                     refresh_deadline=active.refresh_deadline,
@@ -1671,6 +1747,7 @@ def run_rofi(
             _render_error_notice(
                 None,
                 f"Model setup failed: {sanitize(exc)}",
+                selected_identity=callback_selection_identity,
                 preserve=retv != 0,
                 continuation=retv != 0,
                 refresh_deadline=continuation_state.active().refresh_deadline,
@@ -1694,6 +1771,7 @@ def run_rofi(
                 _render_error_notice(
                     snapshot,
                     f"Contract refresh failed: {sanitize(context.error)}",
+                    selected_identity=callback_selection_identity,
                     preserve=retv != 0,
                     continuation=retv != 0,
                     refresh_deadline=continuation_state.active().refresh_deadline,
@@ -1707,6 +1785,7 @@ def run_rofi(
                 _render_error_notice(
                     None,
                     f"Contract refresh failed: {sanitize(exc)}",
+                    selected_identity=callback_selection_identity,
                     preserve=retv != 0,
                     continuation=retv != 0,
                     navigation=navigation,
@@ -1795,6 +1874,7 @@ def run_rofi(
             rendered = _render_error_notice(
                 None,
                 f"Refresh failed: {sanitize(exc)}",
+                selected_identity=callback_selection_identity,
                 preserve=True,
                 continuation=True,
                 refresh_deadline=continuation_state.active().refresh_deadline,
@@ -1820,6 +1900,7 @@ def run_rofi(
                     _render_error_notice(
                         snapshot,
                         "Unable to start background refresh",
+                        selected_identity=callback_selection_identity,
                         preserve=True,
                         continuation=True,
                         navigation=navigation,
@@ -1831,6 +1912,7 @@ def run_rofi(
                 render_snapshot(
                     snapshot,
                     message="Checking sessions…",
+                    selected_identity=callback_selection_identity,
                     preserve=True,
                     timeout=True,
                     refresh_deadline=deadline,
@@ -1850,6 +1932,7 @@ def run_rofi(
                 _render_error_notice(
                     snapshot,
                     message=f"Refresh failed: {sanitize(exc)}",
+                    selected_identity=callback_selection_identity,
                     preserve=True,
                     continuation=True,
                     refresh_deadline=continuation_state.active().refresh_deadline,

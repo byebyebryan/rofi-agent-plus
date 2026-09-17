@@ -1312,6 +1312,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("navigation:", cycled)
         self.assertIn("\x00keep-filter\x1ftrue", cycled)
         self.assertNotIn("\x00keep-selection\x1ftrue", cycled)
+        self.assertNotIn("\x00new-selection\x1f", cycled)
 
         local = NavigationState("local")
         cycled_right = invoke(ROFI_RETV_CUSTOM_2, local)
@@ -1320,6 +1321,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled_right)
         self.assertIn("\x00keep-filter\x1ftrue", cycled_right)
         self.assertNotIn("\x00keep-selection\x1ftrue", cycled_right)
+        self.assertNotIn("\x00new-selection\x1f", cycled_right)
 
         remote = NavigationState("host", "alpha")
         cycled_left = invoke(ROFI_RETV_CUSTOM_3, remote)
@@ -1328,6 +1330,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled_left)
         self.assertIn("\x00keep-filter\x1ftrue", cycled_left)
         self.assertNotIn("\x00keep-selection\x1ftrue", cycled_left)
+        self.assertNotIn("\x00new-selection\x1f", cycled_left)
         store.presentation_context.assert_not_called()
 
     def test_flat_host_lists_filter_scope_and_sort_newest_first(self) -> None:
@@ -2112,6 +2115,149 @@ class RofiProtocolTest(unittest.TestCase):
         _, rows = parse_rendered_records(rendered)
         _, options = parse_row_options(rows[0])
         self.assertNotIn("Checking", options["display"])
+
+    def test_refresh_completion_reselects_the_same_identity_after_rows_reorder(self) -> None:
+        selected = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="selected-before",
+            recencyAt=300,
+        )
+        current = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="selected-after",
+            recencyAt=100,
+        )
+        newer = session(name="newer", recencyAt=400)
+        snapshot = {"sessions": [current, newer], "errors": []}
+        store = mock.Mock(spec=CacheStore)
+        store.load.return_value = snapshot
+        store.is_fresh.return_value = True
+        output = io.StringIO()
+        with (
+            mock.patch("sys.stdout", output),
+            mock.patch("rofi_agent_plus.rofi.time.time", return_value=1000),
+        ):
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                    "ROFI_DATA": _refresh_data(1010),
+                    "ROFI_INFO": selection_payload(selected),
+                },
+                store=store,
+                config=self._config(),
+            )
+
+        headers, rows = parse_rendered_records(output.getvalue())
+        self.assertIn("\x00keep-selection\x1ftrue", headers)
+        self.assertIn("\x00new-selection\x1f1", headers)
+        self.assertEqual("newer", parse_row_options(rows[0])[0].split("  ·  ")[0])
+        selected_row = json.loads(parse_row_options(rows[1])[1]["info"])
+        self.assertEqual(
+            (selected["hostId"], selected["kind"], selected["id"]),
+            (selected_row["hostId"], selected_row["kind"], selected_row["id"]),
+        )
+
+    def test_refresh_selection_identity_degrades_without_a_unique_survivor(self) -> None:
+        selected = session(name="selected")
+        other = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="other",
+        )
+        cases: tuple[str, str | None, dict[str, object]] = (
+            ("missing", None, {"sessions": [selected], "errors": []}),
+            ("invalid json", "not-json", {"sessions": [selected], "errors": []}),
+            (
+                "invalid identity",
+                json.dumps({"hostId": "bad host", "kind": "codex", "id": THREAD_ID}),
+                {"sessions": [selected], "errors": []},
+            ),
+            (
+                "disappeared",
+                selection_payload(selected),
+                {"sessions": [other], "errors": []},
+            ),
+            (
+                "ambiguous",
+                selection_payload(selected),
+                {"sessions": [selected, dict(selected)], "errors": []},
+            ),
+        )
+        for name, info, snapshot in cases:
+            with self.subTest(name=name):
+                store = mock.Mock(spec=CacheStore)
+                store.load.return_value = snapshot
+                store.is_fresh.return_value = True
+                environ = {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                    "ROFI_DATA": _refresh_data(1010),
+                }
+                if info is not None:
+                    environ["ROFI_INFO"] = info
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output):
+                    run_rofi(environ, store=store, config=self._config())
+                headers, rows = parse_rendered_records(output.getvalue())
+                self.assertIn("\x00keep-selection\x1ftrue", headers)
+                self.assertNotIn("\x00new-selection\x1f", output.getvalue())
+                self.assertTrue(rows)
+
+    def test_refresh_continuations_keep_identity_for_polling_notices_and_stop(self) -> None:
+        selected = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="selected",
+            recencyAt=100,
+        )
+        newer = session(name="newer", recencyAt=400)
+        base = {"sessions": [selected, newer], "errors": []}
+        cases = (
+            ("polling", False, True, base),
+            (
+                "completion notice",
+                True,
+                False,
+                {**base, "errors": [{"host": "local", "stage": "active", "message": "offline"}]},
+            ),
+            (
+                "stopped",
+                False,
+                False,
+                {
+                    **base,
+                    "lastRefresh": {
+                        "attemptedAt": 900,
+                        "completedAt": None,
+                        "outcome": "failed",
+                    },
+                },
+            ),
+        )
+        for name, fresh, marker_active, snapshot in cases:
+            with self.subTest(name=name):
+                store = mock.Mock(spec=CacheStore)
+                store.load.return_value = snapshot
+                store.is_fresh.return_value = fresh
+                store.background_active.return_value = marker_active
+                output = io.StringIO()
+                with (
+                    mock.patch("sys.stdout", output),
+                    mock.patch("rofi_agent_plus.rofi.time.time", return_value=1000),
+                ):
+                    run_rofi(
+                        {
+                            "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                            "ROFI_DATA": _refresh_data(1010),
+                            "ROFI_INFO": selection_payload(selected),
+                        },
+                        store=store,
+                        config=self._config(),
+                    )
+                rendered = output.getvalue()
+                self.assertIn("\x00keep-selection\x1ftrue", rendered)
+                self.assertIn("\x00new-selection\x1f1", rendered)
 
     def test_completion_notice_persists_through_navigation_then_clears_on_expiry(self) -> None:
         selected = session(name="fresh", recencyAt=1000)
