@@ -1311,8 +1311,8 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled)
         self.assertIn("navigation:", cycled)
         self.assertIn("\x00keep-filter\x1ftrue", cycled)
-        self.assertNotIn("\x00keep-selection\x1ftrue", cycled)
-        self.assertNotIn("\x00new-selection\x1f", cycled)
+        self.assertIn("\x00keep-selection\x1ftrue", cycled)
+        self.assertIn("\x00new-selection\x1f0", cycled)
 
         local = NavigationState("local")
         cycled_right = invoke(ROFI_RETV_CUSTOM_2, local)
@@ -1320,8 +1320,8 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn(notice, cycled_right)
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled_right)
         self.assertIn("\x00keep-filter\x1ftrue", cycled_right)
-        self.assertNotIn("\x00keep-selection\x1ftrue", cycled_right)
-        self.assertNotIn("\x00new-selection\x1f", cycled_right)
+        self.assertIn("\x00keep-selection\x1ftrue", cycled_right)
+        self.assertIn("\x00new-selection\x1f0", cycled_right)
 
         remote = NavigationState("host", "alpha")
         cycled_left = invoke(ROFI_RETV_CUSTOM_3, remote)
@@ -1329,9 +1329,28 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn(notice, cycled_left)
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled_left)
         self.assertIn("\x00keep-filter\x1ftrue", cycled_left)
-        self.assertNotIn("\x00keep-selection\x1ftrue", cycled_left)
-        self.assertNotIn("\x00new-selection\x1f", cycled_left)
+        self.assertIn("\x00keep-selection\x1ftrue", cycled_left)
+        self.assertIn("\x00new-selection\x1f0", cycled_left)
         store.presentation_context.assert_not_called()
+
+    def test_navigation_failure_resets_selection_and_rearms_the_next_callback(self) -> None:
+        store = mock.Mock(spec=CacheStore)
+        store.load.side_effect = RuntimeError("cache unavailable")
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_2),
+                    "ROFI_DATA": _navigation_data(NavigationState()),
+                },
+                store=store,
+                config=self._config(),
+            )
+        rendered = output.getvalue()
+        self.assertIn("Navigation failed", rendered)
+        self.assertIn("\x00keep-filter\x1ftrue", rendered)
+        self.assertIn("\x00keep-selection\x1ftrue", rendered)
+        self.assertIn("\x00new-selection\x1f0", rendered)
 
     def test_flat_host_lists_filter_scope_and_sort_newest_first(self) -> None:
         sessions = [
@@ -1561,7 +1580,8 @@ class RofiProtocolTest(unittest.TestCase):
             self.assertIn(f"\x00prompt\x1fAgents › {expected}", rendered)
             self.assertIn("background-refresh:1010;error-notice:1003:", rendered)
             self.assertIn("\x00keep-filter\x1ftrue", rendered)
-            self.assertNotIn("\x00keep-selection\x1ftrue", rendered)
+            self.assertIn("\x00keep-selection\x1ftrue", rendered)
+            self.assertIn("\x00new-selection\x1f0", rendered)
 
     def test_escape_migration_guard_always_closes_without_work(self) -> None:
         for state in (
@@ -1928,6 +1948,26 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("\x00keep-selection\x1ftrue", output.getvalue())
         self.assertIn("\x00keep-filter\x1ftrue", output.getvalue())
 
+    def test_initial_fresh_and_stale_rows_arm_selection_before_first_callback(self) -> None:
+        snapshot = {"sessions": [session()], "errors": []}
+        for fresh in (True, False):
+            with self.subTest(fresh=fresh):
+                store = mock.Mock(spec=CacheStore)
+                store.load.return_value = snapshot
+                store.is_fresh.return_value = fresh
+                store.spawn_background.return_value = True
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output):
+                    run_rofi({"ROFI_RETV": "0"}, store=store, config=self._config())
+
+                headers, rows = parse_rendered_records(output.getvalue())
+                self.assertTrue(rows)
+                self.assertIn("\x00keep-selection\x1ftrue", headers)
+                if fresh:
+                    store.spawn_background.assert_not_called()
+                else:
+                    store.spawn_background.assert_called_once()
+
     def test_stale_mode_renders_immediately_and_starts_one_background_refresh(self) -> None:
         store = mock.Mock(spec=CacheStore)
         store.load.return_value = {"sessions": [session()], "errors": []}
@@ -2290,7 +2330,8 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("Agents › Local", navigated)
         self.assertIn(f"{CHECK_NOTICE_DATA_PREFIX}1002", navigated)
         self.assertIn("\x00keep-filter\x1ftrue", navigated)
-        self.assertNotIn("\x00keep-selection\x1ftrue", navigated)
+        self.assertIn("\x00keep-selection\x1ftrue", navigated)
+        self.assertIn("\x00new-selection\x1f0", navigated)
 
         output = io.StringIO()
         with (

@@ -864,6 +864,7 @@ def _render_continuation(
     *,
     navigation: NavigationState | None = None,
     selected_identity: SessionIdentity | None = None,
+    reset_selection: bool = False,
     preserve: bool = False,
     preserve_filter: bool = False,
     clear_message: bool = True,
@@ -901,6 +902,7 @@ def _render_continuation(
         snapshot,
         message=message,
         selected_identity=selected_identity,
+        reset_selection=reset_selection,
         preserve=preserve,
         keep_filter=True if preserve_filter else None,
         timeout=timeout,
@@ -932,6 +934,7 @@ def render_snapshot(
     navigation: NavigationState | None = None,
     keep_filter: bool | None = None,
     keep_selection: bool | None = None,
+    reset_selection: bool = False,
 ) -> str:
     """Render a snapshot as Rofi script headers and rows."""
 
@@ -947,7 +950,10 @@ def render_snapshot(
     if keep_filter is None:
         keep_filter = preserve
     if keep_selection is None:
-        keep_selection = preserve or selected is not None or selected_identity is not None
+        # Rofi snapshots this header before running the next script callback.
+        # Arm it on the ordinary render so the first timeout or manual refresh
+        # can apply a stable identity override to the rows it returns.
+        keep_selection = True
     if keep_selection:
         # Rofi preserves the current filter and cursor across a script
         # callback when these headers are present.  This is especially useful
@@ -1002,7 +1008,9 @@ def render_snapshot(
         for index, session in enumerate(rows)
         if selected_identity is not None and _session_identity(session) == selected_identity
     ]
-    if len(selected_indices) == 1 and keep_selection:
+    if reset_selection:
+        headers.append(_protocol("new-selection", 0))
+    elif len(selected_indices) == 1 and keep_selection:
         headers.append(_protocol("new-selection", selected_indices[0]))
     for session in rows:
         kind = str(session.get("kind") or "")
@@ -1310,6 +1318,7 @@ def _render_error_notice(
     navigation: NavigationState | None = None,
     keep_filter: bool | None = None,
     keep_selection: bool | None = None,
+    reset_selection: bool = False,
 ) -> str:
     """Render a user-visible error with a bounded, self-clearing timeout."""
 
@@ -1328,6 +1337,7 @@ def _render_error_notice(
         navigation=navigation,
         keep_filter=keep_filter,
         keep_selection=keep_selection,
+        reset_selection=reset_selection,
     )
 
 
@@ -1702,6 +1712,7 @@ def run_rofi(
                 continuation_state,
                 navigation=next_navigation,
                 preserve_filter=True,
+                reset_selection=True,
             )
         except Exception as exc:  # noqa: BLE001 - structural callback boundary
             rendered = _render_error_notice(
@@ -1713,7 +1724,8 @@ def run_rofi(
                 check_deadline=continuation_state.active().check_deadline,
                 navigation=next_navigation,
                 keep_filter=True,
-                keep_selection=False,
+                keep_selection=True,
+                reset_selection=True,
             )
         print(rendered, end="")
         return 0
