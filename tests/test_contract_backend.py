@@ -584,17 +584,23 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
 
     def test_composite_probe_reaps_timed_out_child_and_preserves_siblings(self) -> None:
         slow_active = "import time; time.sleep(10)"
-        with mock.patch("rofi_agent_plus.contract_backend._ACTIVE_PROBE", slow_active):
+        healthy = 'print("{\\"installed\\":false,\\"sessions\\":[]}")'
+        with (
+            mock.patch("rofi_agent_plus.contract_backend._ACTIVE_PROBE", slow_active),
+            mock.patch("rofi_agent_plus.contract_backend.CLAUDE_SESSION_PROBE", healthy),
+            mock.patch("rofi_agent_plus.contract_backend.OPENCODE_SESSION_PROBE", healthy),
+        ):
             started = time.monotonic()
             command = _run_bounded(
-                [sys.executable, "-", "0.05", "1"],
+                [sys.executable, "-", "1", "1"],
                 input_data=_composite_probe_input(),
-                timeout=2,
+                timeout=4,
                 stdout_limit=512 * 1024,
             )
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLess(time.monotonic() - started, 3.0)
         active, claude, opencode = _composite_results(command)
         self.assertIsInstance(active, ContractError)
+        self.assertIn("timed_out", str(active))
         self.assertIsInstance(claude, dict)
         self.assertIsInstance(opencode, dict)
 
