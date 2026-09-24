@@ -1523,13 +1523,9 @@ def _auto_refresh_callback(
     if marker_active:
         if deadline is None:
             deadline = now + AUTO_REFRESH_MAX_SECONDS
-        if snapshot is None:
-            background_message = "Checking sessions…"
-        else:
-            # Errors in a stale snapshot belong to the previous refresh.  A
-            # current error notice is emitted once the new worker snapshot is
-            # fresh, so keep the polling status unambiguous here.
-            background_message = "Checking sessions…"
+        # Errors in a stale snapshot belong to the previous refresh. A current
+        # error notice is emitted once the new worker snapshot is fresh.
+        background_message = "Checking sessions…"
         notice_active = error_deadline is not None and now < error_deadline and bool(error_message)
         return render_snapshot(
             snapshot,

@@ -133,6 +133,27 @@ def _safe_mode(path: Path, mode: int) -> None:
             pass
 
 
+def _atomic_write_private(path: Path, content: str, prefix: str) -> None:
+    """Persist one private cache record with the same durability guarantees."""
+
+    descriptor, temporary = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        _safe_mode(path, 0o600)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _as_session_key(session: Mapping[str, Any]) -> tuple[str, str, str]:
     return (
         str(session.get("hostId") or session.get("windowHost") or session.get("host") or "local"),
@@ -1057,22 +1078,7 @@ class CacheStore:
         if snapshot.get("version") == _PREVIOUS_CACHE_VERSION:
             persisted = _migrate_v3_snapshot(snapshot)
         encoded = json.dumps(persisted, ensure_ascii=False, separators=(",", ":"))
-        descriptor, temporary = tempfile.mkstemp(prefix=".snapshot.", suffix=".tmp", dir=self.root)
-        temporary_path = Path(temporary)
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(encoded)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, self.snapshot_path)
-            _safe_mode(self.snapshot_path, 0o600)
-        finally:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+        _atomic_write_private(self.snapshot_path, encoded, ".snapshot.")
 
     def reconcile_contract_reference(
         self,
@@ -1369,22 +1375,8 @@ class CacheStore:
             return None
 
     def _write_marker(self, payload: Mapping[str, object]) -> None:
-        descriptor, temporary = tempfile.mkstemp(prefix=".refresh.", suffix=".tmp", dir=self.root)
-        temporary_path = Path(temporary)
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, separators=(",", ":"))
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, self.background_path)
-            _safe_mode(self.background_path, 0o600)
-        finally:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+        encoded = json.dumps(payload, separators=(",", ":"))
+        _atomic_write_private(self.background_path, encoded, ".refresh.")
 
     def _clear_marker_if_owned(self, owner: str, scope: Mapping[str, object] | None) -> None:
         payload = self._read_marker()
