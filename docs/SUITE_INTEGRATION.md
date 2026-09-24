@@ -2,12 +2,12 @@
 
 Status: the P7 contract-only cutover and guarded-open performance follow-up are
 complete in version `0.3.0`; the P8 flat-scope navigation implementation is
-complete in version `0.4.0`. The coordinated P8 cutover is published and
-deployed, with operator acceptance complete on Snap and Starship; Carbon is in
-a daily-drive soak for the published suite/P9 behavior. P9 locked CLI
-contracts are implemented here as an independent consumer with exact released
-producer provenance; managed suite
-deployment is coordinated through chezmoi.
+complete in version `0.4.0`. The coordinated P8 cutover was published and
+accepted on Snap and Starship. P9 locked CLI contracts are implemented here as
+an independent consumer with exact released producer provenance. Current
+deployment targets and acceptance are recorded in the managed dotfiles
+[Rofi Plus status ledger](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md);
+suite deployment is coordinated through chezmoi.
 Agent Plus consumes Tmux Session v1 through its public process contract on every
 product path; Tmux Plus is mandatory. It consumes
 Host Mesh v1 when SSH Plus is available and otherwise uses the shared
