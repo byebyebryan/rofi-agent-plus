@@ -526,12 +526,12 @@ def _action_hint(action: str) -> str:
         if candidate == action:
             label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
         labels.append(label)
-    return f"Enter: {' · '.join(labels)}\u2028Tab: Cycle actions"
+    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions"
 
 
 def _action_message(action: str, notice: str) -> str:
     hint = _action_hint(action)
-    return f"{hint}\u2028{_pango_escape(notice)}" if notice else hint
+    return f"{hint}\u2028\u2028{_pango_escape(notice)}" if notice else hint
 
 
 def _action_data(action: str) -> str:

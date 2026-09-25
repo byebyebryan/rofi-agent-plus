@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.6.3` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.6.4` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -50,9 +50,9 @@ The picker opens in `Agents › All`, a mixed newest-first list, with `Resume`
 as its action. Up and Down move through rows. `Tab` switches the action from
 `Resume` to `New session here`; `Shift+Tab` cycles in reverse, with wraparound.
 The prompt shows the host scope; the persistent message below the filter shows
-`Enter:` with both actions and highlights the selected one. A second line shows
-`Tab: Cycle actions`, and any notice follows on its own line. Enter applies
-that action to the row highlighted at Enter. Left
+`Enter:` with both actions and highlights the selected one. A divider separates
+`Tab: Cycle actions` on the same line, and any notice follows after a blank
+line. Enter applies that action to the row highlighted at Enter. Left
 and Right cycle `All`, `Local`, and the remote hosts in stable Host Mesh order.
 Escape and `Ctrl+G` use Rofi's
 native cancel path and always close. View changes preserve the filter and reset
