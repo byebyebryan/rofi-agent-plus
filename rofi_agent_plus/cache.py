@@ -1188,6 +1188,7 @@ class CacheStore:
         context: PresentationContext | None = None,
         deadline: float | None = None,
         host_ids: tuple[str, ...] | None = None,
+        retry_stale_mesh: bool = True,
     ) -> dict[str, Any]:
         """Synchronously refresh, with bounded lock waiting and safe fallback."""
 
@@ -1255,6 +1256,11 @@ class CacheStore:
                     kwargs["deadline"] = deadline
                 if host_ids is not None:
                     kwargs["host_ids"] = host_ids
+                if not retry_stale_mesh:
+                    # A guarded lifecycle action needs the typed stale-Mesh
+                    # result itself so it can refresh the whole authority
+                    # before deciding whether a source row is still usable.
+                    kwargs["retry_stale_mesh"] = False
                 return iter(selected_backend.stream(discovery_config, **kwargs))  # type: ignore[union-attr]
 
             discover = backend_discover

@@ -12,12 +12,13 @@ import time
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Protocol
 
 from . import engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig
-from .contract_backend import CommandOutput, select_backend
+from .contract_backend import CommandOutput, StaleMeshError, select_backend
 from .wire import WireError, decode_document, validate_string_bounds
 
 _SCHEMA_VERSION = 1
@@ -181,8 +182,17 @@ def _provider_row(
     snapshot: Mapping[str, object],
     identity: Mapping[str, object],
     selection: Mapping[str, object],
+    *,
+    require_tmux_and_activity_evidence: bool = True,
 ) -> dict[str, object]:
-    """Resolve one fresh row solely by authority, host, provider, and ID."""
+    """Resolve one fresh provider row by authority, host, provider, and ID.
+
+    Resume needs its old wrapper's current Tmux and activity evidence before
+    it can focus, attach, or decide to create a provider-resume wrapper. A
+    fresh native provider launch only needs the provider's current source
+    identity and directory, so it deliberately does not inherit those old
+    wrapper requirements.
+    """
 
     if _backend_identity(selection.get("backend")) != dict(identity):
         raise LifecycleError(
@@ -219,13 +229,6 @@ def _provider_row(
             "operation_failed", "selected provider session is no longer unambiguous"
         )
     row = matched[0]
-    if row.get("tmuxStale") or row.get("tmuxAmbiguous"):
-        raise LifecycleError(
-            "operation_failed", "selected session has stale or ambiguous tmux state"
-        )
-    activity = row.get("activityState")
-    if activity == "unknown":
-        raise LifecycleError("operation_failed", "selected session has unknown provider activity")
     errors = snapshot.get("errors")
     stale_stages = {"codex": "threads", "claude": "claude", "opencode": "opencode"}
     if isinstance(errors, list):
@@ -234,14 +237,28 @@ def _provider_row(
             for error in errors
             if isinstance(error, Mapping) and error.get("host") == host_id
         }
-        # A normal ``tmux_missing`` observation is authoritative capability
-        # data and a provider wrapper may safely be created there.  A generic
-        # tmux-stage error is not: an absent association then means unknown,
-        # not proof that no compatible wrapper already exists.
-        if "tmux" in host_stages:
-            raise LifecycleError("operation_failed", "selected host has unknown tmux inventory")
-        if {"active", stale_stages[str(kind)]} & host_stages:
+        if stale_stages[str(kind)] in host_stages:
             raise LifecycleError("operation_failed", "selected session has stale provider state")
+        if require_tmux_and_activity_evidence:
+            # A normal ``tmux_missing`` observation is authoritative
+            # capability data and a provider wrapper may safely be created
+            # there. A generic tmux-stage error is not: an absent association
+            # then means unknown, not proof that no compatible wrapper exists.
+            if "tmux" in host_stages:
+                raise LifecycleError("operation_failed", "selected host has unknown tmux inventory")
+            if "active" in host_stages:
+                raise LifecycleError(
+                    "operation_failed", "selected session has stale provider state"
+                )
+    if require_tmux_and_activity_evidence:
+        if row.get("tmuxStale") or row.get("tmuxAmbiguous"):
+            raise LifecycleError(
+                "operation_failed", "selected session has stale or ambiguous tmux state"
+            )
+        if row.get("activityState") == "unknown":
+            raise LifecycleError(
+                "operation_failed", "selected session has unknown provider activity"
+            )
     return row
 
 
@@ -596,6 +613,33 @@ def _display_name(row: Mapping[str, object], identifier: str) -> str:
     return identifier
 
 
+def _absolute_provider_cwd(value: object) -> str | None:
+    """Accept only the exact absolute cwd reported by a provider refresh."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_FIELD
+        or any(unicodedata.category(char).startswith("C") for char in value)
+        or not PurePosixPath(value).is_absolute()
+    ):
+        return None
+    return value
+
+
+def _new_session_wrapper_name(cwd: str, kind: str, attempt: int) -> str:
+    """Build a bounded ``directory-provider[-N]`` Tmux wrapper name."""
+
+    basename = PurePosixPath(cwd).name or "root"
+    stem = re.sub(r"[^A-Za-z0-9]+", "-", basename).strip("-") or "cwd"
+    suffix = "" if attempt == 0 else f"-{attempt + 1}"
+    maximum_stem = 96 - len(kind) - len(suffix) - 1
+    candidate = f"{stem[:maximum_stem]}-{kind}{suffix}"
+    if not _NAME.fullmatch(candidate):
+        raise LifecycleError("operation_failed", "cannot build a safe tmux wrapper name")
+    return candidate
+
+
 class ContractLifecycle:
     """Revalidate and hand an Agent Plus selection to Tmux Plus exactly once."""
 
@@ -624,7 +668,12 @@ class ContractLifecycle:
         self.deadline = time.monotonic() + timeout
 
     def _refresh_row(
-        self, selection: Mapping[str, object], *, whole_mesh: bool = False
+        self,
+        selection: Mapping[str, object],
+        *,
+        whole_mesh: bool = False,
+        propagate_stale_mesh: bool = False,
+        source_only: bool = False,
     ) -> dict[str, object]:
         try:
             host_id = selection.get("hostId")
@@ -657,13 +706,21 @@ class ContractLifecycle:
                 context=context,
                 deadline=self.deadline,
                 host_ids=None if whole_mesh else (host_id,),
+                retry_stale_mesh=not propagate_stale_mesh,
             )
+        except StaleMeshError as error:
+            raise LifecycleError("stale_mesh", str(error)) from error
         except engine.PickerError as error:
             raise LifecycleError("operation_failed", str(error)) from error
         lookup = dict(selection)
         if whole_mesh:
             lookup["backend"] = dict(self.identity)
-        return _provider_row(snapshot, self.identity, lookup)
+        return _provider_row(
+            snapshot,
+            self.identity,
+            lookup,
+            require_tmux_and_activity_evidence=not source_only,
+        )
 
     def _reconcile(
         self,
@@ -749,6 +806,135 @@ class ContractLifecycle:
         raise LifecycleError(
             "operation_failed", "could not choose a collision-free tmux wrapper name"
         )
+
+    def _new_session_row(
+        self,
+        selection: Mapping[str, object],
+        *,
+        whole_mesh: bool = False,
+    ) -> tuple[dict[str, object], str]:
+        """Refresh and validate the exact current source for a new session."""
+
+        selected_cwd = _absolute_provider_cwd(selection.get("cwd"))
+        if selected_cwd is None:
+            raise LifecycleError(
+                "operation_failed", "selected session has no absolute provider-reported directory"
+            )
+        row = self._refresh_row(
+            selection,
+            whole_mesh=whole_mesh,
+            propagate_stale_mesh=True,
+            source_only=True,
+        )
+        if row.get("sourceObservation") != "current":
+            raise LifecycleError(
+                "operation_failed", "selected session no longer has current provider evidence"
+            )
+        refreshed_cwd = _absolute_provider_cwd(row.get("cwd"))
+        if refreshed_cwd is None:
+            raise LifecycleError(
+                "operation_failed", "selected session no longer has an absolute provider directory"
+            )
+        if refreshed_cwd != selected_cwd:
+            raise LifecycleError(
+                "operation_failed", "selected session directory changed; choose it again"
+            )
+        return row, refreshed_cwd
+
+    def _preflight_new_session(
+        self,
+        selection: Mapping[str, object],
+        cwd: str,
+    ) -> None:
+        """Check the target directory and bare provider executable pre-action."""
+
+        kind = selection.get("kind")
+        host_id = selection.get("hostId")
+        if kind not in _PROVIDER_OPTIONS or not isinstance(host_id, str):
+            raise LifecycleError("operation_failed", "selected provider session is invalid")
+        executable = _PROVIDER_OPTIONS[str(kind)][2]
+        preflight = getattr(self.backend, "preflight_provider_launch", None)
+        if not callable(preflight):
+            raise LifecycleError("operation_failed", "provider launch preflight is unavailable")
+        try:
+            preflight(host_id, executable, cwd, deadline=self.deadline)
+        except StaleMeshError as error:
+            raise LifecycleError("stale_mesh", str(error)) from error
+        except (engine.PickerError, OSError) as error:
+            raise LifecycleError("operation_failed", str(error)) from error
+
+    def _create_new_session(
+        self,
+        selection: Mapping[str, object],
+        cwd: str,
+    ) -> StableReference:
+        """Create a fresh native provider shell without touching the source row."""
+
+        host_id = str(selection["hostId"])
+        kind = str(selection["kind"])
+        executable = _PROVIDER_OPTIONS[kind][2]
+        revision = self.identity["meshRevision"]
+        for collision in range(_MAX_CREATE_COLLISIONS):
+            argv = [
+                self.backend.tmux_command,
+                "create",
+                "--json",
+                "--host",
+                host_id,
+            ]
+            if revision is not None:
+                argv.extend(("--mesh-revision", str(revision)))
+            argv.extend(
+                (
+                    "--name",
+                    _new_session_wrapper_name(cwd, kind, collision),
+                    "--cwd",
+                    cwd,
+                    "--defer-until-attached",
+                    "--open",
+                    "--",
+                    executable,
+                )
+            )
+            try:
+                return _run_json(
+                    self.backend,
+                    argv,
+                    self.deadline,
+                    host_id,
+                    revision,
+                    opening=True,
+                )
+            except LifecycleError as error:
+                if error.code == "session_exists" and collision + 1 < _MAX_CREATE_COLLISIONS:
+                    continue
+                raise
+        raise LifecycleError(
+            "operation_failed", "could not choose a collision-free tmux wrapper name"
+        )
+
+    def new_session_here(self, selection: Mapping[str, object]) -> None:
+        """Start a fresh provider TUI beside the selected native session.
+
+        Resume's existing fast/open/create lifecycle intentionally stays out
+        of this path.  A new provider process has no provider session ID or
+        provider-specific Tmux option until its own TUI persists one.
+        """
+
+        def attempt(*, whole_mesh: bool) -> None:
+            _row, cwd = self._new_session_row(selection, whole_mesh=whole_mesh)
+            self._preflight_new_session(selection, cwd)
+            self._create_new_session(selection, cwd)
+
+        try:
+            attempt(whole_mesh=False)
+        except LifecycleError as error:
+            if error.code != "stale_mesh":
+                raise
+            # A typed stale-Mesh response is pre-action.  Re-observe the
+            # complete authority exactly once, then prove the same source row
+            # still has current evidence and the same provider-reported cwd.
+            attempt(whole_mesh=True)
 
     def open_or_create(self, selection: Mapping[str, object]) -> None:
         row = self._refresh_row(selection)

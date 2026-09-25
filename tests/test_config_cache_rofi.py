@@ -18,6 +18,8 @@ from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, PresentationContext
 from rofi_agent_plus.config import ConfigError, PickerConfig, config_from_mapping, load_config
 from rofi_agent_plus.contract_lifecycle import LifecycleError
 from rofi_agent_plus.rofi import (
+    ACTION_NEW,
+    ACTION_RESUME,
     AUTO_REFRESH_DATA_PREFIX,
     CHECK_NOTICE_DATA_PREFIX,
     ERROR_NOTICE_DATA_PREFIX,
@@ -32,9 +34,12 @@ from rofi_agent_plus.rofi import (
     ROFI_RETV_CUSTOM_2,
     ROFI_RETV_CUSTOM_3,
     ROFI_RETV_CUSTOM_6,
+    ROFI_RETV_CUSTOM_7,
+    ROFI_RETV_CUSTOM_8,
     ROFI_RETV_CUSTOM_19,
     ROW_SEPARATOR,
     NavigationState,
+    _action_data,
     _age,
     _background_command,
     _navigation_data,
@@ -187,7 +192,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.5.4", engine.VERSION)
+        self.assertEqual("0.6.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -219,16 +224,18 @@ class ProjectMetadataTest(unittest.TestCase):
                 self.assertIn(phrase, readme)
         self.assertNotIn("`Refreshing in background`", readme)
 
-    def test_readme_keeps_tab_for_rows_and_left_right_for_views(self) -> None:
+    def test_readme_documents_action_and_host_scope_bindings(self) -> None:
         readme = (self.root / "README.md").read_text()
         self.assertIn("-kb-custom-2 Right -kb-custom-3 Left", readme)
+        self.assertIn("-kb-custom-7 Tab -kb-custom-8 ISO_Left_Tab", readme)
+        self.assertIn('-kb-element-next "" -kb-element-prev ""', readme)
+        self.assertIn('-kb-accept-custom "" -kb-delete-entry ""', readme)
         self.assertIn("-kb-cancel Escape,Control+g", readme)
-        self.assertIn("`Tab` and `Shift+Tab` use Rofi's normal row navigation", readme)
+        self.assertIn("`Tab` switches the action from", readme)
+        self.assertIn("`Resume` to `New session here`", readme)
         self.assertNotIn("-kb-custom-4 Tab", readme)
         self.assertNotIn("-kb-custom-5 ISO_Left_Tab", readme)
         self.assertNotIn("-kb-custom-6 Escape", readme)
-        self.assertNotIn("-kb-element-next", readme)
-        self.assertNotIn("-kb-element-prev", readme)
         self.assertNotIn("compatibility aliases for next/previous view", readme)
 
     def test_runtime_dependencies_are_empty_and_optional_providers_are_documented(self) -> None:
@@ -1333,6 +1340,242 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("\x00new-selection\x1f0", cycled_left)
         store.presentation_context.assert_not_called()
 
+    def test_action_cycle_wraps_preserves_identity_and_only_reads_cache(self) -> None:
+        selected = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="selected",
+            recencyAt=100,
+        )
+        newer = session(name="newer", recencyAt=200)
+        store = mock.Mock(spec=CacheStore)
+        store.load.return_value = {"sessions": [selected, newer], "errors": []}
+
+        def invoke(retv: int, action: str) -> str:
+            output = io.StringIO()
+            with (
+                mock.patch("rofi_agent_plus.rofi.time.time", return_value=1000),
+                mock.patch("sys.stdout", output),
+            ):
+                self.assertEqual(
+                    0,
+                    run_rofi(
+                        {
+                            "ROFI_RETV": str(retv),
+                            "ROFI_INFO": selection_payload(selected),
+                            "ROFI_DATA": _refresh_data(
+                                1010,
+                                1003,
+                                "Refresh errors: alpha/claude: offline",
+                                action=action,
+                            ),
+                        },
+                        store=store,
+                        config=self._config(),
+                    ),
+                )
+            return output.getvalue()
+
+        new_action = invoke(ROFI_RETV_CUSTOM_7, ACTION_RESUME)
+        self.assertIn("Agents › All · New session here", new_action)
+        self.assertIn("Enter: New session here · Tab: Resume · Shift+Tab: reverse", new_action)
+        self.assertIn("Refresh errors: alpha/claude: offline", new_action)
+        self.assertIn(_action_data(ACTION_NEW), new_action)
+        self.assertIn("\x00keep-filter\x1ftrue", new_action)
+        self.assertIn("\x00keep-selection\x1ftrue", new_action)
+        self.assertIn("\x00new-selection\x1f1", new_action)
+
+        resumed = invoke(ROFI_RETV_CUSTOM_8, ACTION_NEW)
+        self.assertIn("Agents › All · Resume", resumed)
+        self.assertIn("Enter: Resume · Tab: New session here · Shift+Tab: reverse", resumed)
+        self.assertIn(_action_data(ACTION_RESUME), resumed)
+        store.presentation_context.assert_not_called()
+        store.refresh.assert_not_called()
+        store.spawn_background.assert_not_called()
+
+    def test_new_action_survives_scope_refresh_and_manual_refresh_callbacks(self) -> None:
+        selected = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            host="alpha",
+            hostId="alpha",
+        )
+        snapshot = {
+            "sessions": [selected],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {"alpha": {"sessions": [selected], "errors": []}},
+            "errors": [],
+        }
+        data = _refresh_data(1010, navigation=NavigationState(), action=ACTION_NEW)
+
+        scope_store = mock.Mock(spec=CacheStore)
+        scope_store.load.return_value = snapshot
+        scope_output = io.StringIO()
+        with mock.patch("sys.stdout", scope_output):
+            run_rofi(
+                {"ROFI_RETV": str(ROFI_RETV_CUSTOM_2), "ROFI_DATA": data},
+                store=scope_store,
+                config=self._config(),
+            )
+        self.assertIn("Agents › Local · New session here", scope_output.getvalue())
+        self.assertIn(_action_data(ACTION_NEW), scope_output.getvalue())
+        scope_store.presentation_context.assert_not_called()
+
+        config = self._config()
+        context = PresentationContext(config.fingerprint, selected["backend"], selected=object())
+        refresh_store = mock.Mock(spec=CacheStore)
+        refresh_store.presentation_context.return_value = context
+        refresh_store.load_current.return_value = snapshot
+        refresh_store.is_fresh.return_value = True
+        refresh_store.cache_scope.return_value = {"fingerprint": config.fingerprint}
+        refresh_store.spawn_background.return_value = True
+
+        auto_output = io.StringIO()
+        with mock.patch("sys.stdout", auto_output):
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                    "ROFI_DATA": data,
+                    "ROFI_INFO": selection_payload(selected),
+                },
+                store=refresh_store,
+                config=config,
+            )
+        self.assertIn("Agents › All · New session here", auto_output.getvalue())
+        self.assertIn(_action_data(ACTION_NEW), auto_output.getvalue())
+        self.assertIn("\x00new-selection\x1f0", auto_output.getvalue())
+
+        manual_output = io.StringIO()
+        with mock.patch("sys.stdout", manual_output):
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_1),
+                    "ROFI_DATA": data,
+                    "ROFI_INFO": selection_payload(selected),
+                },
+                store=refresh_store,
+                config=config,
+            )
+        self.assertIn("Agents › All · New session here", manual_output.getvalue())
+        self.assertIn(_action_data(ACTION_NEW), manual_output.getvalue())
+        refresh_store.spawn_background.assert_called_once()
+
+    def test_malformed_action_blocks_enter_visibly(self) -> None:
+        selected = session()
+        config = self._config()
+        context = PresentationContext(config.fingerprint, selected["backend"], selected=object())
+        store = mock.Mock(spec=CacheStore)
+        store.presentation_context.return_value = context
+        store.load_current.return_value = {"sessions": [selected], "errors": []}
+        output = io.StringIO()
+        with (
+            mock.patch("rofi_agent_plus.rofi.fast_open_selection") as fast_open,
+            mock.patch("rofi_agent_plus.rofi._open_selection") as resume,
+            mock.patch("rofi_agent_plus.rofi._new_session_selection") as new_session,
+            mock.patch("sys.stdout", output),
+        ):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_INFO": selection_payload(selected),
+                        "ROFI_DATA": "action:not-json",
+                    },
+                    store=store,
+                    config=config,
+                ),
+            )
+        self.assertIn("Invalid Agent action state", output.getvalue())
+        self.assertIn("Agents › All · Resume", output.getvalue())
+        fast_open.assert_not_called()
+        resume.assert_not_called()
+        new_session.assert_not_called()
+
+    def test_new_action_dispatches_the_current_row_without_resume_fast_path(self) -> None:
+        selected = session(
+            backend={
+                "kind": "contract",
+                "capability": "host-mesh-v1+tmux-session-v1",
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
+            },
+            providerOptionVerified=True,
+            tmux={
+                "meshRevision": "sha256:c932eaa7fc77de0590085a5916d5ea823eccce0ba22157f091549ed9ad5c1262",
+                "serverGeneration": "tmux-v1:remote",
+                "sessionId": "$4",
+                "createdAt": 5,
+                "observedName": "agent",
+            },
+        )
+        config = self._config()
+        context = PresentationContext(config.fingerprint, selected["backend"], selected=object())
+        store = mock.Mock(spec=CacheStore)
+        store.presentation_context.return_value = context
+        store.load_current.return_value = {"sessions": [selected], "errors": []}
+        with (
+            mock.patch("rofi_agent_plus.rofi.fast_open_selection") as fast_open,
+            mock.patch("rofi_agent_plus.rofi._open_selection") as resume,
+            mock.patch("rofi_agent_plus.rofi._new_session_selection") as new_session,
+            mock.patch("sys.stdout", new=io.StringIO()),
+        ):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_INFO": selection_payload(selected),
+                        "ROFI_DATA": _action_data(ACTION_NEW),
+                    },
+                    store=store,
+                    config=config,
+                ),
+            )
+        fast_open.assert_not_called()
+        resume.assert_not_called()
+        new_session.assert_called_once_with(
+            json.loads(selection_payload(selected)), config, store=store, context=context
+        )
+
+    def test_new_action_failure_returns_to_resume(self) -> None:
+        selected = session()
+        newer = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="newer",
+            recencyAt=200,
+        )
+        config = self._config()
+        context = PresentationContext(config.fingerprint, selected["backend"], selected=object())
+        store = mock.Mock(spec=CacheStore)
+        store.presentation_context.return_value = context
+        store.load_current.return_value = {"sessions": [selected, newer], "errors": []}
+        output = io.StringIO()
+        with (
+            mock.patch(
+                "rofi_agent_plus.rofi._new_session_selection",
+                side_effect=LifecycleError("operation_failed", "provider unavailable"),
+            ),
+            mock.patch("sys.stdout", output),
+        ):
+            run_rofi(
+                {
+                    "ROFI_RETV": "1",
+                    "ROFI_INFO": selection_payload(selected),
+                    "ROFI_DATA": _action_data(ACTION_NEW),
+                },
+                store=store,
+                config=config,
+            )
+        self.assertIn("Unable to start new session: provider unavailable", output.getvalue())
+        self.assertIn("Agents › All · Resume", output.getvalue())
+        self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
+        self.assertIn("Enter: Resume · Tab: New session here", output.getvalue())
+        self.assertIn("\x00new-selection\x1f1", output.getvalue())
+
     def test_navigation_failure_resets_selection_and_rearms_the_next_callback(self) -> None:
         store = mock.Mock(spec=CacheStore)
         store.load.side_effect = RuntimeError("cache unavailable")
@@ -2013,7 +2256,7 @@ class RofiProtocolTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertNotIn("Checking sessions…", rendered)
         self.assertNotIn("Background refresh stopped", rendered)
-        self.assertNotIn("\x00message\x1f", rendered)
+        self.assertIn("Enter: Resume · Tab: New session here", rendered)
         self.assertNotIn("\x00theme\x1f", rendered)
 
     def test_background_callback_polls_without_starting_another_refresh(self) -> None:
@@ -2345,7 +2588,7 @@ class RofiProtocolTest(unittest.TestCase):
             )
         expired = output.getvalue()
         self.assertNotIn("Checked just now", expired)
-        self.assertIn("\x00message\x1f\t", expired)
+        self.assertIn("Enter: Resume · Tab: New session here", expired)
         self.assertIn("\x00data\x1fidle", expired)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
@@ -2494,7 +2737,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual(0, result)
         rendered = output.getvalue()
         self.assertNotIn("Refresh errors: local/threads: offline", rendered)
-        self.assertIn("\x00message\x1f\t", rendered)
+        self.assertIn("Enter: Resume · Tab: New session here", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
             rendered,
@@ -2599,7 +2842,7 @@ class RofiProtocolTest(unittest.TestCase):
                 if data is None:
                     self.assertNotIn("Check stopped", rendered)
                     self.assertNotIn("Checking sessions…", rendered)
-                    self.assertIn("\x00message\x1f\t", rendered)
+                    self.assertIn("Enter: Resume · Tab: New session here", rendered)
                     self.assertIn(
                         '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
                         rendered,

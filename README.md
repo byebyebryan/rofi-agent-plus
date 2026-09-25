@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.5.4` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.6.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -36,6 +36,9 @@ The executable can be run directly from a checkout:
 ./bin/rofi-agent-plus list | jq
 rofi -show agent-plus -modes "agent-plus:$(pwd)/bin/rofi-agent-plus" \
   -kb-custom-1 Alt+r -kb-custom-2 Right -kb-custom-3 Left \
+  -kb-custom-7 Tab -kb-custom-8 ISO_Left_Tab \
+  -kb-element-next "" -kb-element-prev "" \
+  -kb-accept-custom "" -kb-delete-entry "" \
   -kb-cancel Escape,Control+g \
   -kb-move-char-forward Control+f -kb-move-char-back Control+b \
   -eh 2
@@ -43,13 +46,15 @@ rofi -show agent-plus -modes "agent-plus:$(pwd)/bin/rofi-agent-plus" \
 
 The normal Rofi invocation is configured as the `agent-plus` script mode.
 `Mod+A` or a similar Niri binding can invoke it with `rofi -show agent-plus`.
-The picker opens in `Agents › All`, a mixed newest-first list.  Left and Right
-cycle `All`, `Local`, and the remote hosts in stable Host Mesh order.  Enter
-opens the selected session.  Escape and `Ctrl+G` use Rofi's native cancel
-path and always close; `Tab` and `Shift+Tab` use Rofi's normal row navigation.
-View changes preserve the filter and reset the selection.  `Alt+R` starts a
-background refresh while retaining the current rows, filter, and selection.
-Custom input and deletion remain disabled. Rofi
+The picker opens in `Agents › All`, a mixed newest-first list, with `Resume`
+as its action. Up and Down move through rows. `Tab` switches the action from
+`Resume` to `New session here`; `Shift+Tab` cycles in reverse, with wraparound.
+The prompt and message area always show the selected action. Enter applies that
+action to the row highlighted at Enter. Left and Right cycle `All`, `Local`,
+and the remote hosts in stable Host Mesh order. Escape and `Ctrl+G` use Rofi's
+native cancel path and always close. View changes preserve the filter and reset
+the selection. `Alt+R` starts a background refresh while retaining the current
+rows, filter, selection, and action. Custom input and deletion remain disabled. Rofi
 must be launched with `-eh 2` so each list element reserves height for both
 display lines.
 
@@ -79,10 +84,22 @@ last seen …`.  After a check, retained provider rows show `Last known · seen
 …`, activity-only rows show `Activity seen · details unavailable`, and rows
 with current provider data but secondary activity or Tmux failures show
 `Details limited`.  Active-row styling
-is emitted only when current activity evidence supports it.  A selection uses
-Tmux Plus to focus or launch the terminal, or to create a deferred
+is emitted only when current activity evidence supports it. The `Resume`
+action uses Tmux Plus to focus or launch the terminal, or to create a deferred
 provider-resume wrapper with typed provider options. Icon provenance and
 trademark notes are in [`ASSETS.md`](ASSETS.md).
+
+`New session here` is an independent lifecycle. It refreshes the selected
+logical host through the current Host Mesh authority and requires one exact,
+current provider row with the same provider, ID, host, and provider-reported
+absolute working directory. It checks that directory and the bare provider
+executable on the target host before calling public `rofi-tmux-plus create`.
+The create request uses the exact directory, a sanitized
+`<cwd-basename>-<provider>` name with a bounded numeric collision suffix,
+`--defer-until-attached --open -- <provider>`, and the current Mesh revision
+when present. It carries no provider resume ID or provider options. A failed
+New attempt returns the picker to `Resume`; the selected native provider
+session and its existing tmux session remain untouched.
 
 When discovery correlated a session through its exact provider tmux option,
 the row carries a private `providerOptionVerified` marker. Selecting that row

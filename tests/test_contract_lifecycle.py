@@ -11,12 +11,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from rofi_agent_plus import engine
 from rofi_agent_plus.cache import CacheStore, PresentationContext, build_snapshot
 from rofi_agent_plus.config import PickerConfig
-from rofi_agent_plus.contract_backend import CommandOutput
+from rofi_agent_plus.contract_backend import CommandOutput, StaleMeshError
 from rofi_agent_plus.contract_lifecycle import (
     ContractLifecycle,
     LifecycleError,
+    _provider_row,
     _run_json,
     _success_response,
     fast_open_selection,
@@ -125,15 +127,33 @@ class FakeBackend:
         self._rows = rows if rows and isinstance(rows[0], list) else [rows]  # type: ignore[index]
         self._responses = list(responses)
         self.calls: list[tuple[list[str], float]] = []
+        self.preflights: list[tuple[str, str, str, float]] = []
+        self.preflight_error: Exception | None = None
+        self.prepared = 0
         self.stream_kwargs: list[dict[str, object]] = []
         self.streams = 0
         self.errors: list[dict[str, object]] = []
+        self.stream_errors: list[Exception] = []
 
     def prepare(self) -> None:
-        return None
+        self.prepared += 1
+
+    def preflight_provider_launch(
+        self,
+        host_id: str,
+        executable: str,
+        cwd: str,
+        *,
+        deadline: float,
+    ) -> None:
+        self.preflights.append((host_id, executable, cwd, deadline))
+        if self.preflight_error is not None:
+            raise self.preflight_error
 
     def stream(self, _config: PickerConfig, **kwargs: object):
         self.stream_kwargs.append(dict(kwargs))
+        if self.stream_errors:
+            raise self.stream_errors.pop(0)
         index = min(self.streams, len(self._rows) - 1)
         self.streams += 1
         rows = self._rows[index]
@@ -555,6 +575,179 @@ class ContractLifecycleTest(unittest.TestCase):
         lifecycle.open_or_create(self.selection())
         argv = backend.calls[0][0]
         self.assertEqual("rofi", argv[argv.index("--name") + 1])
+
+    def test_new_session_here_uses_exact_cwd_and_bare_provider_without_touching_source(
+        self,
+    ) -> None:
+        original = row()
+        lifecycle, store, backend, _context = self.harness(
+            [original], [success(descriptor(name="work-codex", pending=True))]
+        )
+        selected = self.selection()
+        selected["cwd"] = "/work"
+
+        lifecycle.new_session_here(selected)
+
+        self.assertEqual([("alpha", "codex", "/work")], [call[:3] for call in backend.preflights])
+        argv = backend.calls[0][0]
+        self.assertEqual(
+            [
+                "rofi-tmux-plus",
+                "create",
+                "--json",
+                "--host",
+                "alpha",
+                "--mesh-revision",
+                REVISION,
+                "--name",
+                "work-codex",
+                "--cwd",
+                "/work",
+                "--defer-until-attached",
+                "--open",
+                "--",
+                "codex",
+            ],
+            argv,
+        )
+        self.assertNotIn("--set-option", argv)
+        self.assertNotIn("resume", argv)
+        self.assertNotIn(THREAD, argv)
+        cached = store.load(self.config.fingerprint, BACKEND)
+        assert cached is not None
+        self.assertEqual("$4", cached["sessions"][0]["tmux"]["sessionId"])
+
+    def test_new_session_here_rejects_noncurrent_and_changed_provider_context(self) -> None:
+        selected = self.selection()
+        selected["cwd"] = "/work"
+        activity_only = row()
+        activity_only["sourceObservation"] = "activity-only"
+        for label, selected_row in (
+            ("activity-only", activity_only),
+            ("changed-cwd", row(cwd="/other")),
+        ):
+            with self.subTest(label=label):
+                rows = selected_row if isinstance(selected_row, list) else [selected_row]
+                lifecycle, _store, backend, _context = self.harness(rows, [])
+                with self.assertRaises(LifecycleError):
+                    lifecycle.new_session_here(selected)
+                self.assertEqual([], backend.preflights)
+                self.assertEqual([], backend.calls)
+
+        retained_backend = FakeBackend([row()], [])
+        retained_store = CacheStore(
+            Path(self.temporary.name) / "retained-cache", backend_selector=lambda: retained_backend
+        )
+        retained_context = PresentationContext(
+            self.config.fingerprint,
+            dict(BACKEND),
+            selected=retained_backend,
+        )
+        retained_store.refresh(self.config, force=True, context=retained_context)
+        retained_backend.errors = [{"host": "alpha", "stage": "threads", "message": "offline"}]
+        lifecycle = ContractLifecycle(retained_store, self.config, retained_context)
+        with self.assertRaises(LifecycleError):
+            lifecycle.new_session_here(selected)
+        self.assertEqual([], retained_backend.preflights)
+        self.assertEqual([], retained_backend.calls)
+
+        duplicate_snapshot = {"backend": dict(BACKEND), "sessions": [row(), row()]}
+        with self.assertRaisesRegex(LifecycleError, "no longer unambiguous"):
+            _provider_row(duplicate_snapshot, BACKEND, selected)
+
+    def test_new_session_here_requires_an_absolute_cwd_and_preflight_success(self) -> None:
+        for cwd in ("", "relative/path", None):
+            with self.subTest(cwd=cwd):
+                lifecycle, _store, backend, _context = self.harness([row()], [])
+                selected = self.selection()
+                selected["cwd"] = cwd
+                with self.assertRaisesRegex(LifecycleError, "absolute provider-reported"):
+                    lifecycle.new_session_here(selected)
+                self.assertEqual([], backend.preflights)
+                self.assertEqual([], backend.calls)
+
+        for message in (
+            "provider directory no longer exists on selected host",
+            "provider executable is unavailable on selected host",
+        ):
+            with self.subTest(message=message):
+                lifecycle, _store, backend, _context = self.harness([row()], [])
+                backend.preflight_error = engine.PickerError(message)
+                selected = self.selection()
+                selected["cwd"] = "/work"
+                with self.assertRaisesRegex(LifecycleError, message):
+                    lifecycle.new_session_here(selected)
+                self.assertEqual(1, len(backend.preflights))
+                self.assertEqual([], backend.calls)
+
+    def test_new_session_here_uses_current_provider_source_despite_old_tmux_uncertainty(
+        self,
+    ) -> None:
+        selected = self.selection()
+        selected["cwd"] = "/work"
+        current = row()
+        current["tmuxStale"] = True
+        current["tmuxAmbiguous"] = True
+        current["activityState"] = "unknown"
+        lifecycle, _store, backend, _context = self.harness(
+            [current], [success(descriptor(pending=True))]
+        )
+        backend.errors = [
+            {"host": "alpha", "stage": "tmux", "message": "inventory unavailable"},
+            {"host": "alpha", "stage": "active", "message": "activity unavailable"},
+        ]
+
+        lifecycle.new_session_here(selected)
+
+        self.assertEqual(1, len(backend.preflights))
+        self.assertEqual(1, len(backend.calls))
+        self.assertEqual("create", backend.calls[0][0][1])
+
+    def test_new_session_here_retries_only_typed_collision_or_stale_mesh(self) -> None:
+        selected = self.selection()
+        selected["cwd"] = "/work"
+        collision = fixture("session-exists.json")["response"]
+        lifecycle, _store, backend, _context = self.harness(
+            [row()], [(2, collision), success(descriptor(pending=True))]
+        )
+        lifecycle.new_session_here(selected)
+        self.assertEqual(
+            ["work-codex", "work-codex-2"],
+            [call[0][call[0].index("--name") + 1] for call in backend.calls],
+        )
+        self.assertEqual(1, len(backend.preflights))
+
+        lifecycle, _store, backend, _context = self.harness(
+            [row()], [(2, failure("stale_mesh", "changed")), success(descriptor(pending=True))]
+        )
+        lifecycle.new_session_here(selected)
+        self.assertEqual(2, backend.streams)
+        self.assertEqual(("alpha",), backend.stream_kwargs[0]["host_ids"])
+        self.assertIsNone(backend.stream_kwargs[1].get("host_ids"))
+        self.assertEqual(2, len(backend.preflights))
+        self.assertEqual(2, len(backend.calls))
+
+        lifecycle, _store, backend, _context = self.harness(
+            [row()], [success(descriptor(pending=True))]
+        )
+        backend.stream_errors = [StaleMeshError("changed")]
+        lifecycle.new_session_here(selected)
+        self.assertEqual(2, len(backend.stream_kwargs))
+        self.assertEqual(("alpha",), backend.stream_kwargs[0]["host_ids"])
+        self.assertIsNone(backend.stream_kwargs[1].get("host_ids"))
+        self.assertFalse(backend.stream_kwargs[0]["retry_stale_mesh"])
+        self.assertFalse(backend.stream_kwargs[1]["retry_stale_mesh"])
+        self.assertEqual(2, backend.prepared)
+        self.assertEqual(1, len(backend.preflights))
+        self.assertEqual(1, len(backend.calls))
+
+        timed_out = CommandOutput((), 0, json.dumps(success(descriptor())), "", timed_out=True)
+        lifecycle, _store, backend, _context = self.harness([row()], [timed_out])
+        with self.assertRaisesRegex(LifecycleError, "timed out"):
+            lifecycle.new_session_here(selected)
+        self.assertEqual(1, backend.streams)
+        self.assertEqual(1, len(backend.preflights))
+        self.assertEqual(1, len(backend.calls))
 
     def test_active_outside_or_unknown_provider_never_creates(self) -> None:
         for kind in ("codex", "claude", "opencode"):

@@ -74,6 +74,16 @@ _OPTIONS = (
 _MAX_HOST_WORKERS = 8
 _WHOLE_REFRESH_MIN_SECONDS = 12.0
 _WHOLE_REFRESH_MAX_SECONDS = 30.0
+_NEW_SESSION_EXECUTABLES = frozenset({"codex", "claude", "opencode"})
+_PREFLIGHT_CWD_MISSING = 11
+_PREFLIGHT_PROVIDER_MISSING = 12
+_PREFLIGHT_PROVIDER_PROGRAM = r"""cwd=$1
+provider=$2
+if [ ! -d "$cwd" ]; then
+  exit 11
+fi
+command -v "$provider" >/dev/null 2>&1 || exit 12
+"""
 
 
 class ContractError(engine.PickerError):
@@ -1621,6 +1631,73 @@ class ContractBackend:
                 unclassified = _bounded_text(output.stderr or f"SSH exited {output.returncode}")
         return None, ContractError(unclassified or f"{label} could not reach host")
 
+    def preflight_provider_launch(
+        self,
+        host_id: str,
+        executable: str,
+        cwd: str,
+        *,
+        deadline: float,
+    ) -> None:
+        """Verify one new-session launch context before any Tmux action.
+
+        This is intentionally a narrow backend operation.  It reuses the
+        selected Host Mesh route protocol for remote hosts and never exposes
+        SSH mechanics to Agent Plus's lifecycle consumer.  The checks prove
+        only that the provider-reported directory still exists and that the
+        requested bare provider command resolves on that same host.
+        """
+
+        if (
+            not isinstance(host_id, str)
+            or not _HOST_ID.fullmatch(host_id)
+            or executable not in _NEW_SESSION_EXECUTABLES
+            or not isinstance(cwd, str)
+            or not cwd.startswith("/")
+            or len(cwd) > _MAX_FIELD
+            or any(unicodedata.category(char).startswith("C") for char in cwd)
+        ):
+            raise ContractError("new-session launch context is invalid")
+        if self.mesh is None:
+            raise ContractError("Host Mesh authority is unavailable")
+        host = next((item for item in self.mesh.hosts if item.host_id == host_id), None)
+        if host is None:
+            raise ContractError("selected host is not in the current Host Mesh")
+
+        if host.local:
+            if not os.path.isdir(cwd):
+                raise ContractError("provider directory no longer exists on selected host")
+            if self._which(executable) is None:
+                raise ContractError("provider executable is unavailable on selected host")
+            return
+
+        _route, result = self._remote_command(
+            host,
+            deadline,
+            remote_argv=(
+                "sh",
+                "-c",
+                _PREFLIGHT_PROVIDER_PROGRAM,
+                "rofi-agent-plus-preflight",
+                cwd,
+                executable,
+            ),
+            input_data=None,
+            label="provider launch preflight",
+            stdout_limit=1024,
+        )
+        if isinstance(result, ContractError):
+            raise result
+        if result.timed_out:
+            raise ContractError("provider launch preflight timed out")
+        if result.returncode == 0:
+            return
+        if result.returncode == _PREFLIGHT_CWD_MISSING:
+            raise ContractError("provider directory no longer exists on selected host")
+        if result.returncode == _PREFLIGHT_PROVIDER_MISSING:
+            raise ContractError("provider executable is unavailable on selected host")
+        raise ContractError("provider launch preflight failed")
+
     def _remote_active(
         self, host: MeshHost, deadline: float
     ) -> tuple[str | None, dict[str, object] | Exception]:
@@ -2147,17 +2224,18 @@ class ContractBackend:
         *,
         deadline: float | None = None,
         host_ids: Sequence[str] | None = None,
+        retry_stale_mesh: bool = True,
     ) -> Sequence[dict[str, object]]:
         if deadline is not None:
             self._stream_deadline = deadline
         elif self._stream_deadline is None:
             self._stream_deadline = time.monotonic() + _WHOLE_REFRESH_MAX_SECONDS
         try:
-            for attempt in range(2):
+            for attempt in range(2 if retry_stale_mesh else 1):
                 try:
                     return self._once(config, self._stream_deadline, host_ids)
                 except StaleMeshError:
-                    if attempt:
+                    if attempt or not retry_stale_mesh:
                         raise
                     self.prepare()
             raise AssertionError("unreachable")

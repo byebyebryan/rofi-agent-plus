@@ -70,13 +70,50 @@ without mixing host and provider dimensions in one view ring.
 Left and Right wrap through host scopes using the current immutable snapshot;
 they never trigger provider discovery, tmux inventory, or SSH work. They
 preserve the filter and reset selection to the first eligible matching row.
-Tab and Shift+Tab remain native row navigation, Enter opens or resumes the
-selected session, and Escape plus Ctrl+G always close through Rofi's native
-cancel action. Neither cancellation key is a script callback.
 
-P8 changes only presentation and interaction. Agent discovery and correlation,
-Host Mesh v1, Tmux Session v1, stable typed selection identity, and guarded
-lifecycle operations remain unchanged.
+P8 established the flat host-scope ring. Its release retained Rofi's native
+Tab row navigation; the later P10 action cycle replaces that binding while
+preserving P8's cached Left and Right scope behavior.
+
+## P10 action cycle
+
+Up and Down navigate rows. Tab (`custom-7`, return value 16) selects the next
+named action and Shift+Tab (`custom-8`, return value 17) selects the previous
+one, wrapping `Resume` and `New session here`. The action is versioned state in
+per-dialog `ROFI_DATA`, so it survives host navigation, filters, Alt+R, and
+background refresh callbacks. The prompt and persistent message hint identify
+the selected action. Enter applies it to the highlighted leaf at callback
+time. Escape plus Ctrl+G always close through Rofi's native cancel action.
+Neither cancellation key is a script callback.
+
+The P10 action cycle leaves Agent discovery and correlation, Host Mesh v1,
+Tmux Session v1, stable typed selection identity, and guarded Resume lifecycle
+operations unchanged.
+
+## New session here lifecycle
+
+`New session here` is separate from the existing Resume fast path and its
+`_create` wrapper. It first performs a fresh selected-host provider refresh
+under the current Host Mesh authority. The current result must contain exactly
+one row for the selected host, provider kind, and provider ID; it must have
+`sourceObservation: current` and the same provider-reported absolute cwd.
+Retained, activity-only, ambiguous, changed-directory, or stale-authority rows
+are visible no-action failures.
+
+Before Tmux creation, Agent Plus asks its selected Host Mesh backend to prove
+that the exact cwd is still a directory and the bare provider executable
+(`codex`, `claude`, or `opencode`) resolves on that host. It then calls only
+the public Tmux Session create command with `--host`, the current
+`--mesh-revision` when present, a sanitized cwd-basename/provider name, exact
+`--cwd`, `--defer-until-attached`, `--open`, and `-- <bare-provider>`.
+It supplies neither a provider resume identifier nor provider `@` options.
+
+Only typed pre-action `session_exists` gets bounded name-suffix retries. A
+typed `stale_mesh` gets one whole-Mesh refresh and a repeat of the same source
+checks before one new create request. Timeout, transport, malformed-response,
+and post-action ambiguity failures do not retry. The source provider row and
+its pre-existing tmux session are never opened, reconciled, or mutated by this
+lifecycle.
 
 ## P9 locked CLI contracts
 
@@ -299,11 +336,12 @@ inferred independently. This prevents the same machine appearing under a
 native hostname, route alias, and friendly name in different pickers. The
 shared fallback rule below applies only while the executable is absent.
 
-The implemented P8 Rofi interaction contract is:
+The implemented Rofi interaction contract is:
 
-- Tab and Shift+Tab navigate rows;
+- Up and Down navigate rows;
+- Tab and Shift+Tab cycle `Resume` and `New session here`;
 - Left and Right switch `All`, `Local`, and stable remote host scopes;
-- Enter opens a selected leaf session;
+- Enter applies the displayed action to a selected leaf session;
 - Escape closes through Rofi's native cancel path; and
 - Ctrl+G closes unconditionally through Rofi's native cancel path.
 
@@ -430,9 +468,9 @@ from the Niri session's `PATH`, stale mesh observations are rejected rather
 than merged, and an external tmux rename cannot redirect an open or destructive
 action to a different session. P6 additionally requires that malformed
 configuration/model/callback data leaves every picker closable: Escape and
-Ctrl+G close unconditionally through Rofi's native cancel path. P8 preserves
-native Tab row navigation, uses Left and Right only for cached host-scope
-changes, and rejects forged group rows.
+Ctrl+G close unconditionally through Rofi's native cancel path. P10 uses Tab
+and Shift+Tab for its action cycle while Left and Right remain cached host-scope
+changes, action state survives callbacks, and forged group rows are rejected.
 
 ## P6 acceptance and P7 performance closure
 

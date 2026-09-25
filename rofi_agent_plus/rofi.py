@@ -29,6 +29,8 @@ ROFI_RETV_CUSTOM_3 = 12
 # still routed Escape through a script callback.  It closes immediately in
 # ``run_rofi`` and must never render a replacement list.
 ROFI_RETV_CUSTOM_6 = 15
+ROFI_RETV_CUSTOM_7 = 16
+ROFI_RETV_CUSTOM_8 = 17
 ROFI_RETV_CUSTOM_19 = 28
 MAX_MESSAGE_LENGTH = 360
 AUTO_REFRESH_POLL_SECONDS = 1
@@ -44,6 +46,11 @@ CHECK_NOTICE_SECONDS = 2
 CHECK_NOTICE_DATA_PREFIX = "check-notice:"
 NAVIGATION_DATA_PREFIX = "navigation:"
 NAVIGATION_DATA_VERSION = 2
+ACTION_DATA_PREFIX = "action:"
+ACTION_DATA_VERSION = 1
+ACTION_RESUME = "resume"
+ACTION_NEW = "new-session-here"
+ACTION_ORDER = (ACTION_RESUME, ACTION_NEW)
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _DISPLAY_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
@@ -144,6 +151,8 @@ class ContinuationState:
     error_deadline: float | None = None
     error_message: str = ""
     check_deadline: float | None = None
+    action: str = ACTION_RESUME
+    action_valid: bool = True
 
     @property
     def has_lifecycle(self) -> bool:
@@ -173,6 +182,8 @@ class ContinuationState:
             error_deadline=error_deadline,
             error_message=self.error_message if error_deadline is not None else "",
             check_deadline=live(self.check_deadline),
+            action=self.action,
+            action_valid=self.action_valid,
         )
 
 
@@ -497,6 +508,78 @@ def _breadcrumb(navigation: NavigationState, snapshot: Mapping[str, Any] | None 
     return "Agents › " + sanitize(label)
 
 
+def _action_label(action: str) -> str:
+    return {
+        ACTION_RESUME: "Resume",
+        ACTION_NEW: "New session here",
+    }[action]
+
+
+def _action_prompt(
+    action: str, navigation: NavigationState, snapshot: Mapping[str, Any] | None
+) -> str:
+    return f"{_breadcrumb(navigation, snapshot)} · {_action_label(action)}"
+
+
+def _action_hint(action: str) -> str:
+    index = ACTION_ORDER.index(action)
+    next_action = ACTION_ORDER[(index + 1) % len(ACTION_ORDER)]
+    return (
+        f"Enter: {_action_label(action)} · Tab: {_action_label(next_action)} · Shift+Tab: reverse"
+    )
+
+
+def _action_message(action: str, notice: str) -> str:
+    hint = _action_hint(action)
+    return f"{notice} · {hint}" if notice else hint
+
+
+def _action_data(action: str) -> str:
+    if action not in ACTION_ORDER:
+        raise ValueError("unknown Agent Plus action")
+    encoded = quote(
+        json.dumps(
+            {"version": ACTION_DATA_VERSION, "action": action},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+        safe="",
+    )
+    return ACTION_DATA_PREFIX + encoded
+
+
+def _parse_action_state(value: object) -> tuple[str, bool]:
+    """Decode the named action without falling back after malformed input."""
+
+    if not isinstance(value, str):
+        return ACTION_RESUME, True
+    components = [
+        component[len(ACTION_DATA_PREFIX) :]
+        for component in value.split(";")
+        if component.startswith(ACTION_DATA_PREFIX)
+    ]
+    if not components:
+        # Older continuation records predate the action cycle.  They carry no
+        # choice, so retain the documented primary action.
+        return ACTION_RESUME, True
+    if len(components) != 1 or not components[0] or len(components[0]) > 4096:
+        return ACTION_RESUME, False
+    try:
+        payload = json.loads(unquote(components[0]))
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        return ACTION_RESUME, False
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"version", "action"}
+        or isinstance(payload.get("version"), bool)
+        or payload.get("version") != ACTION_DATA_VERSION
+        or not isinstance(payload.get("action"), str)
+        or payload["action"] not in ACTION_ORDER
+    ):
+        return ACTION_RESUME, False
+    return payload["action"], True
+
+
 def _navigation_data(navigation: NavigationState) -> str:
     payload: dict[str, object] = {
         "version": NAVIGATION_DATA_VERSION,
@@ -770,6 +853,7 @@ def _refresh_data(
     deadline: float | None = None,
     check_deadline: float | None = None,
     navigation: NavigationState | None = None,
+    action: str = ACTION_RESUME,
 ) -> str:
     """Encode refresh, notices, and optional navigation state for Rofi."""
 
@@ -789,7 +873,8 @@ def _refresh_data(
     if navigation is not None and not navigation.is_default:
         values.append(_navigation_data(navigation))
     if not values:
-        return AUTO_REFRESH_IDLE_DATA
+        values.append(AUTO_REFRESH_IDLE_DATA)
+    values.append(_action_data(action))
     return ";".join(values)
 
 
@@ -845,12 +930,15 @@ def _parse_continuation_state(value: object) -> ContinuationState:
     refresh_deadline = _parse_refresh_deadline(value)
     error_deadline, error_message = _parse_error_notice(value)
     check_deadline = _parse_check_notice(value)
+    action, action_valid = _parse_action_state(value)
     return ContinuationState(
         navigation=_parse_navigation_state(value),
         refresh_deadline=refresh_deadline,
         error_deadline=error_deadline,
         error_message=error_message,
         check_deadline=check_deadline,
+        action=action,
+        action_valid=action_valid,
     )
 
 
@@ -869,6 +957,7 @@ def _render_continuation(
     preserve_filter: bool = False,
     clear_message: bool = True,
     continuation: bool = True,
+    action: str | None = None,
 ) -> str:
     """Render navigation while retaining live refresh/notice state.
 
@@ -881,6 +970,7 @@ def _render_continuation(
 
     active = state.active()
     target = navigation or state.navigation
+    action = action or active.action
     if active.error_deadline is not None:
         message = active.error_message
     elif active.refresh_deadline is not None:
@@ -913,6 +1003,7 @@ def _render_continuation(
         clear_message=clear_message,
         continuation=continuation,
         navigation=target,
+        action=action,
     )
 
 
@@ -935,14 +1026,17 @@ def render_snapshot(
     keep_filter: bool | None = None,
     keep_selection: bool | None = None,
     reset_selection: bool = False,
+    action: str = ACTION_RESUME,
 ) -> str:
     """Render a snapshot as Rofi script headers and rows."""
 
     navigation_was_provided = navigation is not None
     navigation = _canonical_navigation(snapshot, navigation or NavigationState())
+    if action not in ACTION_ORDER:
+        action = ACTION_RESUME
     sessions = _valid_sessions(snapshot)
     headers = [
-        _protocol("prompt", _breadcrumb(navigation, snapshot)),
+        _protocol("prompt", _action_prompt(action, navigation, snapshot)),
         _protocol("no-custom", "true"),
         _protocol("use-hot-keys", "true"),
         _protocol("markup-rows", "true"),
@@ -961,11 +1055,11 @@ def render_snapshot(
         headers.append(_protocol("keep-selection", "true"))
     if keep_filter:
         headers.append(_protocol("keep-filter", "true"))
-    effective_message = sanitize(message)
-    if not effective_message and isinstance(snapshot, Mapping) and not clear_message:
-        effective_message = summarize_errors(snapshot.get("errors", []))
-    if effective_message or clear_message:
-        headers.append(_protocol("message", effective_message))
+    notice_message = sanitize(message)
+    if not notice_message and isinstance(snapshot, Mapping) and not clear_message:
+        notice_message = summarize_errors(snapshot.get("errors", []))
+    effective_message = _action_message(action, notice_message)
+    headers.append(_protocol("message", effective_message))
     if timeout is not None:
         if timeout:
             if refresh_deadline is None and error_deadline is None and check_deadline is None:
@@ -987,9 +1081,10 @@ def render_snapshot(
                 _refresh_data(
                     refresh_deadline if timeout else None,
                     error_deadline if timeout else None,
-                    effective_message if timeout and error_deadline is not None else "",
+                    notice_message if timeout and error_deadline is not None else "",
                     check_deadline=check_deadline if timeout else None,
                     navigation=navigation,
+                    action=action,
                 ),
             )
         )
@@ -998,7 +1093,7 @@ def render_snapshot(
         # failures) still need to carry the active scope to the next callback.
         # Explicitly emit ``idle`` for All so stale continuation data cannot
         # leak across a root transition if Rofi retains the previous data.
-        headers.append(_protocol("data", _refresh_data(navigation=navigation)))
+        headers.append(_protocol("data", _refresh_data(navigation=navigation, action=action)))
 
     rendered_rows: list[str] = []
     emitted = 0
@@ -1069,14 +1164,14 @@ def render_snapshot(
             )
         else:
             status = "No agent sessions found"
-        if effective_message:
-            status = "No sessions · " + effective_message
+        if notice_message:
+            status = "No sessions · " + notice_message
         empty_options: list[tuple[str, object]] = [("nonselectable", "true")]
         refresh_outcome = _refresh_outcome(snapshot)
         empty_urgent = (
             snapshot is None
             or refresh_outcome in {"failed", "partial"}
-            or (not checking and bool(effective_message))
+            or (not checking and bool(notice_message))
         )
         if empty_urgent:
             empty_options.append(("urgent", "true"))
@@ -1205,6 +1300,20 @@ def _open_selection(
     lifecycle.open_or_create(selection)
 
 
+def _new_session_selection(
+    selection: Mapping[str, Any],
+    config: PickerConfig,
+    *,
+    store: CacheStore | None = None,
+    context: PresentationContext | None = None,
+) -> None:
+    """Run the independent guarded New session here lifecycle."""
+
+    if selection.get("contractMode") is not True or store is None or context is None:
+        raise engine.PickerError("contract-backed new session requires a prepared authority")
+    ContractLifecycle(store, config, context).new_session_here(selection)
+
+
 def _try_fast_open(selection: Mapping[str, Any]) -> tuple[bool, Exception | None]:
     """Attempt the guarded open for an option-backed existing session.
 
@@ -1319,6 +1428,7 @@ def _render_error_notice(
     keep_filter: bool | None = None,
     keep_selection: bool | None = None,
     reset_selection: bool = False,
+    action: str = ACTION_RESUME,
 ) -> str:
     """Render a user-visible error with a bounded, self-clearing timeout."""
 
@@ -1338,6 +1448,7 @@ def _render_error_notice(
         keep_filter=keep_filter,
         keep_selection=keep_selection,
         reset_selection=reset_selection,
+        action=action,
     )
 
 
@@ -1378,9 +1489,19 @@ def _auto_refresh_callback(
     selected_identity = _parse_selected_identity(environ.get("ROFI_INFO"))
     now = time.time()
     active_state = continuation_state.active(now)
+    action = active_state.action if active_state.action_valid else ACTION_RESUME
+
+    def render(*args: object, **kwargs: object) -> str:
+        kwargs.setdefault("action", action)
+        return render_snapshot(*args, **kwargs)
+
+    def render_error(*args: object, **kwargs: object) -> str:
+        kwargs.setdefault("action", action)
+        return _render_error_notice(*args, **kwargs)
+
     snapshot = _presentation_snapshot(store, config, context)
     if context is not None and context.error and snapshot is None:
-        return _render_error_notice(
+        return render_error(
             None,
             f"Contract refresh failed: {sanitize(context.error)}",
             selected_identity=selected_identity,
@@ -1410,7 +1531,7 @@ def _auto_refresh_callback(
                 and error_deadline is None
                 and continuation_state.error_message == errors
             ):
-                return render_snapshot(
+                return render(
                     candidate,
                     selected_identity=selected_identity,
                     preserve=True,
@@ -1423,7 +1544,7 @@ def _auto_refresh_callback(
             if notice_deadline is None or error_message != errors:
                 notice_deadline = now + ERROR_NOTICE_SECONDS
             if now < notice_deadline:
-                return render_snapshot(
+                return render(
                     candidate,
                     message=errors,
                     selected_identity=selected_identity,
@@ -1434,7 +1555,7 @@ def _auto_refresh_callback(
                     continuation=True,
                     navigation=navigation,
                 )
-            return render_snapshot(
+            return render(
                 candidate,
                 selected_identity=selected_identity,
                 preserve=True,
@@ -1448,7 +1569,7 @@ def _auto_refresh_callback(
         # data.  Keep that notice visible until its own deadline even when
         # the cache itself has no refresh errors.
         if error_deadline is not None and error_message:
-            return render_snapshot(
+            return render(
                 candidate,
                 message=error_message,
                 selected_identity=selected_identity,
@@ -1465,7 +1586,7 @@ def _auto_refresh_callback(
         # data, and message in one callback.
         if continuation_state.check_deadline is not None:
             if active_state.check_deadline is not None:
-                return render_snapshot(
+                return render(
                     candidate,
                     message="Checked just now",
                     selected_identity=selected_identity,
@@ -1476,7 +1597,7 @@ def _auto_refresh_callback(
                     continuation=True,
                     navigation=navigation,
                 )
-            return render_snapshot(
+            return render(
                 candidate,
                 selected_identity=selected_identity,
                 preserve=True,
@@ -1490,7 +1611,7 @@ def _auto_refresh_callback(
         # started/continued a refresh.  Fresh ordinary opens have no such
         # component and therefore never display a completion acknowledgement.
         if continuation_state.refresh_deadline is not None:
-            return render_snapshot(
+            return render(
                 candidate,
                 message="Checked just now",
                 selected_identity=selected_identity,
@@ -1501,7 +1622,7 @@ def _auto_refresh_callback(
                 continuation=True,
                 navigation=navigation,
             )
-        return render_snapshot(
+        return render(
             candidate,
             selected_identity=selected_identity,
             preserve=True,
@@ -1527,7 +1648,7 @@ def _auto_refresh_callback(
         # error notice is emitted once the new worker snapshot is fresh.
         background_message = "Checking sessions…"
         notice_active = error_deadline is not None and now < error_deadline and bool(error_message)
-        return render_snapshot(
+        return render(
             snapshot,
             message=error_message if notice_active else background_message,
             selected_identity=selected_identity,
@@ -1547,7 +1668,7 @@ def _auto_refresh_callback(
     if latest is not None and store.is_fresh(latest, config.refresh_seconds):
         latest_message = summarize_errors(latest.get("errors", []))
         if latest_message:
-            return _render_error_notice(
+            return render_error(
                 latest,
                 latest_message,
                 selected_identity=selected_identity,
@@ -1558,7 +1679,7 @@ def _auto_refresh_callback(
         return render_fresh(latest)
 
     if error_deadline is not None and now < error_deadline and error_message:
-        return render_snapshot(
+        return render(
             snapshot,
             message=error_message,
             selected_identity=selected_identity,
@@ -1570,7 +1691,7 @@ def _auto_refresh_callback(
             navigation=navigation,
         )
     if continuation_state.check_deadline is not None:
-        return render_snapshot(
+        return render(
             snapshot,
             selected_identity=selected_identity,
             preserve=True,
@@ -1586,7 +1707,7 @@ def _auto_refresh_callback(
             if outcome == "failed"
             else "Check stopped · showing last-known results"
         )
-        return _render_error_notice(
+        return render_error(
             latest or snapshot,
             message,
             selected_identity=selected_identity,
@@ -1594,7 +1715,7 @@ def _auto_refresh_callback(
             continuation=True,
             navigation=navigation,
         )
-    return render_snapshot(
+    return render(
         snapshot,
         selected_identity=selected_identity,
         preserve=True,
@@ -1626,9 +1747,17 @@ def run_rofi(
         return 0
     continuation_state = _parse_continuation_state(environ.get("ROFI_DATA"))
     navigation = continuation_state.navigation
+    action = continuation_state.action if continuation_state.action_valid else ACTION_RESUME
     callback_selection_identity = (
         _parse_selected_identity(environ.get("ROFI_INFO"))
-        if retv in {ROFI_RETV_CUSTOM_1, ROFI_RETV_CUSTOM_19}
+        if retv
+        in {
+            ROFI_RETV_SELECTED,
+            ROFI_RETV_CUSTOM_1,
+            ROFI_RETV_CUSTOM_7,
+            ROFI_RETV_CUSTOM_8,
+            ROFI_RETV_CUSTOM_19,
+        }
         else None
     )
     store = store or CacheStore()
@@ -1662,6 +1791,7 @@ def run_rofi(
                     clear_message=True,
                     continuation=True,
                     navigation=navigation,
+                    action=action,
                 )
             else:
                 # A config failure is a new operation error.  Do not let an
@@ -1679,6 +1809,7 @@ def run_rofi(
                     error_deadline=active.error_deadline,
                     check_deadline=active.check_deadline,
                     navigation=navigation,
+                    action=action,
                 )
         else:
             rendered = _render_error_notice(
@@ -1689,6 +1820,54 @@ def run_rofi(
                 refresh_deadline=continuation_state.active().refresh_deadline,
                 check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
+                action=action,
+            )
+        print(rendered, end="")
+        return 0
+
+    if retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
+        # Tab only changes the named, per-dialog action.  It must never
+        # prepare Host Mesh, refresh a provider, or mutate cache/history.
+        try:
+            snapshot = _presentation_snapshot(store, config)
+            if not continuation_state.action_valid:
+                rendered = render_snapshot(
+                    snapshot,
+                    message="Invalid Agent action state; choose Resume and try again.",
+                    selected_identity=callback_selection_identity,
+                    preserve=True,
+                    keep_filter=True,
+                    keep_selection=True,
+                    continuation=True,
+                    navigation=navigation,
+                    action=ACTION_RESUME,
+                )
+            else:
+                direction = 1 if retv == ROFI_RETV_CUSTOM_7 else -1
+                next_action = ACTION_ORDER[
+                    (ACTION_ORDER.index(action) + direction) % len(ACTION_ORDER)
+                ]
+                rendered = _render_continuation(
+                    snapshot,
+                    continuation_state,
+                    selected_identity=callback_selection_identity,
+                    preserve=True,
+                    preserve_filter=True,
+                    action=next_action,
+                )
+        except Exception as exc:  # noqa: BLE001 - cache-only callback boundary
+            rendered = _render_error_notice(
+                None,
+                f"Action selection failed: {sanitize(exc)}",
+                selected_identity=callback_selection_identity,
+                preserve=True,
+                continuation=True,
+                refresh_deadline=continuation_state.active().refresh_deadline,
+                check_deadline=continuation_state.active().check_deadline,
+                navigation=navigation,
+                keep_filter=True,
+                keep_selection=True,
+                action=action,
             )
         print(rendered, end="")
         return 0
@@ -1722,6 +1901,7 @@ def run_rofi(
                 keep_filter=True,
                 keep_selection=True,
                 reset_selection=True,
+                action=action,
             )
         print(rendered, end="")
         return 0
@@ -1740,7 +1920,11 @@ def run_rofi(
         except Exception as exc:  # noqa: BLE001 - selected callback boundary
             preselection_error = exc
         else:
-            if preselected_type == "session":
+            if (
+                continuation_state.action_valid
+                and action == ACTION_RESUME
+                and preselected_type == "session"
+            ):
                 completed, fast_error = _try_fast_open(preselected)
                 if completed:
                     # Tmux Plus has already validated and opened this exact
@@ -1761,6 +1945,7 @@ def run_rofi(
                 refresh_deadline=continuation_state.active().refresh_deadline,
                 check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
+                action=action,
             ),
             end="",
         )
@@ -1785,6 +1970,7 @@ def run_rofi(
                     refresh_deadline=continuation_state.active().refresh_deadline,
                     check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
+                    action=action,
                 ),
                 end="",
             )
@@ -1797,6 +1983,7 @@ def run_rofi(
                     preserve=retv != 0,
                     continuation=retv != 0,
                     navigation=navigation,
+                    action=action,
                 ),
                 end="",
             )
@@ -1825,6 +2012,7 @@ def run_rofi(
                     refresh_deadline=continuation_state.active().refresh_deadline,
                     check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
+                    action=action,
                 ),
                 end="",
             )
@@ -1838,6 +2026,7 @@ def run_rofi(
                 preserve=True,
                 continuation=True,
                 navigation=navigation,
+                action=action,
             ),
             end="",
         )
@@ -1847,13 +2036,18 @@ def run_rofi(
         selected = preselected
         row_type = preselected_type
         try:
+            if not continuation_state.action_valid:
+                raise engine.PickerError("Invalid Agent action state; choose Resume and try again.")
             if preselection_error is not None:
                 raise preselection_error
             if selected is None:
                 row_type, selected = _parse_row_selection(environ.get("ROFI_INFO"))
             if fast_error is not None:
                 raise fast_error
-            _open_selection(selected, config, store=store, context=context)
+            if action == ACTION_NEW:
+                _new_session_selection(selected, config, store=store, context=context)
+            else:
+                _open_selection(selected, config, store=store, context=context)
             # No rows means Rofi closes after a successful action.
             return 0
         except Exception as exc:  # noqa: BLE001 - selected callback boundary
@@ -1864,12 +2058,18 @@ def run_rofi(
             print(
                 _render_error_notice(
                     snapshot,
-                    message=f"Unable to open session: {sanitize(exc)}",
+                    message=(
+                        f"Unable to start new session: {sanitize(exc)}"
+                        if action == ACTION_NEW
+                        else f"Unable to open session: {sanitize(exc)}"
+                    ),
+                    selected_identity=callback_selection_identity,
                     preserve=True,
                     continuation=True,
                     refresh_deadline=continuation_state.active().refresh_deadline,
                     check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
+                    action=ACTION_RESUME if action == ACTION_NEW else action,
                 ),
                 end="",
             )
@@ -1888,6 +2088,7 @@ def run_rofi(
                 refresh_deadline=continuation_state.active().refresh_deadline,
                 check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
+                action=action,
             )
         print(rendered, end="")
         return 0
@@ -1912,6 +2113,7 @@ def run_rofi(
                         preserve=True,
                         continuation=True,
                         navigation=navigation,
+                        action=action,
                     ),
                     end="",
                 )
@@ -1928,6 +2130,7 @@ def run_rofi(
                     clear_message=True,
                     continuation=True,
                     navigation=navigation,
+                    action=action,
                 ),
                 end="",
             )
@@ -1946,6 +2149,7 @@ def run_rofi(
                     refresh_deadline=continuation_state.active().refresh_deadline,
                     check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
+                    action=action,
                 ),
                 end="",
             )
@@ -1961,6 +2165,7 @@ def run_rofi(
                 refresh_deadline=continuation_state.active().refresh_deadline,
                 check_deadline=continuation_state.active().check_deadline,
                 navigation=navigation,
+                action=action,
             ),
             end="",
         )
@@ -1978,6 +2183,7 @@ def run_rofi(
                     refresh_deadline=continuation_state.active().refresh_deadline,
                     check_deadline=continuation_state.active().check_deadline,
                     navigation=navigation,
+                    action=action,
                 ),
                 end="",
             )
@@ -1997,9 +2203,11 @@ def run_rofi(
                 if latest is not None and store.is_fresh(latest, config.refresh_seconds):
                     latest_message = summarize_errors(latest.get("errors", []))
                     print(
-                        _render_error_notice(latest, latest_message, navigation=navigation)
+                        _render_error_notice(
+                            latest, latest_message, navigation=navigation, action=action
+                        )
                         if latest_message
-                        else render_snapshot(latest, navigation=navigation),
+                        else render_snapshot(latest, navigation=navigation, action=action),
                         end="",
                     )
                     return 0
@@ -2007,7 +2215,10 @@ def run_rofi(
                 "Checking sessions…" if polling else summarize_errors(snapshot.get("errors", []))
             )
             if not polling and message:
-                print(_render_error_notice(snapshot, message, navigation=navigation), end="")
+                print(
+                    _render_error_notice(snapshot, message, navigation=navigation, action=action),
+                    end="",
+                )
                 return 0
             print(
                 render_snapshot(
@@ -2017,13 +2228,14 @@ def run_rofi(
                     refresh_deadline=refresh_deadline,
                     checking=polling,
                     navigation=navigation,
+                    action=action,
                 ),
                 end="",
             )
             return 0
     message = _message_for_cache(store, snapshot, config)
     if message:
-        print(_render_error_notice(snapshot, message, navigation=navigation), end="")
+        print(_render_error_notice(snapshot, message, navigation=navigation, action=action), end="")
     else:
-        print(render_snapshot(snapshot, navigation=navigation), end="")
+        print(render_snapshot(snapshot, navigation=navigation, action=action), end="")
     return 0

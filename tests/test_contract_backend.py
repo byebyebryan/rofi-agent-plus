@@ -6,6 +6,7 @@ import copy
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from rofi_agent_plus.codex import AppServerClient
 from rofi_agent_plus.config import PickerConfig
 from rofi_agent_plus.contract_backend import (
     _ACTIVE_PROBE,
+    _PREFLIGHT_PROVIDER_PROGRAM,
     CommandOutput,
     ContractBackend,
     ContractError,
@@ -393,6 +395,38 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
         self.assertEqual("-bad name", backend.mesh.local.display)
         self.assertEqual(("localhost",), backend.mesh.local.aliases)
 
+    def test_local_new_session_preflight_requires_exact_directory_and_executable(self) -> None:
+        backend = select_backend(
+            which=lambda name: f"/tools/{name}" if name in {"rofi-tmux-plus", "codex"} else None
+        )
+        with (
+            mock.patch("rofi_agent_plus.contract_backend.socket.gethostname", return_value="LOCAL"),
+            mock.patch("rofi_agent_plus.contract_backend.socket.getfqdn", return_value="LOCAL"),
+        ):
+            backend.prepare()
+        assert backend.mesh is not None
+        with tempfile.TemporaryDirectory() as directory:
+            backend.preflight_provider_launch(
+                backend.mesh.local.host_id,
+                "codex",
+                directory,
+                deadline=time.monotonic() + 1,
+            )
+            with self.assertRaisesRegex(ContractError, "directory no longer exists"):
+                backend.preflight_provider_launch(
+                    backend.mesh.local.host_id,
+                    "codex",
+                    str(Path(directory) / "missing"),
+                    deadline=time.monotonic() + 1,
+                )
+            with self.assertRaisesRegex(ContractError, "executable is unavailable"):
+                backend.preflight_provider_launch(
+                    backend.mesh.local.host_id,
+                    "claude",
+                    directory,
+                    deadline=time.monotonic() + 1,
+                )
+
     def test_present_malformed_ssh_contract_never_becomes_local_only(self) -> None:
         backend = select_backend(
             which=lambda name: f"/tools/{name}",
@@ -540,6 +574,80 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
         )
         self.assertIn("python3", remote)
         self.assertNotIn("ssh true", remote)
+
+    def test_remote_new_session_preflight_uses_exact_context_and_stops_after_reach(
+        self,
+    ) -> None:
+        mesh = parse_mesh(fixture("mesh-v1.json"))
+        host = mesh.hosts[1]
+        cwd = "/srv/Agent Work"
+        for returncode, expected in (
+            (0, None),
+            (11, "directory no longer exists"),
+            (12, "executable is unavailable"),
+        ):
+            with self.subTest(returncode=returncode):
+                calls: list[list[str]] = []
+
+                def runner(
+                    argv: list[str],
+                    _calls: list[list[str]] = calls,
+                    _returncode: int = returncode,
+                    **_kwargs: object,
+                ) -> CommandOutput:
+                    _calls.append(argv)
+                    if argv[1:3] == ["mesh", "report-route"]:
+                        return output(
+                            argv,
+                            {"schemaVersion": 1, "ok": True, "accepted": True},
+                        )
+                    self.assertEqual("ssh", argv[0])
+                    remote = shlex.split(argv[-1])
+                    nonce = remote[4]
+                    return CommandOutput(
+                        tuple(argv),
+                        _returncode,
+                        "",
+                        f"\x1eROFI_PLUS_REACHED_V1:{nonce}\x1f\n",
+                    )
+
+                backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=runner)
+                backend.mesh = mesh
+                if expected is None:
+                    backend.preflight_provider_launch(
+                        host.host_id,
+                        "claude",
+                        cwd,
+                        deadline=time.monotonic() + 2,
+                    )
+                else:
+                    with self.assertRaisesRegex(ContractError, expected):
+                        backend.preflight_provider_launch(
+                            host.host_id,
+                            "claude",
+                            cwd,
+                            deadline=time.monotonic() + 2,
+                        )
+
+                ssh_calls = [call for call in calls if call[0] == "ssh"]
+                self.assertEqual(1, len(ssh_calls))
+                self.assertEqual(host.routes[0].destination, ssh_calls[0][-2])
+                remote = shlex.split(ssh_calls[0][-1])
+                self.assertEqual(
+                    [
+                        "sh",
+                        "-c",
+                        _PREFLIGHT_PROVIDER_PROGRAM,
+                        "rofi-agent-plus-preflight",
+                        cwd,
+                        "claude",
+                    ],
+                    remote[-6:],
+                )
+                reports = [call for call in calls if call[1:3] == ["mesh", "report-route"]]
+                self.assertEqual(1, len(reports))
+                self.assertIn(host.routes[0].destination, reports[0])
+                self.assertIn("reachable", reports[0])
 
     def test_local_activity_uses_bounded_probe_instead_of_engine_ps(self) -> None:
         mesh = parse_mesh(fixture("mesh-v1.json"))
