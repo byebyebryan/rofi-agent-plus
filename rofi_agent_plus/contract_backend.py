@@ -129,15 +129,16 @@ def _run_bounded(
     poller: selectors.BaseSelector | None = None
     process: subprocess.Popen[bytes] | None = None
 
-    def terminate() -> None:
-        if process is None or process.poll() is not None:
+    def terminate(*, force_group: bool = False) -> None:
+        if process is None or (process.poll() is not None and not force_group):
             return
         try:
-            # The local probe itself may have a child ``ps`` process.  Keeping
-            # it in a new session lets a deadline reap that whole tiny tree.
+            # The leader can exit while a descendant still holds an output
+            # pipe. A deadline still owns and stops that process group.
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
-            process.kill()
+            if process.poll() is None:
+                process.kill()
         process.wait()
 
     try:
@@ -217,7 +218,7 @@ def _run_bounded(
             bytes(buffers["stderr"]),
         )
     except (TimeoutError, BufferError) as error:
-        terminate()
+        terminate(force_group=True)
         if isinstance(error, BufferError):
             raise ContractError(f"contract command exceeded {error.args[0]} limit") from error
         raise ContractError("contract command timed out") from error

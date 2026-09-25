@@ -676,6 +676,20 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
         self.assertEqual(0, completed.returncode)
         self.assertIn("closed", completed.stderr)
 
+    def test_timeout_stops_descendant_after_parent_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            marker = Path(raw_directory) / "descendant-survived"
+            child = f"import time,pathlib;time.sleep(.25);pathlib.Path({str(marker)!r}).touch()"
+            parent = (
+                "import subprocess,sys;"
+                f"subprocess.Popen([sys.executable,'-c',{child!r}],"
+                "stdout=sys.stdout,stderr=sys.stderr)"
+            )
+            with self.assertRaisesRegex(ContractError, "timed out"):
+                _run_bounded([sys.executable, "-c", parent], timeout=0.05)
+            time.sleep(0.3)
+            self.assertFalse(marker.exists())
+
     def test_codex_waits_for_marker_while_buffering_early_stdout(self) -> None:
         marker = b"\x1eROFI_PLUS_REACHED_V1:0123456789abcdef\x1f\n"
 
