@@ -193,7 +193,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.6.2", engine.VERSION)
+        self.assertEqual("0.6.3", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -1384,7 +1384,7 @@ class RofiProtocolTest(unittest.TestCase):
             'Resume · <span foreground="#42a5f5" weight="bold">[New session here]</span>',
             new_action,
         )
-        self.assertIn("Tab: Cycle · Enter: Run", new_action)
+        self.assertIn("\u2028Tab: Cycle actions", new_action)
         self.assertIn(
             "&lt;offline&gt; &amp; busy",
             _action_message(ACTION_RESUME, "<offline> & busy"),
@@ -1398,7 +1398,7 @@ class RofiProtocolTest(unittest.TestCase):
         resumed = invoke(ROFI_RETV_CUSTOM_8, ACTION_NEW)
         self.assertIn("\x00prompt\x1fAgents › All", resumed)
         self.assertIn(
-            'Actions: <span foreground="#42a5f5" weight="bold">[Resume]</span> · New session here',
+            'Enter: <span foreground="#42a5f5" weight="bold">[Resume]</span> · New session here',
             resumed,
         )
         self.assertIn(_action_data(ACTION_RESUME), resumed)
@@ -1588,13 +1588,13 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn(
-            "[Resume]</span> · New session here  |  Tab: Cycle · Enter: Run  |  Unable to start new session: provider unavailable",
+            "[Resume]</span> · New session here\u2028Tab: Cycle actions\u2028Unable to start new session: provider unavailable",
             output.getvalue(),
         )
         self.assertIn("Agents › All", output.getvalue())
         self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
         self.assertIn(
-            "[Resume]</span> · New session here  |  Tab: Cycle · Enter: Run", output.getvalue()
+            "[Resume]</span> · New session here\u2028Tab: Cycle actions", output.getvalue()
         )
         self.assertIn("\x00new-selection\x1f1", output.getvalue())
 
@@ -2278,7 +2278,7 @@ class RofiProtocolTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertNotIn("Checking sessions…", rendered)
         self.assertNotIn("Background refresh stopped", rendered)
-        self.assertIn("[Resume]</span> · New session here  |  Tab: Cycle · Enter: Run", rendered)
+        self.assertIn("[Resume]</span> · New session here\u2028Tab: Cycle actions", rendered)
         self.assertNotIn("\x00theme\x1f", rendered)
 
     def test_background_callback_polls_without_starting_another_refresh(self) -> None:
@@ -2610,7 +2610,7 @@ class RofiProtocolTest(unittest.TestCase):
             )
         expired = output.getvalue()
         self.assertNotIn("Checked just now", expired)
-        self.assertIn("[Resume]</span> · New session here  |  Tab: Cycle · Enter: Run", expired)
+        self.assertIn("[Resume]</span> · New session here\u2028Tab: Cycle actions", expired)
         self.assertIn("\x00data\x1fidle", expired)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
@@ -2759,7 +2759,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual(0, result)
         rendered = output.getvalue()
         self.assertNotIn("Refresh errors: local/threads: offline", rendered)
-        self.assertIn("[Resume]</span> · New session here  |  Tab: Cycle · Enter: Run", rendered)
+        self.assertIn("[Resume]</span> · New session here\u2028Tab: Cycle actions", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
             rendered,
@@ -2865,7 +2865,7 @@ class RofiProtocolTest(unittest.TestCase):
                     self.assertNotIn("Check stopped", rendered)
                     self.assertNotIn("Checking sessions…", rendered)
                     self.assertIn(
-                        "[Resume]</span> · New session here  |  Tab: Cycle · Enter: Run", rendered
+                        "[Resume]</span> · New session here\u2028Tab: Cycle actions", rendered
                     )
                     self.assertIn(
                         '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
