@@ -192,7 +192,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.6.0", engine.VERSION)
+        self.assertEqual("0.6.1", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -1377,8 +1377,9 @@ class RofiProtocolTest(unittest.TestCase):
             return output.getvalue()
 
         new_action = invoke(ROFI_RETV_CUSTOM_7, ACTION_RESUME)
-        self.assertIn("Agents › All · New session here", new_action)
-        self.assertIn("Enter: New session here · Tab: Resume · Shift+Tab: reverse", new_action)
+        self.assertIn("\x00prompt\x1fAgents › All", new_action)
+        self.assertNotIn("Agents › All · New session here", new_action)
+        self.assertIn("Enter: New session here · Tab: Resume", new_action)
         self.assertIn("Refresh errors: alpha/claude: offline", new_action)
         self.assertIn(_action_data(ACTION_NEW), new_action)
         self.assertIn("\x00keep-filter\x1ftrue", new_action)
@@ -1386,8 +1387,8 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("\x00new-selection\x1f1", new_action)
 
         resumed = invoke(ROFI_RETV_CUSTOM_8, ACTION_NEW)
-        self.assertIn("Agents › All · Resume", resumed)
-        self.assertIn("Enter: Resume · Tab: New session here · Shift+Tab: reverse", resumed)
+        self.assertIn("\x00prompt\x1fAgents › All", resumed)
+        self.assertIn("Enter: Resume · Tab: New session here", resumed)
         self.assertIn(_action_data(ACTION_RESUME), resumed)
         store.presentation_context.assert_not_called()
         store.refresh.assert_not_called()
@@ -1420,7 +1421,8 @@ class RofiProtocolTest(unittest.TestCase):
                 store=scope_store,
                 config=self._config(),
             )
-        self.assertIn("Agents › Local · New session here", scope_output.getvalue())
+        self.assertIn("Agents › Local", scope_output.getvalue())
+        self.assertIn("Enter: New session here", scope_output.getvalue())
         self.assertIn(_action_data(ACTION_NEW), scope_output.getvalue())
         scope_store.presentation_context.assert_not_called()
 
@@ -1444,7 +1446,8 @@ class RofiProtocolTest(unittest.TestCase):
                 store=refresh_store,
                 config=config,
             )
-        self.assertIn("Agents › All · New session here", auto_output.getvalue())
+        self.assertIn("Agents › All", auto_output.getvalue())
+        self.assertIn("Enter: New session here", auto_output.getvalue())
         self.assertIn(_action_data(ACTION_NEW), auto_output.getvalue())
         self.assertIn("\x00new-selection\x1f0", auto_output.getvalue())
 
@@ -1459,7 +1462,8 @@ class RofiProtocolTest(unittest.TestCase):
                 store=refresh_store,
                 config=config,
             )
-        self.assertIn("Agents › All · New session here", manual_output.getvalue())
+        self.assertIn("Agents › All", manual_output.getvalue())
+        self.assertIn("Enter: New session here", manual_output.getvalue())
         self.assertIn(_action_data(ACTION_NEW), manual_output.getvalue())
         refresh_store.spawn_background.assert_called_once()
 
@@ -1490,7 +1494,8 @@ class RofiProtocolTest(unittest.TestCase):
                 ),
             )
         self.assertIn("Invalid Agent action state", output.getvalue())
-        self.assertIn("Agents › All · Resume", output.getvalue())
+        self.assertIn("Agents › All", output.getvalue())
+        self.assertIn("Enter: Resume", output.getvalue())
         fast_open.assert_not_called()
         resume.assert_not_called()
         new_session.assert_not_called()
@@ -1570,8 +1575,11 @@ class RofiProtocolTest(unittest.TestCase):
                 store=store,
                 config=config,
             )
-        self.assertIn("Unable to start new session: provider unavailable", output.getvalue())
-        self.assertIn("Agents › All · Resume", output.getvalue())
+        self.assertIn(
+            "Enter: Resume · Tab: New session here · Unable to start new session: provider unavailable",
+            output.getvalue(),
+        )
+        self.assertIn("Agents › All", output.getvalue())
         self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
         self.assertIn("Enter: Resume · Tab: New session here", output.getvalue())
         self.assertIn("\x00new-selection\x1f1", output.getvalue())

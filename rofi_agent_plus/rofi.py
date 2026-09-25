@@ -515,23 +515,19 @@ def _action_label(action: str) -> str:
     }[action]
 
 
-def _action_prompt(
-    action: str, navigation: NavigationState, snapshot: Mapping[str, Any] | None
-) -> str:
-    return f"{_breadcrumb(navigation, snapshot)} · {_action_label(action)}"
+def _action_prompt(navigation: NavigationState, snapshot: Mapping[str, Any] | None) -> str:
+    return _breadcrumb(navigation, snapshot)
 
 
 def _action_hint(action: str) -> str:
     index = ACTION_ORDER.index(action)
     next_action = ACTION_ORDER[(index + 1) % len(ACTION_ORDER)]
-    return (
-        f"Enter: {_action_label(action)} · Tab: {_action_label(next_action)} · Shift+Tab: reverse"
-    )
+    return f"Enter: {_action_label(action)} · Tab: {_action_label(next_action)}"
 
 
 def _action_message(action: str, notice: str) -> str:
     hint = _action_hint(action)
-    return f"{notice} · {hint}" if notice else hint
+    return f"{hint} · {notice}" if notice else hint
 
 
 def _action_data(action: str) -> str:
@@ -1036,7 +1032,7 @@ def render_snapshot(
         action = ACTION_RESUME
     sessions = _valid_sessions(snapshot)
     headers = [
-        _protocol("prompt", _action_prompt(action, navigation, snapshot)),
+        _protocol("prompt", _action_prompt(navigation, snapshot)),
         _protocol("no-custom", "true"),
         _protocol("use-hot-keys", "true"),
         _protocol("markup-rows", "true"),
