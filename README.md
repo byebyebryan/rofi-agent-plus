@@ -50,9 +50,10 @@ The picker opens in `Agents › All`, a mixed newest-first list, with `Resume`
 as its action. Up and Down move through rows. `Tab` switches the action from
 `Resume` to `New session here`; `Shift+Tab` cycles in reverse, with wraparound.
 The prompt shows the host scope; one persistent message line below the filter
-shows the active Enter action, a Tab cycle hint, and any notice. Enter applies that
-action to the row highlighted at Enter. Left and Right cycle `All`, `Local`,
-and the remote hosts in stable Host Mesh order. Escape and `Ctrl+G` use Rofi's
+lists the actions, highlights the selected one, and shows Tab/Enter hints and
+any notice. Enter applies that action to the row highlighted at Enter. Left
+and Right cycle `All`, `Local`, and the remote hosts in stable Host Mesh order.
+Escape and `Ctrl+G` use Rofi's
 native cancel path and always close. View changes preserve the filter and reset
 the selection. `Alt+R` starts a background refresh while retaining the current
 rows, filter, selection, and action. Custom input and deletion remain disabled. Rofi

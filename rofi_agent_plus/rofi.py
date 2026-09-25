@@ -520,12 +520,18 @@ def _action_prompt(navigation: NavigationState, snapshot: Mapping[str, Any] | No
 
 
 def _action_hint(action: str) -> str:
-    return f"Enter: {_action_label(action)} · Tab: Cycle actions"
+    labels = []
+    for candidate in ACTION_ORDER:
+        label = _action_label(candidate)
+        if candidate == action:
+            label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
+        labels.append(label)
+    return f"Actions: {' · '.join(labels)}  |  Tab: Cycle · Enter: Run"
 
 
 def _action_message(action: str, notice: str) -> str:
     hint = _action_hint(action)
-    return f"{hint} · {notice}" if notice else hint
+    return f"{hint}  |  {_pango_escape(notice)}" if notice else hint
 
 
 def _action_data(action: str) -> str:
