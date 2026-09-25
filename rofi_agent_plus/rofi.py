@@ -520,9 +520,7 @@ def _action_prompt(navigation: NavigationState, snapshot: Mapping[str, Any] | No
 
 
 def _action_hint(action: str) -> str:
-    index = ACTION_ORDER.index(action)
-    next_action = ACTION_ORDER[(index + 1) % len(ACTION_ORDER)]
-    return f"Enter: {_action_label(action)} · Tab: {_action_label(next_action)}"
+    return f"Enter: {_action_label(action)} · Tab: Cycle actions"
 
 
 def _action_message(action: str, notice: str) -> str:

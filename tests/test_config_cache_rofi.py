@@ -1379,7 +1379,7 @@ class RofiProtocolTest(unittest.TestCase):
         new_action = invoke(ROFI_RETV_CUSTOM_7, ACTION_RESUME)
         self.assertIn("\x00prompt\x1fAgents › All", new_action)
         self.assertNotIn("Agents › All · New session here", new_action)
-        self.assertIn("Enter: New session here · Tab: Resume", new_action)
+        self.assertIn("Enter: New session here · Tab: Cycle actions", new_action)
         self.assertIn("Refresh errors: alpha/claude: offline", new_action)
         self.assertIn(_action_data(ACTION_NEW), new_action)
         self.assertIn("\x00keep-filter\x1ftrue", new_action)
@@ -1388,7 +1388,7 @@ class RofiProtocolTest(unittest.TestCase):
 
         resumed = invoke(ROFI_RETV_CUSTOM_8, ACTION_NEW)
         self.assertIn("\x00prompt\x1fAgents › All", resumed)
-        self.assertIn("Enter: Resume · Tab: New session here", resumed)
+        self.assertIn("Enter: Resume · Tab: Cycle actions", resumed)
         self.assertIn(_action_data(ACTION_RESUME), resumed)
         store.presentation_context.assert_not_called()
         store.refresh.assert_not_called()
@@ -1576,12 +1576,12 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn(
-            "Enter: Resume · Tab: New session here · Unable to start new session: provider unavailable",
+            "Enter: Resume · Tab: Cycle actions · Unable to start new session: provider unavailable",
             output.getvalue(),
         )
         self.assertIn("Agents › All", output.getvalue())
         self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
-        self.assertIn("Enter: Resume · Tab: New session here", output.getvalue())
+        self.assertIn("Enter: Resume · Tab: Cycle actions", output.getvalue())
         self.assertIn("\x00new-selection\x1f1", output.getvalue())
 
     def test_navigation_failure_resets_selection_and_rearms_the_next_callback(self) -> None:
@@ -2264,7 +2264,7 @@ class RofiProtocolTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertNotIn("Checking sessions…", rendered)
         self.assertNotIn("Background refresh stopped", rendered)
-        self.assertIn("Enter: Resume · Tab: New session here", rendered)
+        self.assertIn("Enter: Resume · Tab: Cycle actions", rendered)
         self.assertNotIn("\x00theme\x1f", rendered)
 
     def test_background_callback_polls_without_starting_another_refresh(self) -> None:
@@ -2596,7 +2596,7 @@ class RofiProtocolTest(unittest.TestCase):
             )
         expired = output.getvalue()
         self.assertNotIn("Checked just now", expired)
-        self.assertIn("Enter: Resume · Tab: New session here", expired)
+        self.assertIn("Enter: Resume · Tab: Cycle actions", expired)
         self.assertIn("\x00data\x1fidle", expired)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
@@ -2745,7 +2745,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual(0, result)
         rendered = output.getvalue()
         self.assertNotIn("Refresh errors: local/threads: offline", rendered)
-        self.assertIn("Enter: Resume · Tab: New session here", rendered)
+        self.assertIn("Enter: Resume · Tab: Cycle actions", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
             rendered,
@@ -2850,7 +2850,7 @@ class RofiProtocolTest(unittest.TestCase):
                 if data is None:
                     self.assertNotIn("Check stopped", rendered)
                     self.assertNotIn("Checking sessions…", rendered)
-                    self.assertIn("Enter: Resume · Tab: New session here", rendered)
+                    self.assertIn("Enter: Resume · Tab: Cycle actions", rendered)
                     self.assertIn(
                         '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
                         rendered,
