@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.6.4` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.6.5` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -80,9 +80,12 @@ names and aliases remain in the row's filter text and invisible Rofi metadata,
 so searching for `codex`, `claude`, `Claude Code`, or `opencode` still works.
 The complete session identity is carried in Rofi's `info` metadata, not parsed
 from visible text.  Session recency and activity state are independent from
-observation confidence.  Rows with current provider and supporting evidence
-are ordinary; while an automatic stale-cache refresh or explicit `Alt+R` check
-is running, current rows show `Checking` and retained rows show `Rechecking ·
+observation confidence. `Active` means a current activity probe matched a live
+provider process to that session ID; `Idle` means the probe found no matching
+process. A tmux session by itself does not establish provider activity. Rows
+with current provider and supporting evidence are ordinary; while an automatic
+stale-cache refresh or explicit `Alt+R` check is running, current rows show
+`Checking` and retained rows show `Rechecking ·
 last seen …`.  After a check, retained provider rows show `Last known · seen
 …`, activity-only rows show `Activity seen · details unavailable`, and rows
 with current provider data but secondary activity or Tmux failures show

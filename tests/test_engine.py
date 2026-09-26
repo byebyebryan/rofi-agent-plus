@@ -14,6 +14,36 @@ OPENCODE = "ses_0319af718ffegy8N1IoMEggx4B"
 
 
 class ProviderCorrelationTest(unittest.TestCase):
+    def test_claude_task_directory_identifies_fresh_tui_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fd = root / "proc" / "42" / "fd"
+            fd.mkdir(parents=True)
+            tasks = root / f"claude-{engine.os.getuid()}" / "project" / THREAD / "tasks"
+            tasks.mkdir(parents=True)
+            (fd / "3").symlink_to(tasks)
+            with mock.patch.object(engine, "_process_arguments", return_value=["claude"]):
+                self.assertEqual(THREAD, engine._claude_session_id_for_process(42, root / "proc"))
+
+    def test_claude_task_directory_rejects_ambiguous_or_foreign_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fd = root / "proc" / "42" / "fd"
+            fd.mkdir(parents=True)
+            session_root = root / f"claude-{engine.os.getuid()}" / "project"
+            first = session_root / THREAD / "tasks"
+            second = session_root / "22222222-2222-2222-2222-222222222222" / "tasks"
+            foreign = root / "claude-999999" / "project" / THREAD / "tasks"
+            for path in (first, second, foreign):
+                path.mkdir(parents=True)
+            (fd / "3").symlink_to(foreign)
+            with mock.patch.object(engine, "_process_arguments", return_value=["claude"]):
+                self.assertIsNone(engine._claude_session_id_for_process(42, root / "proc"))
+                (fd / "4").symlink_to(first)
+                self.assertEqual(THREAD, engine._claude_session_id_for_process(42, root / "proc"))
+                (fd / "5").symlink_to(second)
+                self.assertIsNone(engine._claude_session_id_for_process(42, root / "proc"))
+
     def test_root_rollout_wins_over_a_subagent_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

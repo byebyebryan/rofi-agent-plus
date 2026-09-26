@@ -18,7 +18,7 @@ from typing import Any
 
 DEFAULT_LIMIT = 40
 DEFAULT_TIMEOUT = 4.0
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 UUID_PATTERN = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -150,14 +150,15 @@ def _claude_session_id_from_args(arguments: Sequence[str]) -> str | None:
     return None
 
 
-def _claude_session_id_for_process(pid: int) -> str | None:
+def _claude_session_id_for_process(pid: int, proc_root: str | Path = "/proc") -> str | None:
     arguments = _process_arguments(pid)
     if identifier := _claude_session_id_from_args(arguments):
         return identifier
     try:
-        entries = (Path("/proc") / str(pid) / "fd").iterdir()
+        entries = (Path(proc_root) / str(pid) / "fd").iterdir()
     except (FileNotFoundError, PermissionError, OSError):
         return None
+    task_sessions: set[str] = set()
     for entry in entries:
         try:
             path = Path(os.readlink(entry))
@@ -170,6 +171,17 @@ def _claude_session_id_for_process(pid: int) -> str | None:
             and UUID_PATTERN.fullmatch(candidate)
         ):
             return candidate
+        # Fresh Claude TUIs have no --session-id argument and may close their
+        # transcript between writes. Their open task directory still carries
+        # the current session ID: .../claude-<uid>/<project>/<uuid>/tasks.
+        if (
+            path.name == "tasks"
+            and UUID_PATTERN.fullmatch(path.parent.name)
+            and path.parent.parent.parent.name == f"claude-{os.getuid()}"
+        ):
+            task_sessions.add(path.parent.name.lower())
+    if len(task_sessions) == 1:
+        return next(iter(task_sessions))
     return None
 
 

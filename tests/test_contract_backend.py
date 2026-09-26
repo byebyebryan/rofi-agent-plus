@@ -1010,10 +1010,11 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
             backend._report_hint(host, route, "reachable", time.monotonic() + 2)
         backend._report.assert_called_once()  # type: ignore[attr-defined]
 
-    def test_remote_probe_keeps_root_codex_and_claude_fd_fallback_without_tmux(self) -> None:
+    def test_remote_probe_keeps_root_codex_and_claude_fd_fallbacks_without_tmux(self) -> None:
         root_id = THREAD
         child_id = "22222222-2222-2222-2222-222222222222"
         claude_id = "33333333-3333-3333-3333-333333333333"
+        fresh_claude_id = "44444444-4444-4444-4444-444444444444"
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             proc = base / "proc"
@@ -1021,7 +1022,7 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
             scripts.mkdir()
             ps = scripts / "ps"
             ps.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '10 1 codex' '11 1 claude' '12 1 codex' '13 1 codex'\n"
+                "#!/bin/sh\nprintf '%s\\n' '10 1 codex' '11 1 claude' '12 1 codex' '13 1 codex' '14 1 claude'\n"
             )
             ps.chmod(0o700)
             commands = {
@@ -1029,6 +1030,7 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
                 11: b"claude\0",
                 12: b"codex\0app-server\0--listen\0" + b"127.0.0.1\0",
                 13: b"codex\0",
+                14: b"claude\0",
             }
             for pid, command in commands.items():
                 fd = proc / str(pid) / "fd"
@@ -1048,6 +1050,9 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
             (proc / "10" / "fd" / "4").symlink_to(child_rollout)
             (proc / "13" / "fd" / "3").symlink_to(root_rollout)
             (proc / "11" / "fd" / "3").symlink_to(transcript)
+            tasks = base / f"claude-{os.getuid()}" / "project" / fresh_claude_id / "tasks"
+            tasks.mkdir(parents=True)
+            (proc / "14" / "fd" / "3").symlink_to(tasks)
             environment = {
                 **os.environ,
                 "PATH": str(scripts),
@@ -1065,7 +1070,7 @@ class BackendSelectionAndTransportTest(unittest.TestCase):
         root_candidates = active["active"][root_id]["candidates"]
         self.assertEqual(2, len(root_candidates))
         self.assertEqual({10, 13}, {candidate["pid"] for candidate in root_candidates})
-        self.assertEqual({claude_id}, set(active["claudeActive"]))
+        self.assertEqual({claude_id, fresh_claude_id}, set(active["claudeActive"]))
         validated = _validate_active(active)
         self.assertEqual(active["nativeHostname"], validated["nativeHostname"])
         self.assertEqual(active["active"], validated["active"])

@@ -752,10 +752,14 @@ def claude_id(pid,arguments):
    if value.startswith(flag) and uuid.fullmatch(value[len(flag):].lower()): return value[len(flag):].lower()
  try: entries=(root/str(pid)/"fd").iterdir()
  except OSError: return None
+ # A fresh Claude TUI can close its transcript but retains its session task directory.
+ task_sessions=set()
  for entry in entries:
   try: path=Path(os.readlink(entry))
   except OSError: continue
   if path.suffix==".jsonl" and "projects" in path.parts and uuid.fullmatch(path.stem.lower()): return path.stem.lower()
+  if path.name=="tasks" and uuid.fullmatch(path.parent.name) and path.parent.parent.parent.name=="claude-%s" % os.getuid(): task_sessions.add(path.parent.name.lower())
+ if len(task_sessions)==1: return next(iter(task_sessions))
  return None
 def open_id(arguments):
  for i,value in enumerate(arguments):
