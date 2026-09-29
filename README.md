@@ -107,6 +107,27 @@ when present. It carries no provider resume ID or provider options. A failed
 New attempt returns the picker to `Resume`; the selected native provider
 session and its existing tmux session remain untouched.
 
+The managed-session workflow uses one foreground provider TUI per ordinary
+tmux session. Codex's shared app-server daemon and Claude Code's background
+agent view are outside the process-correlation contract. A short-lived Codex
+`app-server --stdio` process is still used to list saved threads. Disabling
+Codex daemon auto-start does not stop a daemon already running.
+
+Agent Plus assumes each provider TUI stays on the conversation it launched.
+Switching or creating conversations inside a TUI with provider-native commands
+such as `/resume`, `/new`, `/clear`, or OpenCode `/sessions` is outside this
+contract. For a resumed wrapper, the tmux name and provider ID option still
+describe the original conversation. `Resume` may focus a pane showing a
+different conversation or create another wrapper when the current ID cannot
+be matched. Switch conversations through Agent Plus. After an in-TUI switch,
+use that pane directly until you return to its original conversation or close
+it.
+
+A fresh OpenCode TUI started by `New session here` has no `--session` argument
+for the activity probe to match. Once it saves a conversation, that row may
+show `Idle` while the TUI is still open; choosing `Resume` may create a second
+wrapper. Use the existing tmux pane directly while that TUI is open.
+
 When discovery correlated a session through its exact provider tmux option,
 the row carries a private `providerOptionVerified` marker. Selecting that row
 can use Tmux Plus's guarded `open --require-option` operation directly, which

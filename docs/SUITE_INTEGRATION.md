@@ -188,6 +188,25 @@ Agent Plus remains authoritative for:
 SSH Plus must not know provider commands. Tmux Plus may carry generic pane
 metadata and requested tmux `@` options but must not assign meaning to them.
 
+The managed-session correlation expects foreground provider TUIs in ordinary
+tmux sessions. Codex's shared app-server daemon and Claude Code's background
+agent view are outside this contract. Agent Plus's short-lived Codex
+`app-server --stdio` query lists saved threads; it is not a shared daemon.
+
+Agent Plus owns launch-time provider identity and current process evidence, not
+provider-internal conversation transitions. A tmux provider option records the
+conversation assigned when its wrapper was created; it does not prove which
+conversation the TUI currently displays after an in-TUI `/resume`, `/new`,
+`/clear`, or OpenCode `/sessions` switch. Those transitions are unsupported.
+The picker can focus the original wrapper for a row that is no longer displayed
+there, or create another wrapper if it cannot match the new conversation to a
+process. No provider lifecycle hook updates tmux options or wrapper names.
+
+`New session here` also starts OpenCode without `--session`, so its process
+cannot be matched to the newly saved ID by the current argument-based activity
+probe. Until that TUI exits, its saved row may appear `Idle` and `Resume` may
+create another wrapper. This is a known limit of the external tmux workflow.
+
 ## Removed responsibilities
 
 After migration, Agent Plus no longer owns:
