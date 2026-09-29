@@ -202,6 +202,10 @@ and keeps only provider-owned Agent Plus configuration. DMS remains responsible
 for the bar, notifications, idle handling, lock screen, polkit, and the general
 Spotlight launcher.
 
+The [session client exploration](docs/agent-plus-session-client-exploration.md)
+and its linked feasibility studies record possible future presentation work.
+They do not change the current picker or its public contracts.
+
 The former DMS Agent Picker repository is retained for compatibility and
 history, but is deprecated; new picker behavior belongs here.  Project
 scoping and synthetic-session cleanup remain out of scope until they have a
