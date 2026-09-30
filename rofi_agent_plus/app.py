@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from . import engine
 from .cache import CacheStore
 from .config import ConfigError, PickerConfig, load_config
+from .launcher import initial_frame
 from .rofi import run_rofi
 
 
@@ -67,5 +68,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if "ROFI_RETV" in os.environ:
+        prepared = initial_frame(os.environ)
+        if prepared is not None:
+            print(prepared, end="")
+            return 0
         return run_rofi()
     return diagnostic_main(argv)
