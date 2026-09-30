@@ -38,6 +38,7 @@ from rofi_agent_plus.rofi import (
     ROFI_RETV_CUSTOM_8,
     ROFI_RETV_CUSTOM_19,
     ROW_SEPARATOR,
+    VIEW_ACTIVE,
     NavigationState,
     _action_data,
     _action_message,
@@ -1155,6 +1156,188 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual("No agent sessions on Empty", visible)
         self.assertEqual("true", options["nonselectable"])
 
+    def test_active_scope_uses_all_validated_host_rows_and_deduplicates(self) -> None:
+        recent = session(
+            "opencode",
+            OPENCODE_ID,
+            name="recent",
+            host="alpha",
+            hostId="alpha",
+            recencyAt=300,
+            active=True,
+            activityState="waiting",
+        )
+        limited = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="limited",
+            host="workstation",
+            hostId="workstation",
+            recencyAt=200,
+            active=True,
+            tmuxStale=True,
+        )
+        older = session(
+            name="older",
+            host="workstation",
+            hostId="workstation",
+            recencyAt=100,
+            active=True,
+            sourceObservation="activity-only",
+        )
+        snapshot = {
+            # The flattened All list is capped before this older active row.
+            "sessions": [recent],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {
+                "workstation": {"sessions": [older, dict(older), limited], "errors": []},
+                "alpha": {"sessions": [recent], "errors": []},
+            },
+            "errors": [],
+        }
+
+        output = render_snapshot(snapshot, navigation=NavigationState(VIEW_ACTIVE), now=300)
+        _, rows = parse_rendered_records(output)
+        parsed = [parse_row_options(row) for row in rows]
+        self.assertEqual(
+            ["recent", "limited", "older"],
+            [visible.split("  ·  ")[0] for visible, _ in parsed],
+        )
+        self.assertEqual(1, sum(visible.startswith("older") for visible, _ in parsed))
+        self.assertIn("Activity seen · details unavailable", parsed[2][1]["display"])
+        self.assertIn("Details limited", parsed[1][1]["display"])
+        self.assertEqual("true", parsed[0][1]["active"])
+        self.assertEqual("true", parsed[1][1]["active"])
+        self.assertEqual("true", parsed[2][1]["active"])
+        self.assertTrue(all("info" in options for _, options in parsed))
+        self.assertIn("Agents › Active", output)
+
+    def test_active_scope_excludes_failed_activity_and_failed_refresh_evidence(self) -> None:
+        healthy = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="healthy",
+            active=True,
+            activityState="active",
+        )
+        failed = session(
+            name="activity failed",
+            host="alpha",
+            hostId="alpha",
+            active=True,
+        )
+        catalog = [
+            {"hostId": "workstation", "display": "Workstation", "local": True},
+            {"hostId": "alpha", "display": "Alpha", "local": False},
+        ]
+        snapshot = {
+            "sessions": [healthy, failed],
+            "hostCatalog": catalog,
+            "hosts": {
+                "workstation": {"sessions": [healthy], "errors": []},
+                "alpha": {
+                    "sessions": [failed],
+                    "errors": [{"host": "Alpha", "stage": "activity", "message": "offline"}],
+                    "observations": {"activity": {"outcome": "failed"}},
+                },
+            },
+            "errors": [{"host": "Alpha", "stage": "activity", "message": "offline"}],
+            "lastRefresh": {"attemptedAt": 200, "completedAt": 200, "outcome": "partial"},
+        }
+        output = render_snapshot(snapshot, navigation=NavigationState(VIEW_ACTIVE))
+        _, rows = parse_rendered_records(output)
+        self.assertEqual(["healthy"], [parse_row_options(row)[0].split("  ·  ")[0] for row in rows])
+        self.assertIn("Refresh errors: Alpha/activity: offline", output)
+
+        snapshot["lastRefresh"] = {
+            "attemptedAt": 201,
+            "completedAt": None,
+            "outcome": "failed",
+        }
+        output = render_snapshot(snapshot, navigation=NavigationState(VIEW_ACTIVE))
+        _, rows = parse_rendered_records(output)
+        visible, options = parse_row_options(rows[0])
+        self.assertIn("No active sessions observed", visible)
+        self.assertIn("Refresh errors: Alpha/activity: offline", visible)
+        self.assertEqual("true", options["nonselectable"])
+        self.assertEqual("true", options["urgent"])
+
+    def test_active_refresh_falls_back_when_the_selected_row_becomes_inactive(self) -> None:
+        first = session(name="A", recencyAt=300, active=True)
+        selected = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="B",
+            recencyAt=200,
+            active=False,
+        )
+        last = session(
+            "opencode",
+            OPENCODE_ID,
+            name="C",
+            recencyAt=100,
+            active=True,
+        )
+        snapshot = {
+            "sessions": [first, selected, last],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True}
+            ],
+            "hosts": {"workstation": {"sessions": [first, selected, last], "errors": []}},
+            "errors": [],
+        }
+        selected_identity = ("workstation", "claude", selected["id"])
+
+        active_output = render_snapshot(
+            snapshot,
+            navigation=NavigationState(VIEW_ACTIVE),
+            selected_identity=selected_identity,
+        )
+        active_headers, active_rows = parse_rendered_records(active_output)
+        self.assertEqual(
+            ["A", "C"],
+            [parse_row_options(row)[0].split("  ·  ")[0] for row in active_rows],
+        )
+        self.assertIn("\x00new-selection\x1f0", active_headers)
+
+        local_output = render_snapshot(
+            snapshot,
+            navigation=NavigationState("local"),
+            selected_identity=selected_identity,
+        )
+        local_headers, _ = parse_rendered_records(local_output)
+        self.assertIn("\x00new-selection\x1f1", local_headers)
+
+    def test_active_and_local_remain_the_local_only_page_ring(self) -> None:
+        store = mock.Mock(spec=CacheStore)
+        store.load.return_value = {
+            "sessions": [],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True}
+            ],
+            "hosts": {"workstation": {"sessions": [], "errors": []}},
+            "errors": [],
+        }
+        for state, retv, expected in (
+            (NavigationState("local"), ROFI_RETV_CUSTOM_2, "Active"),
+            (NavigationState(VIEW_ACTIVE), ROFI_RETV_CUSTOM_2, "Local"),
+            (NavigationState("local"), ROFI_RETV_CUSTOM_3, "Active"),
+            (NavigationState(VIEW_ACTIVE), ROFI_RETV_CUSTOM_3, "Local"),
+        ):
+            with self.subTest(state=state, retv=retv):
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output):
+                    run_rofi(
+                        {"ROFI_RETV": str(retv), "ROFI_DATA": _navigation_data(state)},
+                        store=store,
+                        config=self._config(),
+                    )
+                self.assertIn(f"\x00prompt\x1fAgents › {expected}", output.getvalue())
+        store.presentation_context.assert_not_called()
+
     def test_recent_and_nested_sessions_sort_valid_recency_then_identity(self) -> None:
         sessions = [
             session(name="unknown", recencyAt="not-a-time"),
@@ -1176,6 +1359,7 @@ class RofiProtocolTest(unittest.TestCase):
     def test_navigation_state_round_trips_and_legacy_data_is_accepted(self) -> None:
         states = (
             NavigationState(),
+            NavigationState(VIEW_ACTIVE),
             NavigationState("local"),
             NavigationState("host", "alpha"),
             NavigationState("host", "unsafe host › label"),
@@ -1822,8 +2006,10 @@ class RofiProtocolTest(unittest.TestCase):
             (ROFI_RETV_CUSTOM_2, NavigationState(), "Local"),
             (ROFI_RETV_CUSTOM_2, NavigationState("local"), "Alpha"),
             (ROFI_RETV_CUSTOM_2, NavigationState("host", "alpha"), "Beta"),
-            (ROFI_RETV_CUSTOM_2, NavigationState("host", "beta"), "All"),
-            (ROFI_RETV_CUSTOM_3, NavigationState(), "Beta"),
+            (ROFI_RETV_CUSTOM_2, NavigationState("host", "beta"), "Active"),
+            (ROFI_RETV_CUSTOM_2, NavigationState(VIEW_ACTIVE), "All"),
+            (ROFI_RETV_CUSTOM_3, NavigationState(), "Active"),
+            (ROFI_RETV_CUSTOM_3, NavigationState(VIEW_ACTIVE), "Beta"),
             (ROFI_RETV_CUSTOM_3, NavigationState("host", "beta"), "Alpha"),
             (ROFI_RETV_CUSTOM_3, NavigationState("host", "alpha"), "Local"),
             (ROFI_RETV_CUSTOM_3, NavigationState("local"), "All"),
@@ -1847,6 +2033,44 @@ class RofiProtocolTest(unittest.TestCase):
             self.assertIn("\x00keep-filter\x1ftrue", rendered)
             self.assertIn("\x00keep-selection\x1ftrue", rendered)
             self.assertIn("\x00new-selection\x1f0", rendered)
+
+    def test_active_navigation_is_carried_by_refresh_continuations(self) -> None:
+        active_row = session(name="working", active=True, activityState="waiting")
+        snapshot = {
+            "sessions": [active_row],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {
+                "workstation": {"sessions": [active_row], "errors": []},
+                "alpha": {"sessions": [], "errors": []},
+            },
+            "errors": [],
+        }
+        navigation = NavigationState(VIEW_ACTIVE)
+        store = mock.Mock(spec=CacheStore)
+        store.load.return_value = snapshot
+        store.is_fresh.return_value = False
+        store.background_active.return_value = True
+        data = _refresh_data(1010, 1003, "offline", navigation=navigation)
+        self.assertEqual(navigation, parse_continuation_state(data).navigation)
+
+        output = io.StringIO()
+        with (
+            mock.patch("sys.stdout", output),
+            mock.patch("rofi_agent_plus.rofi.time.time", return_value=1000),
+        ):
+            run_rofi(
+                {"ROFI_RETV": str(ROFI_RETV_CUSTOM_19), "ROFI_DATA": data},
+                store=store,
+                config=self._config(),
+            )
+        rendered = output.getvalue()
+        self.assertIn("\x00prompt\x1fAgents › Active", rendered)
+        self.assertIn("background-refresh:1010;error-notice:1003:", rendered)
+        self.assertIn(_navigation_data(navigation), rendered)
+        self.assertIn("offline", rendered)
 
     def test_escape_migration_guard_always_closes_without_work(self) -> None:
         for state in (

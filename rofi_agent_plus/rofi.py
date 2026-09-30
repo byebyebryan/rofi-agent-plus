@@ -76,7 +76,8 @@ _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
 VIEW_ALL = "all"
 VIEW_LOCAL = "local"
 VIEW_HOST = "host"
-_VIEWS = frozenset({VIEW_ALL, VIEW_LOCAL, VIEW_HOST})
+VIEW_ACTIVE = "active"
+_VIEWS = frozenset({VIEW_ACTIVE, VIEW_ALL, VIEW_LOCAL, VIEW_HOST})
 SessionIdentity = tuple[str, str, str]
 
 
@@ -100,9 +101,9 @@ def _contract_text(value: object, *, required: bool = True) -> bool:
 class NavigationState:
     """One flat scope in the immutable Host Mesh presentation catalog.
 
-    ``all`` and ``local`` are typed scopes.  ``host`` carries an authoritative
-    Host Mesh id rather than a display label.  Continuation data is untrusted,
-    so malformed values normalize to the safe mixed scope.
+    ``active``, ``all``, and ``local`` are typed scopes.  ``host`` carries an
+    authoritative Host Mesh id rather than a display label.  Continuation
+    data is untrusted, so malformed values normalize to the safe mixed scope.
     """
 
     view: str = VIEW_ALL
@@ -427,6 +428,8 @@ def _canonical_navigation(
 ) -> NavigationState:
     """Normalize a continuation scope against its immutable catalog."""
 
+    if navigation.view == VIEW_ACTIVE:
+        return navigation
     catalog = _host_catalog(snapshot)
     if not catalog:
         return NavigationState()
@@ -449,22 +452,49 @@ def _canonical_navigation(
 
 
 def _scope_ring(snapshot: Mapping[str, Any] | None) -> list[NavigationState]:
-    """Build the stable All/Local/remote peer ring from Host Mesh order."""
+    """Build the stable Active/All/Local/remote ring from Host Mesh order."""
 
     catalog = _host_catalog(snapshot)
     if not catalog:
-        return [NavigationState()]
+        return [NavigationState(VIEW_ACTIVE), NavigationState()]
     local = next((item for item in catalog if item["local"]), None)
     remotes = [item for item in catalog if not item["local"]]
     if not remotes:
-        return [NavigationState(VIEW_LOCAL)] if local is not None else [NavigationState()]
+        return (
+            [NavigationState(VIEW_ACTIVE), NavigationState(VIEW_LOCAL)]
+            if local is not None
+            else [NavigationState(VIEW_ACTIVE), NavigationState()]
+        )
     ring = (
-        [NavigationState(), NavigationState(VIEW_LOCAL)]
+        [NavigationState(VIEW_ACTIVE), NavigationState(), NavigationState(VIEW_LOCAL)]
         if local is not None
-        else [NavigationState()]
+        else [NavigationState(VIEW_ACTIVE), NavigationState()]
     )
     ring.extend(NavigationState(VIEW_HOST, str(item["hostId"])) for item in remotes)
     return ring
+
+
+def _active_sessions(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Collect observed-active rows from validated per-host cache records."""
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[SessionIdentity] = set()
+    for host in _host_catalog(snapshot):
+        host_id = str(host["hostId"])
+        record = _host_record(snapshot, host_id)
+        raw_rows = record.get("sessions") if isinstance(record, Mapping) else None
+        if not isinstance(raw_rows, list):
+            continue
+        for row in _valid_sessions({"sessions": raw_rows}):
+            if _session_host(row).casefold() != host_id.casefold():
+                continue
+            identity = _session_identity(row)
+            if identity is None or identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(row)
+    active = [row for row in candidates if _row_observation(row, snapshot, None)[2]]
+    return sorted(active, key=_session_sort_key)
 
 
 def _sessions_for_navigation(
@@ -474,6 +504,8 @@ def _sessions_for_navigation(
 ) -> list[dict[str, Any]]:
     """Select leaf rows by logical scope and sort them newest-first."""
 
+    if navigation.view == VIEW_ACTIVE:
+        return _active_sessions(snapshot)
     host_id = _scope_host_id(snapshot, navigation)
     if host_id is None:
         rows = sessions
@@ -492,7 +524,9 @@ def _sessions_for_navigation(
 
 
 def _breadcrumb(navigation: NavigationState, snapshot: Mapping[str, Any] | None = None) -> str:
-    if navigation.view == VIEW_ALL:
+    if navigation.view == VIEW_ACTIVE:
+        label = "Active"
+    elif navigation.view == VIEW_ALL:
         label = "All"
     elif navigation.view == VIEW_LOCAL:
         label = "Local"
@@ -625,7 +659,7 @@ def _parse_navigation_state(value: object) -> NavigationState:
         if view == VIEW_HOST:
             host_id = payload.get("hostId")
             return NavigationState(view, host_id if isinstance(host_id, str) else None)
-        if view in {VIEW_ALL, VIEW_LOCAL} and "hostId" not in payload:
+        if view in {VIEW_ACTIVE, VIEW_ALL, VIEW_LOCAL} and "hostId" not in payload:
             return NavigationState(view)
         return NavigationState()
     return NavigationState()
@@ -1107,6 +1141,8 @@ def render_snapshot(
         headers.append(_protocol("new-selection", 0))
     elif len(selected_indices) == 1 and keep_selection:
         headers.append(_protocol("new-selection", selected_indices[0]))
+    elif navigation.view == VIEW_ACTIVE and selected_identity is not None and keep_selection:
+        headers.append(_protocol("new-selection", 0))
     for session in rows:
         kind = str(session.get("kind") or "")
         info = selection_payload(session)
@@ -1158,14 +1194,19 @@ def render_snapshot(
 
     if emitted == 0:
         scope_host = _scope_host_id(snapshot, navigation)
-        if scope_host is not None:
+        if navigation.view == VIEW_ACTIVE:
+            status = "No active sessions observed · Left/Right: change page"
+        elif scope_host is not None:
             status = "No agent sessions on " + _breadcrumb(navigation, snapshot).removeprefix(
                 "Agents › "
             )
         else:
             status = "No agent sessions found"
         if notice_message:
-            status = "No sessions · " + notice_message
+            if navigation.view == VIEW_ACTIVE:
+                status += " · " + notice_message
+            else:
+                status = "No sessions · " + notice_message
         empty_options: list[tuple[str, object]] = [("nonselectable", "true")]
         refresh_outcome = _refresh_outcome(snapshot)
         empty_urgent = (
