@@ -2,10 +2,11 @@
 
 Date: 2026-09-30
 
-Status: accepted interaction direction; implementation and deployment pending.
+Status: implemented in `0.7.0`. Current deployment and manual acceptance are
+recorded in the [managed suite status ledger](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md).
 This plan covers a global Active page and remembered picker context. It
-supersedes the earlier Active-only toggle proposal. The current `0.6.5`
-picker still has its existing host pages and starts without remembered context.
+supersedes the earlier Active-only toggle proposal. Version `0.6.5` is the
+preceding picker with host pages and no remembered context.
 
 ## Intended interaction
 
@@ -143,6 +144,23 @@ one foreground provider TUI per ordinary tmux session, with provider-native
 conversation switching inside that TUI outside the managed contract. Active
 uses existing external process evidence. This feature adds no provider hooks,
 daemon, internal session manager, or tracking of native lifecycle transitions.
+
+## Initial Rofi selection
+
+An implementation-time GUI probe found that Rofi ignores `new-selection` in
+the initial script output: an inert three-row script requested row 2 but Enter
+accepted row 0. That header works on subsequent callbacks. Rofi's supported
+`-selected-row` launch option selected row 2 in the corresponding GUI test.
+
+Use a small `rofi-agent-plus-rofi` launcher for the managed invocation. Prepare
+the normal initial frame once, read its selection hint, pass that index to
+Rofi, and serve the same private temporary frame to the first script callback.
+Later callbacks follow the existing script path. Keep the frame only for the
+dialog's lifetime and remove it on exit. This preserves recency order and
+avoids another discovery pass, an index/row race, or a delayed selection jump.
+The Mod+A key and Rofi options stay the same; its spawn command uses the
+launcher. Direct script-mode invocation restores the page but needs a launch
+option to restore the first highlighted row.
 
 ## Implementation order
 

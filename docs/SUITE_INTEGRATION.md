@@ -45,29 +45,36 @@ private configuration, history, health, or cache files.
 
 ## P8 flat-scope navigation
 
-P8 removes Agent Plus's `Hosts` and `Providers` browsing roots and all group
-rows. The normal picker contains only agent-session leaves in a flat host-scope
-ring:
+P8 removed Agent Plus's `Hosts` and `Providers` browsing roots and all group
+rows. The navigation follow-up adds Active to that flat model. The normal
+picker contains only agent-session leaves in this page ring:
 
 ```text
+Agents › Active
 Agents › All
 Agents › Local
 Agents › <remote host in Host Mesh order>
 ```
 
-`All` is the mixed newest-first list across hosts and providers. `Local`
+`Active` shows observed running conversations across hosts using the existing
+effective activity predicate. It collects validated cached per-host rows
+before the flattened All list's cap; failed activity evidence cannot retain
+an old active marker. `All` is the mixed newest-first list across hosts and
+providers. `Local`
 follows, then every authoritative remote in stable Host Mesh order. Empty or
 unavailable hosts retain their scope and may render a non-actionable empty-state
 row; activity never moves a view. When no remote exists, the redundant `All`
-and `Local` scopes collapse to one `Local` view. Agent Plus starts in `All` when
-it exists and does not persist host scope between invocations.
+and `Local` scopes collapse into `Local`, leaving Active and Local. The first
+launch starts in All when available, otherwise Local. Subsequent launches
+restore the saved page and last successfully used conversation. Search starts
+empty and the action starts at Resume. Active remains a page even when empty.
 
 Provider becomes a searchable row attribute rather than a navigation axis.
 Provider icons remain visible, and provider names and aliases remain in filter
 metadata, so `codex`, `claude`, and `opencode` continue to isolate sessions
 without mixing host and provider dimensions in one view ring.
 
-Left and Right wrap through host scopes using the current immutable snapshot;
+Left and Right wrap through pages using the current immutable snapshot;
 they never trigger provider discovery, tmux inventory, or SSH work. They
 preserve the filter and reset selection to the first eligible matching row.
 
@@ -75,11 +82,16 @@ P8 established the flat host-scope ring. Its release retained Rofi's native
 Tab row navigation; the later P10 action cycle replaces that binding while
 preserving P8's cached Left and Right scope behavior.
 
-A [planned navigation follow-up](agent-plus-picker-navigation-plan.md) adds
-Active to the same page ring and remembers the last page and successfully used
-conversation between launches. It replaces the proposed Active-only toggle;
-implementation and deployment are pending. The P8 behavior above describes
-the current picker.
+The [navigation design](agent-plus-picker-navigation-plan.md) specifies page
+restoration and selection fallbacks. Explicit page changes and successful
+Enter actions persist a private, versioned preference in
+`$XDG_STATE_HOME/rofi-agent-plus/view.json`; these IDs remain navigation hints.
+Native cancellation does not report arrow-only selection changes. Automatic
+refresh and diagnostic CLI calls do not write preferences. The managed
+Mod+A invocation uses the small `rofi-agent-plus-rofi` launcher so the saved
+selection is supplied before Rofi's first display. The launcher prepares one
+initial frame and serves that same frame to the first script callback, avoiding
+another discovery pass or a race between index calculation and row display.
 
 ## P10 action cycle
 
@@ -365,7 +377,7 @@ The implemented Rofi interaction contract is:
 
 - Up and Down navigate rows;
 - Tab and Shift+Tab cycle `Resume` and `New session here`;
-- Left and Right switch `All`, `Local`, and stable remote host scopes;
+- Left and Right switch `Active`, `All`, `Local`, and stable remote host pages;
 - Enter applies the displayed action to a selected leaf session;
 - Escape closes through Rofi's native cancel path; and
 - Ctrl+G closes unconditionally through Rofi's native cancel path.

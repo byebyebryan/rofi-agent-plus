@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.6.5` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.7.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -34,7 +34,7 @@ The executable can be run directly from a checkout:
 
 ```sh
 ./bin/rofi-agent-plus list | jq
-rofi -show agent-plus -modes "agent-plus:$(pwd)/bin/rofi-agent-plus" \
+./bin/rofi-agent-plus-rofi -show agent-plus -modes "agent-plus:$(pwd)/bin/rofi-agent-plus" \
   -kb-custom-1 Alt+r -kb-custom-2 Right -kb-custom-3 Left \
   -kb-custom-7 Tab -kb-custom-8 ISO_Left_Tab \
   -kb-element-next "" -kb-element-prev "" \
@@ -45,15 +45,19 @@ rofi -show agent-plus -modes "agent-plus:$(pwd)/bin/rofi-agent-plus" \
 ```
 
 The normal Rofi invocation is configured as the `agent-plus` script mode.
-`Mod+A` or a similar Niri binding can invoke it with `rofi -show agent-plus`.
-The picker opens in `Agents › All`, a mixed newest-first list, with `Resume`
-as its action. Up and Down move through rows. `Tab` switches the action from
-`Resume` to `New session here`; `Shift+Tab` cycles in reverse, with wraparound.
-The prompt shows the host scope; the persistent message below the filter shows
+`Mod+A` or a similar Niri binding invokes the `rofi-agent-plus-rofi` launcher
+with the Rofi options above. On its first launch, the picker opens in
+`Agents › All`, a mixed newest-first list. Later launches restore the last
+page and successfully used conversation. Each launch starts with an empty
+search and `Resume` as its action. Up and Down move through rows. `Tab`
+switches the action from `Resume` to `New session here`; `Shift+Tab` cycles in
+reverse, with wraparound.
+The prompt shows the page; the persistent message below the filter shows
 `Enter:` with both actions and highlights the selected one. A divider separates
 `Tab: Cycle actions` on the same line, and any notice follows after a blank
 line. Enter applies that action to the row highlighted at Enter. Left
-and Right cycle `All`, `Local`, and the remote hosts in stable Host Mesh order.
+and Right cycle `Active`, `All`, `Local`, and the remote hosts in stable Host
+Mesh order.
 Escape and `Ctrl+G` use Rofi's
 native cancel path and always close. View changes preserve the filter and reset
 the selection. `Alt+R` starts a background refresh while retaining the current
@@ -65,7 +69,15 @@ The Rofi callback boundary fails closed: configuration, model, and callback
 errors become bounded notices. Left and Right read only the cached snapshot;
 they do not prepare Host Mesh or provider clients. Empty or unavailable hosts
 remain in the view ring as non-actionable status rows, and a local-only Mesh
-collapses the redundant `All` view into `Local`.
+collapses the redundant `All` view into `Local`, leaving `Active` and `Local`.
+
+`Active` shows conversations with observed running provider processes across
+all hosts, including providers waiting for input. It uses the same activity
+evidence as active-row styling, keeps existing failure notices, and stays in
+the ring when empty. It reads the cached per-host rows before the mixed `All`
+page's recent-session cap, so older observed running conversations remain
+visible. Search a host or provider name to narrow this page. Switching pages
+does not trigger discovery; `Alt+R` refreshes as usual.
 
 The host catalog is authoritative and ordered by Host Mesh, while provider
 groups are not navigation scopes. Provider icons remain visible, and provider
@@ -159,6 +171,29 @@ Tmux Plus and are rejected here. Malformed TOML, unknown keys, wrong types,
 and out-of-range values are reported visibly in Rofi. The diagnostic `list`
 command may temporarily override only `max_sessions` with `--limit`.
 
+## Remembered picker context
+
+The picker saves its last page and one last successfully used conversation at
+`$XDG_STATE_HOME/rofi-agent-plus/view.json`, defaulting to
+`~/.local/state/rofi-agent-plus/view.json`. Page changes save immediately,
+including before cancellation. A successful Resume remembers that
+conversation; New session here remembers its source row because the new
+conversation's ID is not yet available. Moving through rows and cancelling
+does not save the highlighted row. Failed actions do not replace the saved ID.
+
+Reopening selects the saved conversation only when exactly one matching row
+is visible on the saved page. Otherwise it selects the first row. A removed
+host falls back to All, or Local in local-only mode. An empty Active page
+remains selected. Search starts empty and the action starts at Resume.
+Preferences are local to the viewing endpoint, private, and best effort;
+invalid or unwritable state leaves the picker usable. The diagnostic CLI and
+background refresh workers do not write these preferences.
+
+Use `rofi-agent-plus-rofi` for initial selection restoration. Rofi's script
+headers restore selection only on later callbacks; the launcher supplies its
+initial row option and shares the prepared first frame with script mode.
+Direct `rofi -show agent-plus` can restore the page but starts at the first row.
+
 ## Cache visibility
 
 The picker stores a private, versioned snapshot under
@@ -223,10 +258,10 @@ and keeps only provider-owned Agent Plus configuration. DMS remains responsible
 for the bar, notifications, idle handling, lock screen, polkit, and the general
 Spotlight launcher.
 
-The [picker navigation plan](docs/agent-plus-picker-navigation-plan.md) records
-the planned Active page and restoration of the last page and successfully used
-conversation. It is an implementation plan; these features are not in the
-current picker yet.
+The [picker navigation design](docs/agent-plus-picker-navigation-plan.md)
+records the Active page, remembered context, implementation order, and
+acceptance requirements. Installed and manual acceptance remain recorded in
+the managed suite status ledger.
 
 The [session client exploration](docs/agent-plus-session-client-exploration.md)
 and its linked feasibility studies record possible future presentation work.

@@ -12,6 +12,7 @@ import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 
 from rofi_agent_plus import VERSION, app, engine
 from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, PresentationContext, build_snapshot
@@ -37,6 +38,7 @@ from rofi_agent_plus.rofi import (
     ROFI_RETV_CUSTOM_7,
     ROFI_RETV_CUSTOM_8,
     ROFI_RETV_CUSTOM_19,
+    ROFI_RETV_SELECTED,
     ROW_SEPARATOR,
     VIEW_ACTIVE,
     NavigationState,
@@ -55,6 +57,12 @@ from rofi_agent_plus.rofi import (
     render_snapshot,
     run_rofi,
     selection_payload,
+)
+from rofi_agent_plus.view_preferences import (
+    ViewPreference,
+    ViewPreferenceStore,
+    encode_last_used,
+    parse_last_used,
 )
 
 THREAD_ID = "00000000-0000-0000-0000-000000000001"
@@ -107,6 +115,115 @@ def parse_rendered_records(output: str) -> tuple[list[str], list[str]]:
         headers = [record for record in records if record.startswith("\x00")]
         records = [record for record in records if not record.startswith("\x00")]
     return headers, [record for record in records if record]
+
+
+def header_value(headers: list[str], key: str) -> str:
+    prefix = "\x00" + key + "\x1f"
+    return next(record[len(prefix) :] for record in headers if record.startswith(prefix))
+
+
+class ViewPreferenceStoreTest(unittest.TestCase):
+    def test_round_trip_uses_private_directory_and_file_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ViewPreferenceStore(temporary)
+            preference = ViewPreference(
+                "host",
+                "alpha",
+                ("workstation", "claude", "00000000-0000-0000-0000-000000000002"),
+            )
+
+            self.assertTrue(store.save(preference))
+            self.assertEqual(preference, store.load())
+            self.assertEqual(0o700, stat.S_IMODE(store.path.parent.stat().st_mode))
+            self.assertEqual(0o600, stat.S_IMODE(store.path.stat().st_mode))
+            self.assertEqual(
+                ["view.json"], sorted(path.name for path in store.path.parent.iterdir())
+            )
+
+    def test_malformed_or_unsupported_records_use_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ViewPreferenceStore(temporary)
+            store.path.parent.mkdir(parents=True)
+            for payload in (
+                {"version": True, "page": {"kind": "active"}, "lastUsed": None},
+                {"version": 1.0, "page": {"kind": "active"}, "lastUsed": None},
+                {"version": 2, "page": {"kind": "all"}, "lastUsed": None},
+                {"version": 1, "page": {"kind": "host", "hostId": "bad host"}, "lastUsed": None},
+                {
+                    "version": 1,
+                    "page": {"kind": "all"},
+                    "lastUsed": {
+                        "hostId": "workstation",
+                        "provider": "unknown",
+                        "sessionId": THREAD_ID,
+                    },
+                },
+                {
+                    "version": 1,
+                    "page": {"kind": "all"},
+                    "lastUsed": {
+                        "hostId": "workstation",
+                        "provider": "codex",
+                        "sessionId": "not-a-native-id",
+                    },
+                },
+            ):
+                with self.subTest(payload=payload):
+                    store.path.write_text(json.dumps(payload))
+                    self.assertEqual(ViewPreference(), store.load())
+
+            deeply_nested = "[" * 1500 + "0" + "]" * 1500
+            store.path.write_text(deeply_nested)
+            self.assertEqual(ViewPreference(), store.load())
+
+    def test_fifo_is_rejected_without_waiting_for_a_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ViewPreferenceStore(temporary)
+            store.path.parent.mkdir(parents=True)
+            os.mkfifo(store.path)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from rofi_agent_plus.view_preferences import ViewPreference, ViewPreferenceStore; "
+                    "import sys; "
+                    "assert ViewPreferenceStore(sys.argv[1]).load() == ViewPreference()",
+                    temporary,
+                ],
+                capture_output=True,
+                check=False,
+                timeout=2,
+            )
+            self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
+
+    def test_continuation_bookmark_requires_an_integer_version(self) -> None:
+        identity = ("workstation", "codex", THREAD_ID)
+        self.assertEqual(identity, parse_last_used(encode_last_used(identity)))
+
+        payload = {
+            "version": 1.0,
+            "lastUsed": {"hostId": "workstation", "provider": "codex", "sessionId": THREAD_ID},
+        }
+        malformed = "last-used:" + quote(json.dumps(payload, separators=(",", ":")), safe="")
+        self.assertIsNone(parse_last_used(malformed))
+
+        deeply_nested = "{" + '"version":1,"lastUsed":' + "[" * 1500 + "0" + "]" * 1500 + "}"
+        self.assertIsNone(parse_last_used("last-used:" + quote(deeply_nested, safe="")))
+
+    def test_failed_atomic_replace_leaves_the_previous_record_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ViewPreferenceStore(temporary)
+            previous = ViewPreference("active", None, ("workstation", "codex", THREAD_ID))
+            replacement = ViewPreference("local")
+            self.assertTrue(store.save(previous))
+
+            with mock.patch("rofi_agent_plus.view_preferences.os.replace", side_effect=OSError):
+                self.assertFalse(store.save(replacement))
+            self.assertEqual(previous, store.load())
+            self.assertEqual(
+                ["view.json"], sorted(path.name for path in store.path.parent.iterdir())
+            )
 
 
 class ConfigTest(unittest.TestCase):
@@ -194,7 +311,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.6.5", engine.VERSION)
+        self.assertEqual("0.7.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -227,7 +344,7 @@ class ProjectMetadataTest(unittest.TestCase):
         self.assertNotIn("`Refreshing in background`", readme)
 
     def test_readme_documents_action_and_host_scope_bindings(self) -> None:
-        readme = (self.root / "README.md").read_text()
+        readme = " ".join((self.root / "README.md").read_text().split())
         self.assertIn("-kb-custom-2 Right -kb-custom-3 Left", readme)
         self.assertIn("-kb-custom-7 Tab -kb-custom-8 ISO_Left_Tab", readme)
         self.assertIn('-kb-element-next "" -kb-element-prev ""', readme)
@@ -734,6 +851,14 @@ class CacheTest(unittest.TestCase):
 
 
 class RofiProtocolTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._state_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._state_home.cleanup)
+        self._state_env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": self._state_home.name})
+        self._state_env.start()
+        self.addCleanup(self._state_env.stop)
+        self.preference_store = ViewPreferenceStore()
+
     def test_background_command_supports_checkout_and_installed_layouts(self) -> None:
         checkout = _background_command()
         self.assertEqual(sys.executable, checkout[0])
@@ -1283,9 +1408,7 @@ class RofiProtocolTest(unittest.TestCase):
         )
         snapshot = {
             "sessions": [first, selected, last],
-            "hostCatalog": [
-                {"hostId": "workstation", "display": "Workstation", "local": True}
-            ],
+            "hostCatalog": [{"hostId": "workstation", "display": "Workstation", "local": True}],
             "hosts": {"workstation": {"sessions": [first, selected, last], "errors": []}},
             "errors": [],
         }
@@ -1315,9 +1438,7 @@ class RofiProtocolTest(unittest.TestCase):
         store = mock.Mock(spec=CacheStore)
         store.load.return_value = {
             "sessions": [],
-            "hostCatalog": [
-                {"hostId": "workstation", "display": "Workstation", "local": True}
-            ],
+            "hostCatalog": [{"hostId": "workstation", "display": "Workstation", "local": True}],
             "hosts": {"workstation": {"sessions": [], "errors": []}},
             "errors": [],
         }
@@ -2456,6 +2577,329 @@ class RofiProtocolTest(unittest.TestCase):
                     store.spawn_background.assert_not_called()
                 else:
                     store.spawn_background.assert_called_once()
+
+    def test_initial_open_restores_page_and_identity_with_resume_and_empty_filter(self) -> None:
+        first = session(name="first", recencyAt=300, active=True)
+        selected = session(
+            "opencode",
+            OPENCODE_ID,
+            name="remembered",
+            host="alpha",
+            hostId="alpha",
+            recencyAt=200,
+            active=True,
+        )
+        last = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="last",
+            recencyAt=100,
+            active=True,
+        )
+        snapshot = {
+            "sessions": [first, selected, last],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {
+                "workstation": {"sessions": [first, last], "errors": []},
+                "alpha": {"sessions": [selected], "errors": []},
+            },
+            "errors": [],
+        }
+        preference = ViewPreference("active", None, ("alpha", "opencode", OPENCODE_ID))
+        self.assertTrue(self.preference_store.save(preference))
+        cache = mock.Mock(spec=CacheStore)
+        cache.load.return_value = snapshot
+        cache.is_fresh.return_value = True
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {"ROFI_RETV": "0", "ROFI_DATA": _navigation_data(NavigationState("local"))},
+                    store=cache,
+                    config=self._config(),
+                    preference_store=self.preference_store,
+                ),
+            )
+
+        headers, rows = parse_rendered_records(output.getvalue())
+        self.assertIn("\x00prompt\x1fAgents › Active", headers)
+        self.assertEqual("1", header_value(headers, "new-selection"))
+        self.assertEqual(
+            ["first", "remembered", "last"],
+            [parse_row_options(row)[0].split("  ·  ")[0] for row in rows],
+        )
+        self.assertNotIn("\x00keep-filter\x1f", output.getvalue())
+        message = header_value(headers, "message")
+        self.assertIn("[Resume]", message)
+        self.assertNotIn("[New session here]", message)
+        continuation = parse_continuation_state(header_value(headers, "data"))
+        self.assertEqual(preference.last_used, continuation.last_used)
+        self.assertEqual(preference, self.preference_store.load())
+
+    def test_initial_contract_error_with_cached_rows_restores_bookmark(self) -> None:
+        first = session(name="first", recencyAt=200)
+        remembered = session(
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            name="remembered",
+            recencyAt=100,
+        )
+        snapshot = {"sessions": [first, remembered], "errors": []}
+        preference = ViewPreference(
+            "all", None, ("workstation", "claude", "00000000-0000-0000-0000-000000000002")
+        )
+        self.assertTrue(self.preference_store.save(preference))
+        config = self._config()
+        cache = mock.Mock(spec=CacheStore)
+        cache.presentation_context.return_value = PresentationContext(
+            config.fingerprint, {}, error="bad mesh"
+        )
+        cache.load_current.return_value = snapshot
+        cache.is_fresh.return_value = True
+        output = io.StringIO()
+
+        with mock.patch("sys.stdout", output):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {"ROFI_RETV": "0"},
+                    store=cache,
+                    config=config,
+                    preference_store=self.preference_store,
+                ),
+            )
+
+        headers, rows = parse_rendered_records(output.getvalue())
+        self.assertIn("Contract refresh failed", header_value(headers, "message"))
+        self.assertEqual(2, len(rows))
+        self.assertEqual("1", header_value(headers, "new-selection"))
+        self.assertEqual(preference, self.preference_store.load())
+
+    def test_initial_open_missing_host_or_row_falls_back_without_rewriting_bookmark(self) -> None:
+        missing = ViewPreference(
+            "host", "removed", ("removed", "codex", "00000000-0000-0000-0000-000000000004")
+        )
+        self.assertTrue(self.preference_store.save(missing))
+        current = session(name="current", recencyAt=100)
+        mesh = {
+            "sessions": [current],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {"workstation": {"sessions": [current], "errors": []}},
+            "errors": [],
+        }
+        local_only = {
+            **mesh,
+            "hostCatalog": [{"hostId": "workstation", "display": "Workstation", "local": True}],
+        }
+        for snapshot, expected in ((mesh, "All"), (local_only, "Local")):
+            with self.subTest(expected=expected):
+                cache = mock.Mock(spec=CacheStore)
+                cache.load.return_value = snapshot
+                cache.is_fresh.return_value = True
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output):
+                    run_rofi(
+                        {"ROFI_RETV": "0"},
+                        store=cache,
+                        config=self._config(),
+                        preference_store=self.preference_store,
+                    )
+                headers, _ = parse_rendered_records(output.getvalue())
+                self.assertIn(f"\x00prompt\x1fAgents › {expected}", headers)
+                self.assertEqual("0", header_value(headers, "new-selection"))
+                self.assertEqual(missing, self.preference_store.load())
+
+    def test_page_navigation_saves_page_without_reloading_preference_file(self) -> None:
+        remembered = ("workstation", "codex", THREAD_ID)
+        self.assertTrue(self.preference_store.save(ViewPreference("all", None, remembered)))
+        current = session(name="current", recencyAt=100, active=True)
+        snapshot = {
+            "sessions": [current],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {"workstation": {"sessions": [current], "errors": []}},
+            "errors": [],
+        }
+        cache = mock.Mock(spec=CacheStore)
+        cache.load.return_value = snapshot
+        cache.is_fresh.return_value = True
+        initial = io.StringIO()
+        with mock.patch("sys.stdout", initial):
+            run_rofi(
+                {"ROFI_RETV": "0"},
+                store=cache,
+                config=self._config(),
+                preference_store=self.preference_store,
+            )
+        data = header_value(parse_rendered_records(initial.getvalue())[0], "data")
+
+        with mock.patch.object(
+            self.preference_store, "load", wraps=self.preference_store.load
+        ) as load:
+            navigated = io.StringIO()
+            with mock.patch("sys.stdout", navigated):
+                run_rofi(
+                    {"ROFI_RETV": str(ROFI_RETV_CUSTOM_2), "ROFI_DATA": data},
+                    store=cache,
+                    config=self._config(),
+                    preference_store=self.preference_store,
+                )
+            load.assert_not_called()
+
+        headers, _ = parse_rendered_records(navigated.getvalue())
+        self.assertIn("\x00prompt\x1fAgents › Local", headers)
+        self.assertEqual(ViewPreference("local", None, remembered), self.preference_store.load())
+
+    def test_successful_resume_and_new_save_the_used_conversation(self) -> None:
+        selected = session(name="resumed")
+        cache = mock.Mock(spec=CacheStore)
+        for action, method in (
+            (ACTION_RESUME, "_open_selection"),
+            (ACTION_NEW, "_new_session_selection"),
+        ):
+            with self.subTest(action=action):
+                with mock.patch(f"rofi_agent_plus.rofi.{method}") as lifecycle:
+                    run_rofi(
+                        {
+                            "ROFI_RETV": str(ROFI_RETV_SELECTED),
+                            "ROFI_INFO": selection_payload(selected),
+                            "ROFI_DATA": _refresh_data(
+                                navigation=NavigationState(VIEW_ACTIVE), action=action
+                            ),
+                        },
+                        store=cache,
+                        config=self._config(),
+                        preference_store=self.preference_store,
+                    )
+                lifecycle.assert_called_once()
+                self.assertEqual(
+                    ViewPreference(VIEW_ACTIVE, None, ("workstation", "codex", THREAD_ID)),
+                    self.preference_store.load(),
+                )
+
+    def test_fast_resume_saves_once_and_preference_write_failure_does_not_repeat_it(self) -> None:
+        revision = "sha256:" + "a" * 64
+        selected = session(
+            name="fast",
+            providerOptionVerified=True,
+            tmux={
+                "meshRevision": revision,
+                "serverGeneration": "tmux-v1:local",
+                "sessionId": "$1",
+                "createdAt": 100,
+                "observedName": "agent",
+            },
+            backend={
+                "kind": "contract",
+                "capability": "host-mesh-v1+tmux-session-v1",
+                "meshRevision": revision,
+            },
+        )
+        cache = mock.Mock(spec=CacheStore)
+        with mock.patch("rofi_agent_plus.rofi.fast_open_selection") as fast_open:
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_SELECTED),
+                    "ROFI_INFO": selection_payload(selected),
+                    "ROFI_DATA": _refresh_data(navigation=NavigationState("local")),
+                },
+                store=cache,
+                config=self._config(),
+                preference_store=self.preference_store,
+            )
+        fast_open.assert_called_once()
+        self.assertEqual(
+            ViewPreference("local", None, ("workstation", "codex", THREAD_ID)),
+            self.preference_store.load(),
+        )
+
+        failing_preferences = mock.Mock(spec=ViewPreferenceStore)
+        failing_preferences.save.side_effect = OSError("state is read-only")
+        output = io.StringIO()
+        with mock.patch("rofi_agent_plus.rofi._open_selection") as lifecycle:
+            with mock.patch("sys.stdout", output):
+                run_rofi(
+                    {
+                        "ROFI_RETV": str(ROFI_RETV_SELECTED),
+                        "ROFI_INFO": selection_payload(session(name="ordinary")),
+                        "ROFI_DATA": _refresh_data(navigation=NavigationState("local")),
+                    },
+                    store=cache,
+                    config=self._config(),
+                    preference_store=failing_preferences,
+                )
+        lifecycle.assert_called_once()
+        failing_preferences.save.assert_called_once()
+        self.assertEqual("", output.getvalue())
+
+    def test_failed_actions_and_refresh_cancellation_do_not_write_preferences(self) -> None:
+        remembered = ("workstation", "claude", "00000000-0000-0000-0000-000000000002")
+        original = ViewPreference("all", None, remembered)
+        self.assertTrue(self.preference_store.save(original))
+        before = self.preference_store.path.read_bytes()
+        selected = session("codex", THREAD_ID, name="new selection")
+        cache = mock.Mock(spec=CacheStore)
+        cache.load.return_value = {"sessions": [selected], "errors": []}
+        error_output = io.StringIO()
+        with mock.patch(
+            "rofi_agent_plus.rofi._open_selection", side_effect=engine.PickerError("stale")
+        ):
+            with mock.patch("sys.stdout", error_output):
+                run_rofi(
+                    {
+                        "ROFI_RETV": str(ROFI_RETV_SELECTED),
+                        "ROFI_INFO": selection_payload(selected),
+                        "ROFI_DATA": _refresh_data(
+                            navigation=NavigationState("local"), last_used=remembered
+                        ),
+                    },
+                    store=cache,
+                    config=self._config(),
+                    preference_store=self.preference_store,
+                )
+        self.assertIn("Unable to open session", error_output.getvalue())
+        self.assertEqual(original, self.preference_store.load())
+        self.assertEqual(before, self.preference_store.path.read_bytes())
+
+        timeout_store = mock.Mock(spec=CacheStore)
+        timeout_store.load.return_value = {"sessions": [selected], "errors": []}
+        timeout_store.is_fresh.return_value = True
+        output = io.StringIO()
+        with (
+            mock.patch("sys.stdout", output),
+            mock.patch("rofi_agent_plus.rofi.time.time", return_value=1000),
+        ):
+            run_rofi(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                    "ROFI_DATA": _refresh_data(
+                        1010, navigation=NavigationState(), last_used=remembered
+                    ),
+                    "ROFI_INFO": selection_payload(selected),
+                },
+                store=timeout_store,
+                config=self._config(),
+                preference_store=self.preference_store,
+            )
+            run_rofi(
+                {"ROFI_RETV": str(ROFI_RETV_CUSTOM_6)},
+                store=timeout_store,
+                config=self._config(),
+                preference_store=self.preference_store,
+            )
+        timeout_headers, _ = parse_rendered_records(output.getvalue())
+        self.assertEqual("0", header_value(timeout_headers, "new-selection"))
+        self.assertEqual(original, self.preference_store.load())
+        self.assertEqual(before, self.preference_store.path.read_bytes())
 
     def test_stale_mode_renders_immediately_and_starts_one_background_refresh(self) -> None:
         store = mock.Mock(spec=CacheStore)

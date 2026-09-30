@@ -9,6 +9,7 @@ ruff check .
 ruff format --check .
 
 test -x bin/rofi-agent-plus
+test -x bin/rofi-agent-plus-rofi
 test -x scripts/check
 test -x scripts/check-contract-sync
 test -f README.md

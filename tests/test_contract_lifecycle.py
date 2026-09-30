@@ -24,6 +24,7 @@ from rofi_agent_plus.contract_lifecycle import (
     fast_open_selection,
 )
 from rofi_agent_plus.rofi import _open_selection, run_rofi, selection_payload
+from rofi_agent_plus.view_preferences import ViewPreferenceStore
 
 ROOT = Path(__file__).parent / "fixtures" / "contract" / "lifecycle"
 THREAD = "11111111-1111-1111-1111-111111111111"
@@ -1020,6 +1021,7 @@ class ContractLifecycleTest(unittest.TestCase):
                     {"ROFI_RETV": "1", "ROFI_INFO": json.dumps(selected)},
                     store=store,
                     config=self.config,
+                    preference_store=ViewPreferenceStore(Path(self.temporary.name) / "state"),
                 ),
             )
         self.assertEqual("open", backend.calls[0][0][1])

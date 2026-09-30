@@ -75,8 +75,9 @@ possibilities. On 2026-09-30, the operator selected two small picker
 improvements: a global Active page in the existing Left/Right ring, and
 remembering the last page and successfully used conversation. The
 [picker navigation plan](agent-plus-picker-navigation-plan.md) records that
-direction and replaces the initial Active-only toggle proposal. Implementation
-and deployment are pending. Bulk reopening and saved groups remain separate
+direction and replaces the initial Active-only toggle proposal. These picker
+improvements are implemented in `0.7.0`; deployment and acceptance are tracked
+in the managed suite status ledger. Bulk reopening and saved groups remain separate
 possibilities. The discussion moved to a terminal client because it could
 address window management and reconnection together. Named workspaces and
 their UI complexity remain open.

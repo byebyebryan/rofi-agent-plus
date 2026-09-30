@@ -41,6 +41,7 @@ from rofi_agent_plus.contract_backend import (
 )
 from rofi_agent_plus.engine import PickerError
 from rofi_agent_plus.rofi import _open_selection, _parse_selection, render_snapshot, run_rofi
+from rofi_agent_plus.view_preferences import ViewPreferenceStore
 
 ROOT = Path(__file__).parent / "fixtures" / "contract"
 THREAD = "11111111-1111-1111-1111-111111111111"
@@ -2154,6 +2155,7 @@ class ContractCacheTest(unittest.TestCase):
                         {"ROFI_RETV": "0"},
                         store=store,
                         config=self.config,
+                        preference_store=ViewPreferenceStore(Path(temporary) / "state"),
                     ),
                 )
             self.assertIn("Contract refresh failed", rendered.getvalue())

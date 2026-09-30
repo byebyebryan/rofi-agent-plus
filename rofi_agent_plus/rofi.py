@@ -20,6 +20,12 @@ from . import engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig, load_config
 from .contract_lifecycle import ContractLifecycle, LifecycleError, fast_open_selection
+from .view_preferences import (
+    ViewPreference,
+    ViewPreferenceStore,
+    encode_last_used,
+    parse_last_used,
+)
 
 ROFI_RETV_SELECTED = 1
 ROFI_RETV_CUSTOM_1 = 10
@@ -154,6 +160,7 @@ class ContinuationState:
     check_deadline: float | None = None
     action: str = ACTION_RESUME
     action_valid: bool = True
+    last_used: SessionIdentity | None = None
 
     @property
     def has_lifecycle(self) -> bool:
@@ -185,6 +192,7 @@ class ContinuationState:
             check_deadline=live(self.check_deadline),
             action=self.action,
             action_valid=self.action_valid,
+            last_used=self.last_used,
         )
 
 
@@ -888,6 +896,7 @@ def _refresh_data(
     check_deadline: float | None = None,
     navigation: NavigationState | None = None,
     action: str = ACTION_RESUME,
+    last_used: SessionIdentity | None = None,
 ) -> str:
     """Encode refresh, notices, and optional navigation state for Rofi."""
 
@@ -906,6 +915,9 @@ def _refresh_data(
         values.append(f"{CHECK_NOTICE_DATA_PREFIX}{max(0, int(check_deadline))}")
     if navigation is not None and not navigation.is_default:
         values.append(_navigation_data(navigation))
+    last_used_data = encode_last_used(last_used)
+    if last_used_data is not None:
+        values.append(last_used_data)
     if not values:
         values.append(AUTO_REFRESH_IDLE_DATA)
     values.append(_action_data(action))
@@ -973,6 +985,7 @@ def _parse_continuation_state(value: object) -> ContinuationState:
         check_deadline=check_deadline,
         action=action,
         action_valid=action_valid,
+        last_used=parse_last_used(value),
     )
 
 
@@ -992,6 +1005,7 @@ def _render_continuation(
     clear_message: bool = True,
     continuation: bool = True,
     action: str | None = None,
+    last_used: SessionIdentity | None = None,
 ) -> str:
     """Render navigation while retaining live refresh/notice state.
 
@@ -1038,6 +1052,7 @@ def _render_continuation(
         continuation=continuation,
         navigation=target,
         action=action,
+        last_used=state.last_used if last_used is None else last_used,
     )
 
 
@@ -1061,6 +1076,8 @@ def render_snapshot(
     keep_selection: bool | None = None,
     reset_selection: bool = False,
     action: str = ACTION_RESUME,
+    last_used: SessionIdentity | None = None,
+    initial_open: bool = False,
 ) -> str:
     """Render a snapshot as Rofi script headers and rows."""
 
@@ -1119,6 +1136,7 @@ def render_snapshot(
                     check_deadline=check_deadline if timeout else None,
                     navigation=navigation,
                     action=action,
+                    last_used=last_used,
                 ),
             )
         )
@@ -1127,7 +1145,12 @@ def render_snapshot(
         # failures) still need to carry the active scope to the next callback.
         # Explicitly emit ``idle`` for All so stale continuation data cannot
         # leak across a root transition if Rofi retains the previous data.
-        headers.append(_protocol("data", _refresh_data(navigation=navigation, action=action)))
+        headers.append(
+            _protocol(
+                "data",
+                _refresh_data(navigation=navigation, action=action, last_used=last_used),
+            )
+        )
 
     rendered_rows: list[str] = []
     emitted = 0
@@ -1141,7 +1164,9 @@ def render_snapshot(
         headers.append(_protocol("new-selection", 0))
     elif len(selected_indices) == 1 and keep_selection:
         headers.append(_protocol("new-selection", selected_indices[0]))
-    elif navigation.view == VIEW_ACTIVE and selected_identity is not None and keep_selection:
+    elif keep_selection and (
+        initial_open or (navigation.view == VIEW_ACTIVE and selected_identity is not None)
+    ):
         headers.append(_protocol("new-selection", 0))
     for session in rows:
         kind = str(session.get("kind") or "")
@@ -1323,6 +1348,38 @@ def _cycled_scope(
     return ring[(index + direction) % len(ring)]
 
 
+def _navigation_from_preference(preference: ViewPreference) -> NavigationState:
+    if preference.page_kind == VIEW_HOST:
+        return NavigationState(VIEW_HOST, preference.page_host_id)
+    if preference.page_kind in {VIEW_ACTIVE, VIEW_ALL, VIEW_LOCAL}:
+        return NavigationState(preference.page_kind)
+    return NavigationState()
+
+
+def _preference_for_navigation(
+    navigation: NavigationState,
+    last_used: SessionIdentity | None,
+) -> ViewPreference:
+    return ViewPreference(
+        page_kind=navigation.view,
+        page_host_id=navigation.host_id if navigation.view == VIEW_HOST else None,
+        last_used=last_used,
+    )
+
+
+def _save_preference_best_effort(
+    preference_store: ViewPreferenceStore,
+    navigation: NavigationState,
+    last_used: SessionIdentity | None,
+) -> None:
+    """Persist UI hints without allowing storage failure to affect the action."""
+
+    try:
+        preference_store.save(_preference_for_navigation(navigation, last_used))
+    except Exception:  # noqa: BLE001 - UI preference writes are strictly best effort
+        pass
+
+
 def _open_selection(
     selection: Mapping[str, Any],
     config: PickerConfig,
@@ -1470,6 +1527,8 @@ def _render_error_notice(
     keep_selection: bool | None = None,
     reset_selection: bool = False,
     action: str = ACTION_RESUME,
+    last_used: SessionIdentity | None = None,
+    initial_open: bool = False,
 ) -> str:
     """Render a user-visible error with a bounded, self-clearing timeout."""
 
@@ -1490,6 +1549,8 @@ def _render_error_notice(
         keep_selection=keep_selection,
         reset_selection=reset_selection,
         action=action,
+        last_used=last_used,
+        initial_open=initial_open,
     )
 
 
@@ -1534,10 +1595,12 @@ def _auto_refresh_callback(
 
     def render(*args: object, **kwargs: object) -> str:
         kwargs.setdefault("action", action)
+        kwargs.setdefault("last_used", continuation_state.last_used)
         return render_snapshot(*args, **kwargs)
 
     def render_error(*args: object, **kwargs: object) -> str:
         kwargs.setdefault("action", action)
+        kwargs.setdefault("last_used", continuation_state.last_used)
         return _render_error_notice(*args, **kwargs)
 
     snapshot = _presentation_snapshot(store, config, context)
@@ -1772,6 +1835,7 @@ def run_rofi(
     *,
     store: CacheStore | None = None,
     config: PickerConfig | None = None,
+    preference_store: ViewPreferenceStore | None = None,
 ) -> int:
     """Process one Rofi script invocation."""
 
@@ -1786,9 +1850,33 @@ def run_rofi(
         # return as a migration guard for an older binding that still routed
         # it through script mode; no cache/model/config work is safe here.
         return 0
-    continuation_state = _parse_continuation_state(environ.get("ROFI_DATA"))
-    navigation = continuation_state.navigation
-    action = continuation_state.action if continuation_state.action_valid else ACTION_RESUME
+    preference_store = preference_store or ViewPreferenceStore()
+    if retv == 0:
+        continuation_state = ContinuationState()
+        saved_preference = preference_store.load()
+        navigation = _navigation_from_preference(saved_preference)
+        last_used = saved_preference.last_used
+        action = ACTION_RESUME
+    else:
+        continuation_state = _parse_continuation_state(environ.get("ROFI_DATA"))
+        navigation = continuation_state.navigation
+        last_used = continuation_state.last_used
+        action = continuation_state.action if continuation_state.action_valid else ACTION_RESUME
+
+    def emit_snapshot(*args: object, **kwargs: object) -> str:
+        kwargs.setdefault("last_used", last_used)
+        if retv == 0:
+            kwargs["selected_identity"] = last_used
+            kwargs.setdefault("initial_open", True)
+        return render_snapshot(*args, **kwargs)
+
+    def emit_error(*args: object, **kwargs: object) -> str:
+        kwargs.setdefault("last_used", last_used)
+        if retv == 0:
+            kwargs["selected_identity"] = last_used
+            kwargs.setdefault("initial_open", True)
+        return _render_error_notice(*args, **kwargs)
+
     callback_selection_identity = (
         _parse_selected_identity(environ.get("ROFI_INFO"))
         if retv
@@ -1816,7 +1904,7 @@ def run_rofi(
                 # has elapsed, clear it rather than starting another notice
                 # merely because config loading still fails.  A still-live
                 # background worker remains visible and keeps its poll alive.
-                rendered = render_snapshot(
+                rendered = emit_snapshot(
                     None,
                     message=(
                         "Checking sessions…"
@@ -1838,7 +1926,7 @@ def run_rofi(
                 # A config failure is a new operation error.  Do not let an
                 # unrelated active refresh (or its old notice text) hide it;
                 # carry the refresh deadline alongside a fresh bounded notice.
-                rendered = _render_error_notice(
+                rendered = emit_error(
                     None,
                     str(exc)
                     if active.refresh_deadline
@@ -1853,7 +1941,7 @@ def run_rofi(
                     action=action,
                 )
         else:
-            rendered = _render_error_notice(
+            rendered = emit_error(
                 None,
                 str(exc),
                 preserve=retv != 0,
@@ -1872,7 +1960,7 @@ def run_rofi(
         try:
             snapshot = _presentation_snapshot(store, config)
             if not continuation_state.action_valid:
-                rendered = render_snapshot(
+                rendered = emit_snapshot(
                     snapshot,
                     message="Invalid Agent action state; choose Resume and try again.",
                     selected_identity=callback_selection_identity,
@@ -1895,9 +1983,10 @@ def run_rofi(
                     preserve=True,
                     preserve_filter=True,
                     action=next_action,
+                    last_used=last_used,
                 )
         except Exception as exc:  # noqa: BLE001 - cache-only callback boundary
-            rendered = _render_error_notice(
+            rendered = emit_error(
                 None,
                 f"Action selection failed: {sanitize(exc)}",
                 selected_identity=callback_selection_identity,
@@ -1920,18 +2009,24 @@ def run_rofi(
         # cursor for the newly rendered leaf list.
         direction = 1 if retv == ROFI_RETV_CUSTOM_2 else -1
         next_navigation = _cycled_scope(None, navigation, direction)
+        preference_saved = False
         try:
             snapshot = _presentation_snapshot(store, config)
             next_navigation = _cycled_scope(snapshot, navigation, direction)
+            _save_preference_best_effort(preference_store, next_navigation, last_used)
+            preference_saved = True
             rendered = _render_continuation(
                 snapshot,
                 continuation_state,
                 navigation=next_navigation,
                 preserve_filter=True,
                 reset_selection=True,
+                last_used=last_used,
             )
         except Exception as exc:  # noqa: BLE001 - structural callback boundary
-            rendered = _render_error_notice(
+            if not preference_saved:
+                _save_preference_best_effort(preference_store, next_navigation, last_used)
+            rendered = emit_error(
                 None,
                 f"Navigation failed: {sanitize(exc)}",
                 preserve=False,
@@ -1943,6 +2038,7 @@ def run_rofi(
                 keep_selection=True,
                 reset_selection=True,
                 action=action,
+                last_used=last_used,
             )
         print(rendered, end="")
         return 0
@@ -1971,13 +2067,18 @@ def run_rofi(
                     # Tmux Plus has already validated and opened this exact
                     # reference.  No cache reconciliation is needed because
                     # the reference itself did not change.
+                    _save_preference_best_effort(
+                        preference_store,
+                        navigation,
+                        _session_identity(preselected) or last_used,
+                    )
                     return 0
 
     try:
         context = _presentation_context(store, config)
     except Exception as exc:  # noqa: BLE001 - private model boundary
         print(
-            _render_error_notice(
+            emit_error(
                 None,
                 f"Model setup failed: {sanitize(exc)}",
                 selected_identity=callback_selection_identity,
@@ -2002,7 +2103,7 @@ def run_rofi(
             if snapshot is None:
                 snapshot = store.refresh(config, force=True, context=context)
             print(
-                _render_error_notice(
+                emit_error(
                     snapshot,
                     f"Contract refresh failed: {sanitize(context.error)}",
                     selected_identity=callback_selection_identity,
@@ -2017,7 +2118,7 @@ def run_rofi(
             )
         except Exception as exc:  # noqa: BLE001 - defensive callback boundary
             print(
-                _render_error_notice(
+                emit_error(
                     None,
                     f"Contract refresh failed: {sanitize(exc)}",
                     selected_identity=callback_selection_identity,
@@ -2045,7 +2146,7 @@ def run_rofi(
             snapshot = _presentation_snapshot(store, config, context)
         except Exception as exc:  # noqa: BLE001 - private model boundary
             print(
-                _render_error_notice(
+                emit_error(
                     None,
                     f"Model refresh failed: {sanitize(exc)}",
                     preserve=True,
@@ -2060,7 +2161,7 @@ def run_rofi(
             return 0
         notice = "Custom input is disabled" if retv == 2 else "Deletion is disabled"
         print(
-            render_snapshot(
+            emit_snapshot(
                 snapshot,
                 message=notice,
                 selected=selected,
@@ -2089,6 +2190,11 @@ def run_rofi(
                 _new_session_selection(selected, config, store=store, context=context)
             else:
                 _open_selection(selected, config, store=store, context=context)
+            _save_preference_best_effort(
+                preference_store,
+                navigation,
+                _session_identity(selected) or last_used,
+            )
             # No rows means Rofi closes after a successful action.
             return 0
         except Exception as exc:  # noqa: BLE001 - selected callback boundary
@@ -2097,7 +2203,7 @@ def run_rofi(
             except Exception:  # noqa: BLE001 - preserve the original callback error
                 snapshot = None
             print(
-                _render_error_notice(
+                emit_error(
                     snapshot,
                     message=(
                         f"Unable to start new session: {sanitize(exc)}"
@@ -2120,7 +2226,7 @@ def run_rofi(
         try:
             rendered = _auto_refresh_callback(environ, store, config, context)
         except Exception as exc:  # noqa: BLE001 - timeout callback boundary
-            rendered = _render_error_notice(
+            rendered = emit_error(
                 None,
                 f"Refresh failed: {sanitize(exc)}",
                 selected_identity=callback_selection_identity,
@@ -2147,7 +2253,7 @@ def run_rofi(
             )
             if not polling:
                 print(
-                    _render_error_notice(
+                    emit_error(
                         snapshot,
                         "Unable to start background refresh",
                         selected_identity=callback_selection_identity,
@@ -2160,7 +2266,7 @@ def run_rofi(
                 )
                 return 0
             print(
-                render_snapshot(
+                emit_snapshot(
                     snapshot,
                     message="Checking sessions…",
                     selected_identity=callback_selection_identity,
@@ -2181,7 +2287,7 @@ def run_rofi(
             except Exception:  # noqa: BLE001 - preserve the original refresh error
                 snapshot = None
             print(
-                _render_error_notice(
+                emit_error(
                     snapshot,
                     message=f"Refresh failed: {sanitize(exc)}",
                     selected_identity=callback_selection_identity,
@@ -2200,7 +2306,7 @@ def run_rofi(
         snapshot = _presentation_snapshot(store, config, context)
     except Exception as exc:  # noqa: BLE001 - initial model boundary
         print(
-            _render_error_notice(
+            emit_error(
                 None,
                 f"Model refresh failed: {sanitize(exc)}",
                 refresh_deadline=continuation_state.active().refresh_deadline,
@@ -2218,7 +2324,7 @@ def run_rofi(
             snapshot = store.refresh(config, context=context) if context else store.refresh(config)
         except Exception as exc:  # noqa: BLE001 - initial refresh boundary
             print(
-                _render_error_notice(
+                emit_error(
                     None,
                     f"Refresh failed: {sanitize(exc)}",
                     refresh_deadline=continuation_state.active().refresh_deadline,
@@ -2244,11 +2350,9 @@ def run_rofi(
                 if latest is not None and store.is_fresh(latest, config.refresh_seconds):
                     latest_message = summarize_errors(latest.get("errors", []))
                     print(
-                        _render_error_notice(
-                            latest, latest_message, navigation=navigation, action=action
-                        )
+                        emit_error(latest, latest_message, navigation=navigation, action=action)
                         if latest_message
-                        else render_snapshot(latest, navigation=navigation, action=action),
+                        else emit_snapshot(latest, navigation=navigation, action=action),
                         end="",
                     )
                     return 0
@@ -2257,12 +2361,12 @@ def run_rofi(
             )
             if not polling and message:
                 print(
-                    _render_error_notice(snapshot, message, navigation=navigation, action=action),
+                    emit_error(snapshot, message, navigation=navigation, action=action),
                     end="",
                 )
                 return 0
             print(
-                render_snapshot(
+                emit_snapshot(
                     snapshot,
                     message=message,
                     timeout=True if polling else None,
@@ -2276,7 +2380,7 @@ def run_rofi(
             return 0
     message = _message_for_cache(store, snapshot, config)
     if message:
-        print(_render_error_notice(snapshot, message, navigation=navigation, action=action), end="")
+        print(emit_error(snapshot, message, navigation=navigation, action=action), end="")
     else:
-        print(render_snapshot(snapshot, navigation=navigation, action=action), end="")
+        print(emit_snapshot(snapshot, navigation=navigation, action=action), end="")
     return 0
