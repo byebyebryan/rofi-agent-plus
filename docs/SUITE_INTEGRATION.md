@@ -75,6 +75,12 @@ P8 established the flat host-scope ring. Its release retained Rofi's native
 Tab row navigation; the later P10 action cycle replaces that binding while
 preserving P8's cached Left and Right scope behavior.
 
+A [planned navigation follow-up](agent-plus-picker-navigation-plan.md) adds
+Active to the same page ring and remembers the last page and successfully used
+conversation between launches. It replaces the proposed Active-only toggle;
+implementation and deployment are pending. The P8 behavior above describes
+the current picker.
+
 ## P10 action cycle
 
 Up and Down navigate rows. Tab (`custom-7`, return value 16) selects the next

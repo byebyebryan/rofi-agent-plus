@@ -71,9 +71,15 @@ underlying issue is window-per-session presentation. The desired experience
 should also work on a small screen and with other window managers.
 
 Sticky picker scope/selection, bulk reopening, and saved groups were earlier
-possibilities. They remain possible incremental improvements. The discussion
-moved to a terminal client because it could address window management and
-reconnection together. Named workspaces and their UI complexity remain open.
+possibilities. On 2026-09-30, the operator selected two small picker
+improvements: a global Active page in the existing Left/Right ring, and
+remembering the last page and successfully used conversation. The
+[picker navigation plan](agent-plus-picker-navigation-plan.md) records that
+direction and replaces the initial Active-only toggle proposal. Implementation
+and deployment are pending. Bulk reopening and saved groups remain separate
+possibilities. The discussion moved to a terminal client because it could
+address window management and reconnection together. Named workspaces and
+their UI complexity remain open.
 
 ## The primary object is the agent conversation
 

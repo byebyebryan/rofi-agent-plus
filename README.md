@@ -223,6 +223,11 @@ and keeps only provider-owned Agent Plus configuration. DMS remains responsible
 for the bar, notifications, idle handling, lock screen, polkit, and the general
 Spotlight launcher.
 
+The [picker navigation plan](docs/agent-plus-picker-navigation-plan.md) records
+the planned Active page and restoration of the last page and successfully used
+conversation. It is an implementation plan; these features are not in the
+current picker yet.
+
 The [session client exploration](docs/agent-plus-session-client-exploration.md)
 and its linked feasibility studies record possible future presentation work.
 They do not change the current picker or its public contracts.
