@@ -120,14 +120,13 @@ an implicit batch operation, and a group row never becomes the remembered
 conversation. Opening still restores the remembered conversation or first
 real conversation, falling back to the group only on an empty page.
 
-Prefer changing the action bar when the native highlighted row changes if a
-simple supported Rofi integration can do so. Prove this before selecting that
-implementation. Rofi's selection-change command is distinct from the normal
-script callback and does not itself define a script redraw. If immediate
-updates require extra machinery, Enter on the group or Alt+A activates its
-context **in place**. This fallback was explicitly included in the accepted
-proposal. Use only dialog-local finite UI state; no persistent helper, global
-keyboard injection, provider hooks, or perpetual polling for cursor tracking.
+The native Rofi 2.0.0 probe on 2026-10-01 confirmed that the selection-change
+command launches separately and its output is not parsed as a script response.
+Moving the cursor fired the hook but did not call the script executor again.
+There is no simple supported redraw through that hook. Use the agreed fallback:
+Enter on the group or Alt+A activates its context **in place**. Use only
+dialog-local finite UI state; no persistent helper, global keyboard injection,
+provider hooks, or perpetual polling for cursor tracking.
 
 The contextual message names the target group and current action. While the
 group context is active, entering a conversation returns to individual
