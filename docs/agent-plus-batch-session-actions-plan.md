@@ -2,8 +2,7 @@
 
 Date: 2026-09-30
 
-Status: implemented in Agent Plus `0.8.0` with Tmux Plus `0.4.0`; coordinated
-deployment is in progress. The operator selected all eligible active sessions
+Status: implemented in Agent Plus `0.8.0` with Tmux Plus `0.4.0`. The operator selected all eligible active sessions
 on the current page and a small Batch actions menu. The source gates and owned
 public viewer and spawned batch-job fixtures passed.
 
@@ -278,7 +277,8 @@ completed through the public viewer contract, and preserved its owned session
 and process. Native Rofi Alt+A with no search matches opened the menu, Close
 built a read-only preview, and native Ctrl+G cancelled with unchanged isolated
 preferences and no job. Source gates passed 191 Tmux tests and 259 Agent tests.
-The coordinated deployment and installed gates are the remaining release work.
+The current coordinated deployment and installed acceptance are recorded in
+the [managed fleet status](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md).
 
 ## Acceptance and limits
 
