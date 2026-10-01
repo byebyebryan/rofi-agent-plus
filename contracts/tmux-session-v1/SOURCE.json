@@ -2,6 +2,6 @@
   "contract": "tmux-session-v1",
   "upstreamRepository": "https://github.com/byebyebryan/rofi-tmux-plus",
   "sourceState": "released",
-  "sourceCommit": "0126305fa190a25505a7aca7041018a269c70ade",
-  "bundleDigest": "sha256:af8b5bcaf957568102970bccc6933faeeeef9c0e64070a820abc7bdf18c34599"
+  "sourceCommit": "1e348c06969e377d41b493b6626590122080b58a",
+  "bundleDigest": "sha256:dff45ee114bbb7346ec752ccc70f7037482819e9801419250c4627c98bb93c7f"
 }
