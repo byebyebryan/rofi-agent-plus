@@ -56,11 +56,12 @@ NAVIGATION_DATA_VERSION = 2
 ACTION_DATA_PREFIX = "action:"
 ACTION_DATA_VERSION = 1
 ACTION_RESUME = "resume"
+ACTION_CLOSE = batch.ACTION_CLOSE
 ACTION_NEW = "new-session-here"
-ACTION_ORDER = (ACTION_RESUME, ACTION_NEW)
+ACTION_ORDER = (ACTION_RESUME, ACTION_CLOSE, ACTION_NEW)
 BATCH_UI_DATA_PREFIX = "batch-ui:"
-_BATCH_SCREENS = frozenset({"group", "preview", "job"})
-_BATCH_ROW_TYPES = frozenset({"batch", "batch-group", "batch-confirm", "batch-target", "batch-job"})
+_BATCH_SCREENS = frozenset({"preview", "job"})
+_BATCH_ROW_TYPES = frozenset({"batch", "batch-confirm", "batch-target", "batch-job"})
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _DISPLAY_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
@@ -208,8 +209,8 @@ class BatchUIState:
 
     screen: str
     source_identity: SessionIdentity | None = None
-    # This is the separate group action cycle. Individual Resume/New action
-    # state remains in ContinuationState.action and cannot be changed by it.
+    # Preview operation; the shared Resume/Close/New selection lives in
+    # ContinuationState.action and survives preview/job exits.
     action: str | None = None
     record_id: str | None = None
 
@@ -250,9 +251,10 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
         return None
     screen = payload.get("screen")
     if not isinstance(screen, str) or screen not in _BATCH_SCREENS:
+        # A 0.9 group continuation is no longer an action context. Treat it
+        # as ordinary root state so it cannot invoke a hidden operation.
         return None
     allowed = {
-        "group": {"version", "screen", "sourceIdentity", "action"},
         "preview": {"version", "screen", "sourceIdentity", "action", "recordId"},
         "job": {"version", "screen", "sourceIdentity", "recordId"},
     }[screen]
@@ -270,7 +272,7 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
             return None
     action = payload.get("action")
     record_id = payload.get("recordId")
-    if screen in {"group", "preview"}:
+    if screen == "preview":
         if action not in {batch.ACTION_CLOSE, batch.ACTION_RESUME}:
             return None
     elif action is not None:
@@ -281,10 +283,6 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
     elif screen == "job":
         if not isinstance(record_id, str) or not batch._ID.fullmatch(record_id):
             return None
-    elif screen == "group" and record_id is not None:
-        return None
-    elif screen not in {"group", "preview"}:
-        return None
     return BatchUIState(screen, source_identity, action, record_id)
 
 
@@ -719,7 +717,8 @@ def _breadcrumb(navigation: NavigationState, snapshot: Mapping[str, Any] | None 
 def _action_label(action: str) -> str:
     return {
         ACTION_RESUME: "Resume",
-        ACTION_NEW: "New session here",
+        ACTION_CLOSE: "Close",
+        ACTION_NEW: "New",
     }[action]
 
 
@@ -734,7 +733,7 @@ def _action_hint(action: str) -> str:
         if candidate == action:
             label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
         labels.append(label)
-    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions  │  Alt+A: Active group"
+    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions  │  Alt+A: Select All active"
 
 
 def _action_message(action: str, notice: str) -> str:
@@ -867,6 +866,11 @@ def selection_payload(session: Mapping[str, Any]) -> str:
         payload["providerOptionVerified"] = bool(
             verified and not session.get("tmuxStale") and not session.get("tmuxAmbiguous")
         )
+    payload["tmuxAssociationCurrent"] = bool(
+        session.get("sourceObservation") == "current"
+        and not session.get("tmuxStale")
+        and not session.get("tmuxAmbiguous")
+    )
     if "tmux" in session:
         payload["tmux"] = session["tmux"]
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -1281,6 +1285,7 @@ def _render_continuation(
     continuation: bool = True,
     action: str | None = None,
     last_used: SessionIdentity | None = None,
+    batch_initial_control: bool = False,
 ) -> str:
     """Render navigation while retaining live refresh/notice state.
 
@@ -1329,6 +1334,7 @@ def _render_continuation(
         action=action,
         last_used=state.last_used if last_used is None else last_used,
         batch_state=state.batch_state,
+        batch_initial_control=batch_initial_control,
     )
 
 
@@ -1484,7 +1490,7 @@ def render_snapshot(
         headers.append(_protocol("new-selection", 0))
     elif keep_selection and (initial_open or preserve or selected_identity is not None):
         # A missing remembered/current selection falls back to the first real
-        # conversation, or to the active group row when the page is empty.
+        # conversation, or to All active when the page is empty.
         headers.append(_protocol("new-selection", first_conversation))
     if inline_batch:
         rendered_rows.append(
@@ -1522,13 +1528,6 @@ def render_snapshot(
         info = selection_payload(session)
         identity = _session_identity(session)
         badge = target_badges.get(identity) if identity is not None else None
-        if (
-            badge is None
-            and inline_batch
-            and batch_state.screen == "group"
-            and identity in active_membership
-        ):
-            badge = "Active set in scope · observed"
         search_metadata = " ".join(
             (
                 *(
@@ -1702,6 +1701,9 @@ def _parse_selection(raw: str | None) -> dict[str, Any]:
     verified = payload.get("providerOptionVerified")
     if "providerOptionVerified" in payload and not isinstance(verified, bool):
         raise engine.PickerError("Rofi contract tmux evidence marker is invalid")
+    association_current = payload.get("tmuxAssociationCurrent")
+    if "tmuxAssociationCurrent" in payload and not isinstance(association_current, bool):
+        raise engine.PickerError("Rofi contract association evidence marker is invalid")
     if tmux is not None:
         if (
             not isinstance(tmux, Mapping)
@@ -1931,6 +1933,7 @@ def _render_error_notice(
     action: str = ACTION_RESUME,
     last_used: SessionIdentity | None = None,
     initial_open: bool = False,
+    batch_initial_control: bool = False,
 ) -> str:
     """Render a user-visible error with a bounded, self-clearing timeout."""
 
@@ -1953,6 +1956,7 @@ def _render_error_notice(
         action=action,
         last_used=last_used,
         initial_open=initial_open,
+        batch_initial_control=batch_initial_control,
     )
 
 
@@ -1990,7 +1994,12 @@ def _auto_refresh_callback(
     rofi_data = environ.get("ROFI_DATA")
     continuation_state = _parse_continuation_state(rofi_data)
     navigation = continuation_state.navigation
-    selected_identity = _parse_selected_identity(environ.get("ROFI_INFO"))
+    raw_selection = environ.get("ROFI_INFO")
+    selected_identity = _parse_selected_identity(raw_selection)
+    selected_control = _parse_batch_row(raw_selection)
+    preserve_batch_control = (
+        selected_control is not None and selected_control.get("type") == "batch"
+    )
     now = time.time()
     active_state = continuation_state.active(now)
     action = active_state.action if active_state.action_valid else ACTION_RESUME
@@ -1998,11 +2007,13 @@ def _auto_refresh_callback(
     def render(*args: object, **kwargs: object) -> str:
         kwargs.setdefault("action", action)
         kwargs.setdefault("last_used", continuation_state.last_used)
+        kwargs.setdefault("batch_initial_control", preserve_batch_control)
         return render_snapshot(*args, **kwargs)
 
     def render_error(*args: object, **kwargs: object) -> str:
         kwargs.setdefault("action", action)
         kwargs.setdefault("last_used", continuation_state.last_used)
+        kwargs.setdefault("batch_initial_control", preserve_batch_control)
         return _render_error_notice(*args, **kwargs)
 
     snapshot = _presentation_snapshot(store, config, context)
@@ -2268,12 +2279,6 @@ def _parse_batch_row(raw: str | None) -> Mapping[str, object] | None:
     row_type = value.get("type")
     if row_type not in _BATCH_ROW_TYPES:
         return None
-    if row_type == "batch-group":
-        return (
-            value
-            if set(value) == {"type", "action"} and value.get("action") in _BATCH_ACTION_ORDER
-            else None
-        )
     if row_type == "batch-confirm":
         return (
             value
@@ -2332,21 +2337,22 @@ def _inline_batch_control_row(
     job: Mapping[str, object] | None,
     notice: str,
 ) -> str:
-    if state.screen == "group":
-        count = len(_group_sessions(snapshot, navigation))
-        label = f"All active sessions ({count}) · {_batch_action_label(state.action or batch.ACTION_RESUME)}"
-        return _batch_record(
-            label,
-            row_type="batch-group",
-            action=state.action or batch.ACTION_RESUME,
-            meta="all active sessions group",
-            display=label,
-        )
     if state.screen == "preview":
         if _batch_can_confirm(state, record):
             targets = record.get("targets")
             count = len(targets) if isinstance(targets, list) else 0
-            label = f"Confirm {_batch_action_label(state.action or batch.ACTION_RESUME)} · {count} fixed targets"
+            scope = record.get("scope")
+            single_close = (
+                state.action == batch.ACTION_CLOSE
+                and isinstance(scope, str)
+                and scope.startswith("Selected conversation ·")
+            )
+            operation = (
+                "Close selected conversation"
+                if single_close
+                else _batch_action_label(state.action or batch.ACTION_RESUME)
+            )
+            label = f"Confirm {operation} · {count} fixed target{'s' if count != 1 else ''}"
             return _batch_record(
                 label,
                 row_type="batch-confirm",
@@ -2442,41 +2448,32 @@ def _batch_context_message(
         if state.screen == "job" and isinstance(job, Mapping)
         else batch.scope_label(catalog, _batch_scope(navigation))
     )
-    lines = [f"All active sessions · Scope: {_pango_escape(scope)}"]
-    if state.screen == "group":
-        action = state.action if state.action in _BATCH_ACTION_ORDER else batch.ACTION_RESUME
-        labels = [
-            (
-                f'<span foreground="#42a5f5" weight="bold">'
-                f"[{_pango_escape(_batch_action_label(candidate))}]</span>"
-                if candidate == action
-                else _pango_escape(_batch_action_label(candidate))
-            )
-            for candidate in _BATCH_ACTION_ORDER
-        ]
-        lines.extend(
-            (
-                f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions",
-                _pango_escape(
-                    "Enter on the group prepares a fixed preview; Enter on a conversation "
-                    "switches to individual actions · Shift+Tab reverses the group action cycle"
-                ),
-                _pango_escape("Alt+A returns to individual actions"),
-            )
-        )
-    elif state.screen == "preview":
+    operation = (
+        str(record.get("action") or state.action or batch.ACTION_RESUME)
+        if state.screen == "preview" and isinstance(record, Mapping)
+        else str(job.get("action") or batch.ACTION_RESUME)
+        if state.screen == "job" and isinstance(job, Mapping)
+        else state.action or batch.ACTION_RESUME
+    )
+    single_close = operation == batch.ACTION_CLOSE and scope.startswith("Selected conversation ·")
+    subject = "Selected conversation" if single_close else "All active sessions"
+    lines = [f"{subject} · Scope: {_pango_escape(scope)}"]
+    if state.screen == "preview":
         targets = record.get("targets") if isinstance(record, Mapping) else None
         count = len(targets) if isinstance(targets, list) else 0
+        operation_label = (
+            "Close selected conversation" if single_close else _batch_action_label(operation)
+        )
         lines.extend(
             (
                 _pango_escape(
-                    f"Preview: {_batch_action_label(state.action or batch.ACTION_RESUME)} · "
+                    f"Preview: {operation_label} · "
                     f"{count} fixed eligible target{'s' if count != 1 else ''}"
                     " · Search does not change the frozen list"
                 ),
                 _pango_escape(
                     "Only Confirm runs this exact preview; Tab/Shift+Tab discards it and "
-                    "changes the action · Alt+A returns to the group"
+                    "changes the shared action · Alt+A selects All active"
                 ),
             )
         )
@@ -2491,7 +2488,7 @@ def _batch_context_message(
                 _pango_escape(f"Batch {status} · {batch.job_summary(job or {})}"),
                 _pango_escape(
                     "The confirmed job keeps running if Escape closes this view "
-                    "· Alt+A returns to individual actions"
+                    "· Alt+A selects All active"
                 ),
             )
         )
@@ -2556,9 +2553,10 @@ def _root_after_batch(
     source_identity: SessionIdentity | None,
     *,
     notice: str = "",
+    active_control: bool = False,
 ) -> str:
     snapshot = _presentation_snapshot(store, config)
-    selected_identity = source_identity or last_used
+    selected_identity = None if active_control else source_identity or last_used
     active = continuation_state.active()
     if active.error_deadline is not None:
         message = active.error_message
@@ -2588,6 +2586,7 @@ def _root_after_batch(
         keep_selection=True,
         action=action,
         last_used=last_used,
+        batch_initial_control=active_control,
         initial_open=True,
     )
 
@@ -2687,6 +2686,10 @@ def _handle_batch_screen(
     ) -> str:
         if snapshot is None:
             snapshot = _presentation_snapshot(store, config)
+        if state_value.screen == "preview" and record is None:
+            record = batch_store.read_preview(state_value.record_id or "")
+        if state_value.screen == "job" and job is None:
+            job = batch_store.current_job(state_value.record_id)
         return _render_batch_inline(
             snapshot,
             continuation_state,
@@ -2738,14 +2741,19 @@ def _handle_batch_screen(
                     record=batch_store.read_preview(state.record_id or ""),
                     notice=failure,
                 )
-            group_state = BatchUIState("group", source_identity, state.action)
-            return render_context(
-                group_state,
-                selected=None,
+            return _root_after_batch(
+                store,
+                config,
+                navigation,
+                continuation_state,
+                action,
+                last_used,
+                None,
                 notice="Preview discarded; the fixed target list was not changed.",
-                initial_control=True,
+                active_control=True,
             )
-        # Alt+A in the group or job view returns to ordinary individual actions.
+        # Alt+A from a confirmed job hides its status while the finite worker
+        # continues; from a preview it also selects the root control row.
         return _root_after_batch(
             store,
             config,
@@ -2753,29 +2761,16 @@ def _handle_batch_screen(
             continuation_state,
             action,
             last_used,
-            selected_identity or source_identity,
+            None,
+            active_control=True,
         )
 
     if retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
         direction = 1 if retv == ROFI_RETV_CUSTOM_7 else -1
-        if state.screen == "group":
-            current_action = (
-                state.action if state.action in _BATCH_ACTION_ORDER else batch.ACTION_RESUME
-            )
-            next_action = _BATCH_ACTION_ORDER[
-                (_BATCH_ACTION_ORDER.index(current_action) + direction) % len(_BATCH_ACTION_ORDER)
-            ]
-            return render_context(
-                BatchUIState("group", source_identity, next_action),
-                selected=None,
-                keep_filter=True,
-            )
         if state.screen == "preview":
-            current_action = (
-                state.action if state.action in _BATCH_ACTION_ORDER else batch.ACTION_RESUME
-            )
-            next_action = _BATCH_ACTION_ORDER[
-                (_BATCH_ACTION_ORDER.index(current_action) + direction) % len(_BATCH_ACTION_ORDER)
+            current_action = action if action in ACTION_ORDER else ACTION_RESUME
+            next_action = ACTION_ORDER[
+                (ACTION_ORDER.index(current_action) + direction) % len(ACTION_ORDER)
             ]
             # The one-file private preview is no longer referenced by the
             # dialog. A new Enter must prepare a fresh operation preview.
@@ -2785,11 +2780,16 @@ def _handle_batch_screen(
                     record=batch_store.read_preview(state.record_id or ""),
                     notice=failure,
                 )
-            return render_context(
-                BatchUIState("group", source_identity, next_action),
-                selected=None,
-                notice=f"Preview discarded; {_batch_action_label(next_action)} is selected.",
-                initial_control=True,
+            return _root_after_batch(
+                store,
+                config,
+                navigation,
+                continuation_state,
+                next_action,
+                last_used,
+                source_identity,
+                notice=f"Preview discarded; {_action_label(next_action)} is selected.",
+                active_control=source_identity is None,
             )
         job = batch_store.current_job(state.record_id)
         return render_context(
@@ -2810,63 +2810,25 @@ def _handle_batch_screen(
         if state.screen == "preview":
             record = batch_store.read_preview(state.record_id or "")
             if record is None:
-                return render_context(
-                    BatchUIState("group", source_identity, state.action),
-                    selected=None,
-                    notice="Preview expired; choose the group action again.",
-                    initial_control=True,
+                return _root_after_batch(
+                    store,
+                    config,
+                    navigation,
+                    continuation_state,
+                    action,
+                    last_used,
+                    source_identity,
+                    notice="Preview expired; choose the action again.",
+                    active_control=source_identity is None,
                 )
             return render_context(record=record, keep_filter=True)
         return render_context(keep_filter=True)
 
     if retv == ROFI_RETV_CUSTOM_1:
-        if state.screen != "group":
-            return render_context(
-                record=(
-                    batch_store.read_preview(state.record_id or "")
-                    if state.screen == "preview"
-                    else None
-                ),
-                job=(batch_store.current_job(state.record_id) if state.screen == "job" else None),
-                keep_filter=True,
-                notice="The preview or confirmed job stays fixed while you are viewing it.",
-            )
-        try:
-            context = _presentation_context(store, config)
-            snapshot = _presentation_snapshot(store, config, context)
-            polling, deadline = _start_background_refresh(
-                store,
-                _refresh_scope(store, config, context),
-            )
-            if not polling:
-                return render_context(
-                    snapshot=snapshot, keep_filter=True, notice="Unable to start background refresh"
-                )
-            active = continuation_state.active()
-            next_state = ContinuationState(
-                navigation=navigation,
-                refresh_deadline=deadline,
-                error_deadline=active.error_deadline,
-                error_message=active.error_message,
-                check_deadline=active.check_deadline,
-                action=action,
-                action_valid=continuation_state.action_valid,
-                last_used=last_used,
-                batch_state=state,
-            )
-            return _render_batch_inline(
-                snapshot,
-                next_state,
-                navigation,
-                action,
-                last_used,
-                state,
-                selected_identity=selected_identity,
-                notice="Checking sessions…",
-                keep_filter=True,
-            )
-        except Exception as error:  # noqa: BLE001 - explicit refresh boundary
-            return render_context(keep_filter=True, notice=f"Refresh failed: {sanitize(error)}")
+        return render_context(
+            keep_filter=True,
+            notice="The preview or confirmed job stays fixed while you are viewing it.",
+        )
 
     if retv in {2, 3}:
         notice = "Custom input is disabled" if retv == 2 else "Deletion is disabled"
@@ -2907,45 +2869,6 @@ def _handle_batch_screen(
             )
 
         row_type = selected_row.get("type")
-        if state.screen == "group":
-            if (
-                row_type != "batch-group"
-                or selected_row.get("action") != state.action
-                or state.action not in _BATCH_ACTION_ORDER
-            ):
-                return render_context(notice="This control does not match the active group action.")
-            try:
-                current_job = _batch_job_state(batch_store, source_identity)
-                if current_job is not None:
-                    job_state, job = current_job
-                    return render_context(job_state, job=job, selected=None, initial_control=True)
-                preview = batch.build_preview(
-                    store,
-                    config,
-                    _batch_scope(navigation),
-                    state.action,
-                )
-                preview_id = batch_store.write_preview(preview)
-                preview_state = BatchUIState("preview", source_identity, state.action, preview_id)
-                persisted = batch_store.read_preview(preview_id)
-                if persisted is None:
-                    raise batch.BatchError("Batch preview could not be saved safely")
-                return render_context(
-                    preview_state,
-                    record=persisted,
-                    selected=None,
-                    initial_control=True,
-                )
-            except batch.BatchBusy as error:
-                job = batch_store.current_job(error.job_id)
-                job_state = BatchUIState("job", source_identity, None, error.job_id)
-                return render_context(job_state, job=job, selected=None, initial_control=True)
-            except Exception as error:  # noqa: BLE001 - bounded preview boundary
-                return render_context(
-                    notice=f"Batch preview failed: {sanitize(error)}",
-                    keep_filter=True,
-                )
-
         if state.screen == "preview":
             record = batch_store.read_preview(state.record_id or "")
             if row_type == "batch-confirm":
@@ -3039,8 +2962,25 @@ def run_rofi(
         last_used = continuation_state.last_used
         action = continuation_state.action if continuation_state.action_valid else ACTION_RESUME
 
+    raw_info = environ.get("ROFI_INFO")
+    parsed_control = _parse_batch_row(raw_info)
+    callback_control_selected = (
+        retv
+        in {
+            ROFI_RETV_SELECTED,
+            ROFI_RETV_CUSTOM_1,
+            ROFI_RETV_CUSTOM_4,
+            ROFI_RETV_CUSTOM_7,
+            ROFI_RETV_CUSTOM_8,
+            ROFI_RETV_CUSTOM_19,
+        }
+        and parsed_control is not None
+        and parsed_control.get("type") == "batch"
+    )
+
     def emit_snapshot(*args: object, **kwargs: object) -> str:
         kwargs.setdefault("last_used", last_used)
+        kwargs.setdefault("batch_initial_control", callback_control_selected)
         if retv == 0:
             kwargs["selected_identity"] = last_used
             kwargs.setdefault("initial_open", True)
@@ -3048,6 +2988,7 @@ def run_rofi(
 
     def emit_error(*args: object, **kwargs: object) -> str:
         kwargs.setdefault("last_used", last_used)
+        kwargs.setdefault("batch_initial_control", callback_control_selected)
         if retv == 0:
             kwargs["selected_identity"] = last_used
             kwargs.setdefault("initial_open", True)
@@ -3153,7 +3094,7 @@ def run_rofi(
                 navigation,
                 action,
                 last_used,
-                BatchUIState("group", safe_state.source_identity, batch.ACTION_RESUME),
+                safe_state,
                 notice=f"Batch view failed safely: {sanitize(exc)}",
                 initial_control=True,
             )
@@ -3163,48 +3104,24 @@ def run_rofi(
     if retv == ROFI_RETV_CUSTOM_4:
         try:
             snapshot = _presentation_snapshot(store, config)
-            current_job = _batch_job_state(
-                batch_state_store,
-                callback_selection_identity or last_used,
-            )
-            if current_job is not None:
-                state, job = current_job
-                rendered = _render_batch_inline(
-                    snapshot,
-                    continuation_state,
-                    navigation,
-                    action,
-                    last_used,
-                    state,
-                    job=job,
-                    initial_control=True,
-                )
-            else:
-                rendered = _render_batch_inline(
-                    snapshot,
-                    continuation_state,
-                    navigation,
-                    action,
-                    last_used,
-                    BatchUIState(
-                        "group",
-                        callback_selection_identity or last_used,
-                        batch.ACTION_RESUME,
-                    ),
-                    initial_control=True,
-                )
-        except Exception as exc:  # noqa: BLE001 - cache-only batch entry boundary
-            rendered = _render_batch_inline(
-                None,
+            rendered = _render_continuation(
+                snapshot,
                 continuation_state,
-                navigation,
-                action,
-                last_used,
-                BatchUIState(
-                    "group", callback_selection_identity or last_used, batch.ACTION_RESUME
-                ),
-                notice=f"Active group unavailable: {sanitize(exc)}",
-                initial_control=True,
+                selected_identity=None,
+                action=action,
+                last_used=last_used,
+                batch_initial_control=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - cache-only batch entry boundary
+            rendered = emit_error(
+                None,
+                message=f"Cache read failed: {sanitize(exc)}",
+                selected_identity=None,
+                preserve=True,
+                continuation=True,
+                navigation=navigation,
+                action=action,
+                batch_initial_control=True,
             )
         print(rendered, end="")
         return 0
@@ -3219,30 +3136,102 @@ def run_rofi(
             if isinstance(typed_payload, Mapping) and "type" in typed_payload:
                 parsed_control = _parse_batch_row(raw_info)
                 if typed_payload.get("type") == "batch" and parsed_control is not None:
-                    snapshot = _presentation_snapshot(store, config)
-                    current_job = _batch_job_state(batch_state_store, last_used)
-                    if current_job is not None:
-                        state, job = current_job
-                        rendered = _render_batch_inline(
+                    try:
+                        snapshot = _presentation_snapshot(store, config)
+                    except Exception:
+                        snapshot = None
+                    if not continuation_state.action_valid:
+                        rendered = emit_error(
                             snapshot,
-                            continuation_state,
-                            navigation,
-                            action,
-                            last_used,
-                            state,
-                            job=job,
-                            initial_control=True,
+                            "Invalid Agent action state; choose Resume and try again.",
+                            selected_identity=None,
+                            preserve=True,
+                            continuation=True,
+                            navigation=navigation,
+                            action=ACTION_RESUME,
+                            batch_initial_control=True,
+                        )
+                    elif action == ACTION_NEW:
+                        rendered = emit_error(
+                            snapshot,
+                            "Select a conversation to create a new session.",
+                            selected_identity=None,
+                            preserve=True,
+                            continuation=True,
+                            navigation=navigation,
+                            keep_filter=True,
+                            keep_selection=True,
+                            action=action,
+                            batch_initial_control=True,
                         )
                     else:
-                        rendered = _render_batch_inline(
-                            snapshot,
-                            continuation_state,
-                            navigation,
-                            action,
-                            last_used,
-                            BatchUIState("group", last_used, batch.ACTION_RESUME),
-                            initial_control=True,
+                        operation = (
+                            batch.ACTION_CLOSE if action == ACTION_CLOSE else batch.ACTION_RESUME
                         )
+                        try:
+                            current_job = _batch_job_state(batch_state_store, None)
+                            if current_job is not None:
+                                state, job = current_job
+                                rendered = _render_batch_inline(
+                                    snapshot,
+                                    continuation_state,
+                                    navigation,
+                                    action,
+                                    last_used,
+                                    state,
+                                    job=job,
+                                    initial_control=True,
+                                )
+                            else:
+                                preview = batch.build_preview(
+                                    store,
+                                    config,
+                                    _batch_scope(navigation),
+                                    operation,
+                                )
+                                preview_id = batch_state_store.write_preview(preview)
+                                state = BatchUIState("preview", None, operation, preview_id)
+                                persisted = batch_state_store.read_preview(preview_id)
+                                if persisted is None:
+                                    raise batch.BatchError(
+                                        "Batch preview could not be saved safely"
+                                    )
+                                rendered = _render_batch_inline(
+                                    snapshot,
+                                    continuation_state,
+                                    navigation,
+                                    action,
+                                    last_used,
+                                    state,
+                                    record=persisted,
+                                    initial_control=True,
+                                )
+                        except batch.BatchBusy as exc:
+                            job = batch_state_store.current_job(exc.job_id)
+                            state = BatchUIState("job", None, None, exc.job_id)
+                            rendered = _render_batch_inline(
+                                snapshot,
+                                continuation_state,
+                                navigation,
+                                action,
+                                last_used,
+                                state,
+                                job=job,
+                                initial_control=True,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - bounded preview boundary
+                            rendered = emit_snapshot(
+                                snapshot,
+                                message=f"Batch preview failed: {sanitize(exc)}",
+                                selected_identity=None,
+                                preserve=True,
+                                keep_filter=True,
+                                keep_selection=True,
+                                continuation=True,
+                                navigation=navigation,
+                                action=action,
+                                batch_initial_control=True,
+                            )
                 else:
                     rendered = emit_error(
                         _presentation_snapshot(store, config),
@@ -3285,6 +3274,7 @@ def run_rofi(
                     preserve_filter=True,
                     action=next_action,
                     last_used=last_used,
+                    batch_initial_control=callback_control_selected,
                 )
         except Exception as exc:  # noqa: BLE001 - cache-only callback boundary
             rendered = emit_error(
@@ -3358,6 +3348,82 @@ def run_rofi(
         except Exception as exc:  # noqa: BLE001 - selected callback boundary
             preselection_error = exc
         else:
+            if continuation_state.action_valid and action == ACTION_CLOSE:
+                selected_identity = _session_identity(preselected)
+                try:
+                    current_job = _batch_job_state(batch_state_store, selected_identity)
+                    if current_job is not None:
+                        state, job = current_job
+                        snapshot = _presentation_snapshot(store, config)
+                        rendered = _render_batch_inline(
+                            snapshot,
+                            continuation_state,
+                            navigation,
+                            action,
+                            last_used,
+                            state,
+                            job=job,
+                            initial_control=True,
+                        )
+                    elif preselected_type != "session":
+                        raise engine.PickerError(
+                            "Close only applies to a selected conversation or All active sessions"
+                        )
+                    else:
+                        context = _presentation_context(store, config)
+                        preview = batch.build_single_close_preview(
+                            store,
+                            config,
+                            preselected,
+                            context=context,
+                        )
+                        preview_id = batch_state_store.write_preview(preview)
+                        state = BatchUIState(
+                            "preview", selected_identity, batch.ACTION_CLOSE, preview_id
+                        )
+                        persisted = batch_state_store.read_preview(preview_id)
+                        if persisted is None:
+                            raise batch.BatchError("Close preview could not be saved safely")
+                        snapshot = _presentation_snapshot(store, config, context)
+                        rendered = _render_batch_inline(
+                            snapshot,
+                            continuation_state,
+                            navigation,
+                            action,
+                            last_used,
+                            state,
+                            record=persisted,
+                            initial_control=True,
+                        )
+                except batch.BatchBusy as exc:
+                    job = batch_state_store.current_job(exc.job_id)
+                    state = BatchUIState("job", selected_identity, None, exc.job_id)
+                    rendered = _render_batch_inline(
+                        _presentation_snapshot(store, config),
+                        continuation_state,
+                        navigation,
+                        action,
+                        last_used,
+                        state,
+                        job=job,
+                        initial_control=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - guarded single-close boundary
+                    try:
+                        snapshot = _presentation_snapshot(store, config)
+                    except Exception:
+                        snapshot = None
+                    rendered = emit_error(
+                        snapshot,
+                        f"Close preview failed safely: {sanitize(exc)}",
+                        selected_identity=selected_identity,
+                        preserve=True,
+                        continuation=True,
+                        navigation=navigation,
+                        action=ACTION_CLOSE,
+                    )
+                print(rendered, end="")
+                return 0
             if (
                 continuation_state.action_valid
                 and action == ACTION_RESUME
@@ -3374,6 +3440,25 @@ def run_rofi(
                         _session_identity(preselected) or last_used,
                     )
                     return 0
+
+    if retv == ROFI_RETV_SELECTED and action == ACTION_CLOSE and preselection_error is not None:
+        try:
+            snapshot = _presentation_snapshot(store, config)
+        except Exception:
+            snapshot = None
+        print(
+            emit_error(
+                snapshot,
+                f"Close preview failed safely: {sanitize(preselection_error)}",
+                selected_identity=callback_selection_identity,
+                preserve=True,
+                continuation=True,
+                navigation=navigation,
+                action=ACTION_CLOSE,
+            ),
+            end="",
+        )
+        return 0
 
     try:
         context = _presentation_context(store, config)

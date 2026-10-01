@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.9.0` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.10.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -51,16 +51,17 @@ with the Rofi options above. On its first launch, the picker opens in
 `Agents › All`, a mixed newest-first list. Later launches restore the last
 page and successfully used conversation. Each launch starts with an empty
 search and `Resume` as its action. Up and Down move through rows. `Tab`
-switches the action from `Resume` to `New session here`; `Shift+Tab` cycles in
-reverse, with wraparound.
+cycles the shared action through `Resume`, `Close`, and `New`; `Shift+Tab`
+cycles in reverse, with wraparound. The action applies to the highlighted
+conversation or to the leading `All active sessions (N)` control.
 The prompt shows the page; the persistent message below the filter shows
-`Enter:` with both individual actions and highlights the selected one. The
-hint also shows `Tab: Cycle actions` and `Alt+A: Active group`. The leading
-typed `All active sessions (N)` row enters the group view on Enter; `Alt+A`
-opens the same view even when filtering leaves no matching row. The first
-conversation remains the default selection when one exists; the group row is
-selected on an empty page. Enter on a conversation runs the selected
-individual action. Left
+`Enter:` with all three actions and highlights the selected one. The
+hint also shows `Tab: Cycle actions` and `Alt+A: Select All active`. The first
+conversation remains the default selection when one exists; the All active
+row is selected on an empty page. `Alt+A` clears search and selects that row.
+On All active, `Resume` or `Close` prepares an inline fixed preview, while
+`New` asks you to select a conversation. Enter on a conversation runs the
+selected action. Left
 and Right cycle `Active`, `All`, `Local`, and the remote hosts in stable Host
 Mesh order.
 Escape and `Ctrl+G` use Rofi's
@@ -85,40 +86,36 @@ page's recent-session cap, so older observed running conversations remain
 visible. Search a host or provider name to narrow this page. Switching pages
 does not trigger discovery; `Alt+R` refreshes as usual.
 
-## Batch session actions
+## Batch and window actions
 
-The leading `All active sessions (N)` row and `Alt+A` enter the active group
-view. The list shows the ordinary page rows plus any missing uncapped active or
-waiting sessions in the page's owner-host scope. The `N` count and an
-“observed/in scope” badge describe cached membership, not guaranteed viewer
-eligibility. In group view, **Resume all** is selected by default; `Tab` and
-`Shift+Tab` switch between it and **Close all windows**. The header names the
-scope, and cycling actions only uses cached data. Enter on the group prepares
-a fixed preview. Enter on a conversation returns to individual actions
-without opening it; its next Enter uses the visible individual action bar.
-`Alt+A` returns to individual actions, while Left/Right exits to the page ring.
+The leading `All active sessions (N)` control shows the current page's cached
+active or waiting count. Its count uses uncapped per-host rows; the ordinary
+history cap still applies to the conversation list. `Alt+A` clears search and
+selects the control without changing the shared `Resume` / `Close` / `New`
+action. The count is a cache-backed shortcut; previews determine which
+sessions are currently eligible.
 
-The preview refreshes the selected page's authoritative host coverage once and
-ignores the current search. Active and All cover every authoritative owner
-host; All can include active rows beyond its ordinary history-list cap. Local
-covers only this machine as owner, and a named-host page covers that host. The
-preview freezes stable tmux references and any viewing windows selected for
-closure. Exact frozen targets receive an operation badge; exclusions and frozen
-targets that no longer match a current full reference remain visible without
-being marked as eligible. Target rows are display-only. `Tab` or `Shift+Tab`
-discards the preview and changes the operation; Enter must prepare a new
-preview before Confirm is available. Native Escape/Ctrl+G before confirmation
-has no session or window effect.
+On All active, Enter with `Resume` or `Close` refreshes the selected page's
+authoritative host coverage once and prepares a fixed inline preview independent
+of search. Active and All cover every authoritative session-owner host; All can
+include rows beyond its ordinary history-list cap. Local covers this machine,
+and a named-host page covers that host. The preview freezes complete tmux
+references and, for Close, verified viewer windows. Exact frozen targets
+receive an operation badge; changed references, exclusions, and other frozen
+targets remain visible without an eligible tint. Target rows are display-only.
+Enter on the explicit Confirm control submits the preview once. Changing the
+shared action discards that preview and requires a new Enter to prepare one.
+Native Escape/Ctrl+G before Confirm has no session or window effect.
 
-Close removes only verified viewing windows on the current endpoint and keeps
-the tmux sessions and provider processes running. Resume revalidates current
-active evidence and opens only an existing tmux reference through Tmux Plus;
-it never creates a session or starts a provider. Retained, stale, missing, or
-ambiguous associations and unsupported or unverified viewers appear as
-exclusions. Confirmed work runs as one background job, reports completed,
-already open/closed, skipped, and failed targets, and continues after an
-individual target failure. Escape after Confirm closes the view while the
-authorized fixed list finishes.
+On a selected conversation, `Close` previews only that row's currently
+verified viewer windows. It requires the exact current tmux association and
+provider option; missing, stale, ambiguous, or unverifiable associations are
+shown as exclusions. Close never kills or rebinds a tmux session and leaves
+provider processes running. `Resume` on All active opens only an existing tmux
+reference and never creates a session or starts a provider. Confirmed work runs
+as one background job, reports completed, already open/closed, skipped, and
+failed targets, and continues after an individual target failure. Escape after
+Confirm closes the view while the authorized fixed target list finishes.
 
 Batch viewers currently require the managed Kitty/Niri setup. Legacy remote
 windows may need closing manually once and reopening through Agent/Tmux Plus.
@@ -129,7 +126,7 @@ The host catalog is authoritative and ordered by Host Mesh, while provider
 groups are not navigation scopes. Provider icons remain visible, and provider
 names and aliases remain in filter metadata, so searching for `codex`,
 `claude`, `Claude Code`, or `opencode` still works. Conversation rows carry
-typed session metadata; the typed active-group control and batch controls
+typed session metadata; the typed All active control and batch controls
 cannot enter the session open or create path.
 
 Rows use a two-line layout: the session title is primary, while a smaller
@@ -154,7 +151,7 @@ action uses Tmux Plus to focus or launch the terminal, or to create a deferred
 provider-resume wrapper with typed provider options. Icon provenance and
 trademark notes are in [`ASSETS.md`](ASSETS.md).
 
-`New session here` is an independent lifecycle. It refreshes the selected
+The `New` action starts a new session here. It refreshes the selected
 logical host through the current Host Mesh authority and requires one exact,
 current provider row with the same provider, ID, host, and provider-reported
 absolute working directory. It checks that directory and the bare provider
@@ -310,9 +307,9 @@ records the Active page, remembered context, implementation order, and
 acceptance requirements. Installed and manual acceptance remain recorded in
 the managed suite status ledger.
 
-The proposed [batch session actions plan](docs/agent-plus-batch-session-actions-plan.md)
-describes Close/Resume for machine switching, the missing viewer capability,
-and implementation checkpoints. Kill all is a separate follow-up.
+The [batch session actions plan](docs/agent-plus-batch-session-actions-plan.md)
+records the Close/Resume safeguards and release boundaries; Kill all remains
+outside the current action set.
 
 The [session client exploration](docs/agent-plus-session-client-exploration.md)
 and its linked feasibility studies record possible future presentation work.

@@ -5,23 +5,25 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from rofi_agent_plus import batch, contract_viewers
-from rofi_agent_plus.cache import CacheStore, PresentationContext
+from rofi_agent_plus.cache import PresentationContext
 from rofi_agent_plus.config import PickerConfig
 from rofi_agent_plus.rofi import (
+    ACTION_CLOSE,
+    ACTION_NEW,
+    ACTION_ORDER,
+    ACTION_RESUME,
     ROFI_RETV_CUSTOM_4,
     ROFI_RETV_CUSTOM_7,
-    ROFI_RETV_CUSTOM_8,
+    ROFI_RETV_CUSTOM_19,
     BatchUIState,
-    ContinuationState,
     NavigationState,
-    _batch_row_info,
     _refresh_data,
-    _root_after_batch,
     parse_continuation_state,
     render_snapshot,
     run_rofi,
@@ -70,6 +72,12 @@ class FakeStore:
     def refresh(self, _config: PickerConfig, **kwargs: object) -> dict[str, object]:
         self.refresh_calls.append(kwargs)
         return self.snapshot
+
+    def is_fresh(self, _snapshot: object, _refresh_seconds: int) -> bool:
+        return True
+
+    def background_active(self, **_kwargs: object) -> bool:
+        return False
 
 
 def _reference(host_id: str, session_id: str, created_at: int) -> dict[str, object]:
@@ -429,406 +437,452 @@ class BatchWorkerTest(unittest.TestCase):
 
 
 class BatchPickerTest(unittest.TestCase):
-    def test_return_to_individual_context_uses_conversation_offset(self) -> None:
-        for rows, expected in (([], 0), ([_row("local", "codex", LOCAL_ID, "$1", 1)], 1)):
-            with self.subTest(expected=expected):
-                cache = mock.Mock(spec=CacheStore)
-                cache.load.return_value = {"sessions": rows, "errors": []}
-                rendered = _root_after_batch(
-                    cache,
-                    PickerConfig(),
-                    NavigationState(),
-                    ContinuationState(),
-                    "resume",
-                    None,
-                    None,
-                )
-                headers, records = _records(rendered)
-                self.assertIn(f"\x00new-selection\x1f{expected}", headers)
-                self.assertEqual("batch", json.loads(_options(records[0])[1]["info"])["type"])
+    def _invoke(
+        self,
+        environ: dict[str, str],
+        store: FakeStore,
+        *,
+        preferences: ViewPreferenceStore | None = None,
+        state_store: batch.BatchStateStore | None = None,
+    ) -> str:
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            run_rofi(
+                environ,
+                store=store,
+                config=PickerConfig(),
+                preference_store=preferences,
+                batch_state_store=state_store,
+            )
+        return output.getvalue()
 
-    def test_leading_row_is_typed_and_conversation_focus_includes_offset(self) -> None:
-        row = _row("local", "codex", LOCAL_ID, "$1", 1)
-        snapshot = _snapshot([row], [])
-        rendered = render_snapshot(
-            snapshot,
-            selected_identity=("local", "codex", LOCAL_ID),
-            initial_open=True,
+    @staticmethod
+    def _data(output: str) -> str:
+        headers, _ = _records(output)
+        return next(
+            value.split("\x1f", 1)[1] for value in headers if value.startswith("\x00data\x1f")
         )
-        headers, rows = _records(rendered)
-        _, batch_options = _options(rows[0])
-        _, session_options = _options(rows[1])
-        self.assertEqual({"type": "batch"}, json.loads(batch_options["info"]))
-        self.assertEqual("all active sessions", batch_options["meta"])
-        self.assertTrue(rows[0].startswith("All active sessions (1)"))
-        self.assertIn("All active sessions (1)", batch_options["display"])
-        self.assertEqual(LOCAL_ID, json.loads(session_options["info"])["id"])
+
+    def _stored_preview(
+        self,
+        store: FakeStore,
+        state_store: batch.BatchStateStore,
+        action: str = ACTION_RESUME,
+    ) -> tuple[BatchUIState, str, dict[str, object]]:
+        preview = batch.build_preview(store, PickerConfig(), batch.Scope("all"), action)
+        preview_id = state_store.write_preview(preview)
+        state = BatchUIState("preview", None, action, preview_id)
+        return (
+            state,
+            _refresh_data(action=action, batch_state=state),
+            dict(state_store.read_preview(preview_id) or {}),
+        )
+
+    def test_leading_row_action_cycle_and_conversation_offset(self) -> None:
+        row = _row("local", "codex", LOCAL_ID, "$1", 1)
+        headers, rows = _records(
+            render_snapshot(
+                _snapshot([row], []),
+                selected_identity=("local", "codex", LOCAL_ID),
+                initial_open=True,
+            )
+        )
+        _, control = _options(rows[0])
+        _, conversation = _options(rows[1])
+        self.assertEqual({"type": "batch"}, json.loads(control["info"]))
+        self.assertEqual("all active sessions", control["meta"])
+        self.assertEqual(LOCAL_ID, json.loads(conversation["info"])["id"])
         self.assertIn("\x00new-selection\x1f1", headers)
         self.assertIn("\x00no-custom\x1ffalse", headers)
+        self.assertIn("[Resume]</span> · Close · New", "\t".join(headers))
+        self.assertEqual((ACTION_RESUME, ACTION_CLOSE, ACTION_NEW), ACTION_ORDER)
 
-    def test_empty_page_selects_group_and_alt_a_enters_without_preferences_or_queries(self) -> None:
-        empty = {"sessions": [], "errors": []}
-        cache = mock.Mock(spec=CacheStore)
-        cache.load.return_value = empty
-        preferences = mock.Mock(spec=ViewPreferenceStore)
-        with tempfile.TemporaryDirectory() as temporary:
-            state = batch.BatchStateStore(Path(temporary))
-            output = io.StringIO()
-            with mock.patch("sys.stdout", output):
-                run_rofi(
-                    {"ROFI_RETV": str(ROFI_RETV_CUSTOM_4)},
-                    store=cache,
-                    config=PickerConfig(),
-                    preference_store=preferences,
-                    batch_state_store=state,
-                )
-            self.assertIn("All active sessions (0) · Resume all", output.getvalue())
-            self.assertIn(
-                'Enter: <span foreground="#42a5f5" weight="bold">[Resume all]</span>'
-                " · Close all windows  │  Tab: Cycle actions",
-                output.getvalue(),
-            )
-            self.assertIn("All active sessions · Scope:", output.getvalue())
-            self.assertIn("All active sessions (0)", output.getvalue())
-            self.assertIn("batch-ui:", output.getvalue())
-            self.assertIn("\x00new-selection\x1f0", output.getvalue())
-            preferences.save.assert_not_called()
-            self.assertFalse(cache.presentation_context.called)
-
-        headers, rows = _records(render_snapshot(empty, initial_open=True))
-        _, options = _options(rows[0])
-        self.assertEqual("batch", json.loads(options["info"])["type"])
-        self.assertIn("\x00new-selection\x1f0", headers)
-
-    def test_group_context_shows_uncapped_scoped_active_rows_and_deduplicates(self) -> None:
-        local1 = _row("local", "codex", LOCAL_ID, "$1", 1)
-        local2 = _row(
-            "local",
-            "claude",
-            "00000000-0000-0000-0000-000000000003",
-            "$3",
-            3,
-            active=False,
-            activityState="waiting",
-        )
-        remote = _row("remote", "claude", REMOTE_ID, "$9", 9)
-        snapshot = _snapshot([local1, local2], [remote])
-        state = BatchUIState("group", None, batch.ACTION_RESUME)
-
-        all_output = render_snapshot(snapshot, batch_state=state, continuation=True)
-        _, all_rows = _records(all_output)
-        self.assertIn("All active sessions (3)", all_rows[0])
-        self.assertEqual(4, len(all_rows))  # control plus all three uncapped rows
-        self.assertIn("Active set in scope · observed", all_output)
-        self.assertIn("waiting", all_output)
-
-        local_output = render_snapshot(
-            snapshot,
-            navigation=NavigationState("local"),
-            batch_state=state,
-            continuation=True,
-        )
-        _, local_rows = _records(local_output)
-        self.assertIn("All active sessions (2)", local_rows[0])
-        self.assertNotIn(REMOTE_ID, local_output)
-
-        retained_duplicate = dict(local1)
-        retained_duplicate["sourceObservation"] = "retained"
-        duplicate_snapshot = _snapshot([retained_duplicate, dict(local1)], [])
-        duplicate_output = render_snapshot(
-            duplicate_snapshot,
-            batch_state=state,
-            continuation=True,
-        )
-        self.assertIn("All active sessions (1)", duplicate_output)
-        self.assertNotIn("Last known", duplicate_output)
-
-    def test_group_action_cycle_is_cache_only_and_does_not_touch_preferences(self) -> None:
+    def test_alt_a_clears_search_selects_control_and_preserves_action_cache_only(self) -> None:
         row = _row("local", "codex", LOCAL_ID, "$1", 1)
         store = FakeStore(_snapshot([row], []))
         preferences = mock.Mock(spec=ViewPreferenceStore)
-        group = BatchUIState("group", ("local", "codex", LOCAL_ID), batch.ACTION_RESUME)
-        data = _refresh_data(navigation=NavigationState(), batch_state=group)
+        output = self._invoke(
+            {
+                "ROFI_RETV": str(ROFI_RETV_CUSTOM_4),
+                "ROFI_DATA": _refresh_data(action=ACTION_CLOSE),
+                "ROFI_INFO": selection_payload(row),
+            },
+            store,
+            preferences=preferences,
+        )
+        headers, rows = _records(output)
+        _, control = _options(rows[0])
+        self.assertEqual("batch", json.loads(control["info"])["type"])
+        self.assertIn("\x00new-selection\x1f0", headers)
+        self.assertNotIn("\x00keep-filter\x1ftrue", headers)
+        self.assertIn("[Close]</span>", output)
+        self.assertNotIn("batch-ui:", output)
+        self.assertEqual(0, store.context_calls)
+        self.assertEqual([], store.refresh_calls)
+        preferences.save.assert_not_called()
+
+    def test_shared_cycle_is_cache_only_and_preserves_root_or_conversation_selection(self) -> None:
+        row = _row("local", "codex", LOCAL_ID, "$1", 1)
+        store = FakeStore(_snapshot([row], []))
+        preferences = mock.Mock(spec=ViewPreferenceStore)
+        close_control = self._invoke(
+            {
+                "ROFI_RETV": str(ROFI_RETV_CUSTOM_7),
+                "ROFI_DATA": _refresh_data(action=ACTION_RESUME),
+                "ROFI_INFO": '{"type":"batch"}',
+            },
+            store,
+            preferences=preferences,
+        )
+        headers, _ = _records(close_control)
+        close_data = self._data(close_control)
+        self.assertEqual(ACTION_CLOSE, parse_continuation_state(close_data).action)
+        self.assertIn("[Close]</span>", close_control)
+        self.assertIn("\x00new-selection\x1f0", headers)
+        self.assertIn("\x00keep-filter\x1ftrue", headers)
+
+        new_conversation = self._invoke(
+            {
+                "ROFI_RETV": str(ROFI_RETV_CUSTOM_7),
+                "ROFI_DATA": close_data,
+                "ROFI_INFO": selection_payload(row),
+            },
+            store,
+            preferences=preferences,
+        )
+        new_headers, _ = _records(new_conversation)
+        new_data = self._data(new_conversation)
+        self.assertEqual(ACTION_NEW, parse_continuation_state(new_data).action)
+        self.assertIn("[New]</span>", new_conversation)
+        self.assertIn("\x00new-selection\x1f1", new_headers)
+        self.assertEqual(0, store.context_calls)
+        self.assertEqual([], store.refresh_calls)
+        preferences.save.assert_not_called()
+
+    def test_all_active_new_warns_without_queries_and_timeout_keeps_control_selected(self) -> None:
+        row = _row("local", "codex", LOCAL_ID, "$1", 1)
+        store = FakeStore(_snapshot([row], []))
+        preferences = mock.Mock(spec=ViewPreferenceStore)
         with tempfile.TemporaryDirectory() as temporary:
-            batch_store = batch.BatchStateStore(Path(temporary))
-
-            def cycle(retv: int, prior_data: str, info: str | None = None) -> str:
-                output = io.StringIO()
-                environ = {"ROFI_RETV": str(retv), "ROFI_DATA": prior_data}
-                if info is not None:
-                    environ["ROFI_INFO"] = info
-                with mock.patch("sys.stdout", output):
-                    run_rofi(
-                        environ,
-                        store=store,
-                        config=PickerConfig(),
-                        preference_store=preferences,
-                        batch_state_store=batch_store,
-                    )
-                return output.getvalue()
-
-            close = cycle(ROFI_RETV_CUSTOM_7, data)
-            close_data = next(
-                value.split("\x1f", 1)[1]
-                for value in _records(close)[0]
-                if value.startswith("\x00data\x1f")
-            )
-            self.assertEqual("close", parse_continuation_state(close_data).batch_state.action)
-            self.assertIn(
-                'Resume all · <span foreground="#42a5f5" weight="bold">[Close all windows]</span>',
-                close,
-            )
-            resume = cycle(ROFI_RETV_CUSTOM_8, close_data)
-            resume_data = next(
-                value.split("\x1f", 1)[1]
-                for value in _records(resume)[0]
-                if value.startswith("\x00data\x1f")
-            )
-            self.assertEqual("resume", parse_continuation_state(resume_data).batch_state.action)
+            state_store = batch.BatchStateStore(Path(temporary))
+            with (
+                mock.patch("rofi_agent_plus.rofi._new_session_selection") as create,
+                mock.patch("rofi_agent_plus.rofi._open_selection") as open_session,
+            ):
+                warning = self._invoke(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": _refresh_data(action=ACTION_NEW),
+                        "ROFI_INFO": '{"type":"batch"}',
+                    },
+                    store,
+                    preferences=preferences,
+                    state_store=state_store,
+                )
+            self.assertIn("Select a conversation to create a new session.", warning)
+            self.assertIn("[New]</span>", warning)
+            self.assertIn("\x00new-selection\x1f0", warning)
+            self.assertNotIn("batch-ui:", warning)
             self.assertEqual(0, store.context_calls)
+            self.assertEqual([], store.refresh_calls)
+            create.assert_not_called()
+            open_session.assert_not_called()
+            self.assertIsNone(state_store.read_preview("a" * 32))
+
+            expired = _refresh_data(
+                error_deadline=time.time() - 1,
+                error_message="Select a conversation to create a new session.",
+                action=ACTION_NEW,
+            )
+            refreshed = self._invoke(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                    "ROFI_DATA": expired,
+                    "ROFI_INFO": '{"type":"batch"}',
+                },
+                store,
+                preferences=preferences,
+                state_store=state_store,
+            )
+            refreshed_headers, refreshed_rows = _records(refreshed)
+            _, control = _options(refreshed_rows[0])
+            self.assertEqual("batch", json.loads(control["info"])["type"])
+            self.assertIn("\x00new-selection\x1f0", refreshed_headers)
+            self.assertIn("[New]</span>", refreshed)
             self.assertEqual([], store.refresh_calls)
             preferences.save.assert_not_called()
 
-    def test_enter_conversation_in_group_returns_to_individual_actions_without_open(self) -> None:
+    def test_all_active_resume_and_close_enter_preview_directly(self) -> None:
         row = _row("local", "codex", LOCAL_ID, "$1", 1)
-        store = FakeStore(_snapshot([row], []))
-        preferences = mock.Mock(spec=ViewPreferenceStore)
-        group = BatchUIState("group", None, batch.ACTION_RESUME)
-        output = io.StringIO()
-        with tempfile.TemporaryDirectory() as temporary:
-            with (
-                mock.patch("sys.stdout", output),
-                mock.patch("rofi_agent_plus.rofi._try_fast_open") as fast_open,
-                mock.patch("rofi_agent_plus.rofi._open_selection") as open_selection,
-            ):
-                run_rofi(
-                    {
-                        "ROFI_RETV": "1",
-                        "ROFI_DATA": _refresh_data(batch_state=group),
-                        "ROFI_INFO": selection_payload(row),
-                    },
-                    store=store,
-                    config=PickerConfig(),
-                    preference_store=preferences,
-                    batch_state_store=batch.BatchStateStore(Path(temporary)),
+        for action in (ACTION_RESUME, ACTION_CLOSE):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                store = FakeStore(_snapshot([row], []))
+                preferences = mock.Mock(spec=ViewPreferenceStore)
+                state_store = batch.BatchStateStore(Path(temporary))
+                inspection = (
+                    contract_viewers.ViewerInspection(
+                        "verified", (contract_viewers.Viewer("viewer-1", 3),), True
+                    )
+                    if action == ACTION_CLOSE
+                    else contract_viewers.ViewerInspection("none", (), True)
                 )
-        fast_open.assert_not_called()
-        open_selection.assert_not_called()
-        preferences.save.assert_not_called()
-        self.assertNotIn('"screen":"group"', output.getvalue())
-        self.assertIn("Enter: <span", output.getvalue())
-        self.assertIn("\x00new-selection\x1f1", output.getvalue())
-
-    def test_inline_preview_marks_only_exact_targets_and_shows_exclusions(self) -> None:
-        target = _row("local", "codex", LOCAL_ID, "$1", 1)
-        excluded = _row(
-            "local",
-            "claude",
-            "00000000-0000-0000-0000-000000000003",
-            "$3",
-            3,
-            tmuxAmbiguous=True,
-        )
-        store = FakeStore(_snapshot([target, excluded], []))
-        preferences = mock.Mock(spec=ViewPreferenceStore)
-        group = BatchUIState("group", None, batch.ACTION_RESUME)
-        with mock.patch(
-            "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
-            return_value=contract_viewers.ViewerInspection("none", (), True),
-        ) as inspect:
-            with tempfile.TemporaryDirectory() as temporary:
-                batch_store = batch.BatchStateStore(Path(temporary))
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    run_rofi(
+                with mock.patch(
+                    "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                    return_value=inspection,
+                ) as inspect:
+                    output = self._invoke(
                         {
                             "ROFI_RETV": "1",
-                            "ROFI_DATA": _refresh_data(batch_state=group),
-                            "ROFI_INFO": _batch_row_info("batch-group", batch.ACTION_RESUME),
+                            "ROFI_DATA": _refresh_data(action=action),
+                            "ROFI_INFO": '{"type":"batch"}',
                         },
-                        store=store,
-                        config=PickerConfig(),
-                        preference_store=preferences,
-                        batch_state_store=batch_store,
+                        store,
+                        preferences=preferences,
+                        state_store=state_store,
                     )
-                rendered = output.getvalue()
-                self.assertIn("Confirm Resume all · 1 fixed targets", rendered)
-                self.assertIn("Will open existing session", rendered)
-                self.assertIn("Excluded · claude-local", rendered)
-                self.assertNotIn("Active set in scope · observed", rendered)
+                state = parse_continuation_state(self._data(output)).batch_state
+                record = state_store.read_preview(state.record_id)
+                self.assertEqual("preview", state.screen)
+                self.assertIsNone(state.source_identity)
+                self.assertEqual(action, record["action"])
+                self.assertEqual(1, len(record["targets"]))
+                expected_mode = "close" if action == ACTION_CLOSE else "open"
+                self.assertEqual(expected_mode, record["targets"][0]["mode"])
+                self.assertIn("All active sessions · Scope:", output)
+                self.assertIn("fixed target", output)
+                self.assertNotIn("\x00keep-filter\x1ftrue", output)
                 self.assertEqual(1, len(store.refresh_calls))
                 inspect.assert_called_once()
                 preferences.save.assert_not_called()
 
-    def test_inline_confirm_consumes_once_and_renders_job_with_rows(self) -> None:
+    def test_single_idle_close_freezes_only_exact_viewer_and_confirms_once(self) -> None:
+        selected = _row("local", "codex", LOCAL_ID, "$1", 1, active=False, activityState="idle")
+        other = _row(
+            "local",
+            "claude",
+            "00000000-0000-0000-0000-000000000003",
+            "$3",
+            3,
+        )
+        store = FakeStore(_snapshot([selected, other], []))
+        preferences = mock.Mock(spec=ViewPreferenceStore)
+        viewer = contract_viewers.Viewer("viewer-1", 7)
+        with tempfile.TemporaryDirectory() as temporary:
+            state_store = batch.BatchStateStore(Path(temporary))
+            with (
+                mock.patch(
+                    "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                    return_value=contract_viewers.ViewerInspection("verified", (viewer,), True),
+                ) as inspect,
+                mock.patch("rofi_agent_plus.rofi._try_fast_open") as fast_open,
+                mock.patch("rofi_agent_plus.rofi._open_selection") as open_session,
+                mock.patch("rofi_agent_plus.rofi._new_session_selection") as create,
+            ):
+                preview_output = self._invoke(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": _refresh_data(action=ACTION_CLOSE),
+                        "ROFI_INFO": selection_payload(selected),
+                    },
+                    store,
+                    preferences=preferences,
+                    state_store=state_store,
+                )
+                state = parse_continuation_state(self._data(preview_output)).batch_state
+                preview = state_store.read_preview(state.record_id)
+                self.assertEqual(ACTION_CLOSE, state.action)
+                self.assertEqual(("local", "codex", LOCAL_ID), state.source_identity)
+                self.assertEqual(1, len(preview["targets"]))
+                target = preview["targets"][0]
+                self.assertEqual(LOCAL_ID, target["id"])
+                self.assertEqual("$1", target["reference"]["sessionId"])
+                self.assertEqual("close", target["mode"])
+                self.assertEqual([{"viewerId": "viewer-1", "windowId": 7}], target["viewers"])
+                self.assertTrue(preview["scope"].startswith("Selected conversation ·"))
+                self.assertIn("Selected conversation · Scope:", preview_output)
+                self.assertIn(
+                    "Confirm Close selected conversation · 1 fixed target", preview_output
+                )
+                inspect.assert_called_once()
+                inspected_reference = inspect.call_args.args[1]
+                self.assertEqual("$1", inspected_reference.session_id)
+                self.assertEqual(
+                    ("@codex_thread_id", LOCAL_ID),
+                    inspect.call_args.kwargs["required_option"],
+                )
+                self.assertEqual([], store.refresh_calls)
+
+                confirm = _options(_records(preview_output)[1][0])[1]["info"]
+                with mock.patch("rofi_agent_plus.batch._spawn_worker") as spawn:
+                    job_output = self._invoke(
+                        {
+                            "ROFI_RETV": "1",
+                            "ROFI_DATA": self._data(preview_output),
+                            "ROFI_INFO": confirm,
+                        },
+                        store,
+                        preferences=preferences,
+                        state_store=state_store,
+                    )
+                    spawn.assert_called_once()
+                    job = state_store.current_job()
+                    self.assertEqual(ACTION_CLOSE, job["action"])
+                    self.assertEqual(1, len(job["targets"]))
+                    self.assertIn("Selected conversation · Scope:", job_output)
+
+                    replay = self._invoke(
+                        {
+                            "ROFI_RETV": "1",
+                            "ROFI_DATA": self._data(preview_output),
+                            "ROFI_INFO": confirm,
+                        },
+                        store,
+                        preferences=preferences,
+                        state_store=state_store,
+                    )
+                    spawn.assert_called_once()
+                    self.assertIn("Batch queued", replay)
+                fast_open.assert_not_called()
+                open_session.assert_not_called()
+                create.assert_not_called()
+                preferences.save.assert_not_called()
+
+    def test_single_close_excludes_stale_optionless_and_ended_exact_reference(self) -> None:
+        selected = _row("local", "codex", LOCAL_ID, "$1", 1)
+        store = FakeStore(_snapshot([selected], []))
+        raw_selection = json.loads(selection_payload(selected))
+        for label, changes in (
+            ("stale", {"tmuxAssociationCurrent": False}),
+            ("optionless", {"providerOptionVerified": False}),
+            ("missing reference", {"tmux": None}),
+        ):
+            with self.subTest(label=label):
+                selection = {**raw_selection, **changes}
+                with mock.patch(
+                    "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                    return_value=contract_viewers.ViewerInspection("none", (), True),
+                ) as inspect:
+                    preview = batch.build_single_close_preview(store, PickerConfig(), selection)
+                self.assertEqual([], preview["targets"])
+                self.assertTrue(preview["exclusions"])
+                self.assertFalse(inspect.called)
+
+        replaced = _row("local", "codex", LOCAL_ID, "$99", 99)
+        replaced_store = FakeStore(_snapshot([replaced], []))
+        with mock.patch(
+            "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+            return_value=contract_viewers.ViewerInspection("none", (), True),
+        ) as inspect:
+            ended = batch.build_single_close_preview(replaced_store, PickerConfig(), raw_selection)
+        self.assertEqual([], ended["targets"])
+        self.assertEqual("$1", inspect.call_args.args[1].session_id)
+        self.assertEqual([], replaced_store.refresh_calls)
+
+    def test_preview_action_cycle_discards_fixed_targets_and_replay_cannot_confirm(self) -> None:
         target = _row("local", "codex", LOCAL_ID, "$1", 1)
         store = FakeStore(_snapshot([target], []))
         preferences = mock.Mock(spec=ViewPreferenceStore)
-        group = BatchUIState("group", None, batch.ACTION_RESUME)
-        with mock.patch(
-            "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
-            return_value=contract_viewers.ViewerInspection("none", (), True),
-        ):
-            with tempfile.TemporaryDirectory() as temporary:
-                batch_store = batch.BatchStateStore(Path(temporary))
-                preview_output = io.StringIO()
-                with mock.patch("sys.stdout", preview_output):
-                    run_rofi(
-                        {
-                            "ROFI_RETV": "1",
-                            "ROFI_DATA": _refresh_data(batch_state=group),
-                            "ROFI_INFO": _batch_row_info("batch-group", batch.ACTION_RESUME),
-                        },
-                        store=store,
-                        config=PickerConfig(),
-                        preference_store=preferences,
-                        batch_state_store=batch_store,
-                    )
-                preview_headers, preview_rows = _records(preview_output.getvalue())
-                preview_data = next(
-                    value.split("\x1f", 1)[1]
-                    for value in preview_headers
-                    if value.startswith("\x00data\x1f")
+        with tempfile.TemporaryDirectory() as temporary:
+            state_store = batch.BatchStateStore(Path(temporary))
+            with mock.patch(
+                "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                return_value=contract_viewers.ViewerInspection("none", (), True),
+            ):
+                start = self._invoke(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": _refresh_data(action=ACTION_RESUME),
+                        "ROFI_INFO": '{"type":"batch"}',
+                    },
+                    store,
+                    preferences=preferences,
+                    state_store=state_store,
                 )
-                preview_state = parse_continuation_state(preview_data).batch_state
-                self.assertEqual("preview", preview_state.screen)
-                preview_id = preview_state.record_id
-                confirm_info = _options(preview_rows[0])[1]["info"]
-                self.assertEqual("batch-confirm", json.loads(confirm_info)["type"])
-                self.assertNotIn("\x00keep-filter\x1ftrue", preview_output.getvalue())
+            state = parse_continuation_state(self._data(start)).batch_state
+            confirm = _options(_records(start)[1][0])[1]["info"]
+            cycled = self._invoke(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_7),
+                    "ROFI_DATA": self._data(start),
+                    "ROFI_INFO": confirm,
+                },
+                store,
+                preferences=preferences,
+                state_store=state_store,
+            )
+            headers, rows = _records(cycled)
+            _, control = _options(rows[0])
+            self.assertEqual("batch", json.loads(control["info"])["type"])
+            self.assertIn("\x00new-selection\x1f0", headers)
+            self.assertIn("[Close]</span>", cycled)
+            self.assertNotIn("batch-ui:", cycled)
+            self.assertIsNone(state_store.read_preview(state.record_id))
+            self.assertEqual(1, len(store.refresh_calls))
 
-                worker_spawn = mock.patch("rofi_agent_plus.batch._spawn_worker")
-                with worker_spawn as spawn:
-                    job_output = io.StringIO()
-                    with mock.patch("sys.stdout", job_output):
-                        run_rofi(
-                            {
-                                "ROFI_RETV": "1",
-                                "ROFI_DATA": preview_data,
-                                "ROFI_INFO": confirm_info,
-                            },
-                            store=store,
-                            config=PickerConfig(),
-                            preference_store=preferences,
-                            batch_state_store=batch_store,
-                        )
-                    spawn.assert_called_once()
-                    job = batch_store.current_job()
-                    self.assertEqual("queued", job["status"])
-                    self.assertIsNone(batch_store.read_preview(preview_id))
-                    job_headers, _ = _records(job_output.getvalue())
-                    job_data = next(
-                        value.split("\x1f", 1)[1]
-                        for value in job_headers
-                        if value.startswith("\x00data\x1f")
-                    )
-                    self.assertEqual("job", parse_continuation_state(job_data).batch_state.screen)
-                    self.assertIn("Batch queued · Done 0", job_output.getvalue())
-                    self.assertIn("codex-local", job_output.getvalue())
-                    self.assertIn("Will open existing session", job_output.getvalue())
-                    self.assertIn("delay: 1", job_output.getvalue())
-
-                    # A stale replay sees the already-claimed job and cannot
-                    # submit the private preview a second time.
-                    replay = io.StringIO()
-                    with mock.patch("sys.stdout", replay):
-                        run_rofi(
-                            {
-                                "ROFI_RETV": "1",
-                                "ROFI_DATA": preview_data,
-                                "ROFI_INFO": confirm_info,
-                            },
-                            store=store,
-                            config=PickerConfig(),
-                            preference_store=preferences,
-                            batch_state_store=batch_store,
-                        )
-                    spawn.assert_called_once()
-                    replay_headers, _ = _records(replay.getvalue())
-                    replay_data = next(
-                        value.split("\x1f", 1)[1]
-                        for value in replay_headers
-                        if value.startswith("\x00data\x1f")
-                    )
-                    self.assertEqual(
-                        "job", parse_continuation_state(replay_data).batch_state.screen
-                    )
-                preferences.save.assert_not_called()
-
-    def test_preview_action_cycle_discards_confirm_and_requires_new_preview(self) -> None:
-        target = _row("local", "codex", LOCAL_ID, "$1", 1)
-        store = FakeStore(_snapshot([target], []))
-        group = BatchUIState("group", None, batch.ACTION_RESUME)
-        with mock.patch(
-            "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
-            return_value=contract_viewers.ViewerInspection("none", (), True),
-        ):
-            with tempfile.TemporaryDirectory() as temporary:
-                batch_store = batch.BatchStateStore(Path(temporary))
-                preview_output = io.StringIO()
-                with mock.patch("sys.stdout", preview_output):
-                    run_rofi(
-                        {
-                            "ROFI_RETV": "1",
-                            "ROFI_DATA": _refresh_data(batch_state=group),
-                            "ROFI_INFO": _batch_row_info("batch-group", batch.ACTION_RESUME),
-                        },
-                        store=store,
-                        config=PickerConfig(),
-                        batch_state_store=batch_store,
-                    )
-                preview_headers, _ = _records(preview_output.getvalue())
-                preview_data = next(
-                    value.split("\x1f", 1)[1]
-                    for value in preview_headers
-                    if value.startswith("\x00data\x1f")
+            with mock.patch("rofi_agent_plus.batch._spawn_worker") as spawn:
+                replay = self._invoke(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": self._data(start),
+                        "ROFI_INFO": confirm,
+                    },
+                    store,
+                    preferences=preferences,
+                    state_store=state_store,
                 )
-                preview_state = parse_continuation_state(preview_data).batch_state
-                self.assertEqual("preview", preview_state.screen)
-                old_preview_id = preview_state.record_id
-                cycled = io.StringIO()
-                with mock.patch("sys.stdout", cycled):
-                    run_rofi(
-                        {"ROFI_RETV": str(ROFI_RETV_CUSTOM_7), "ROFI_DATA": preview_data},
-                        store=store,
-                        config=PickerConfig(),
-                        batch_state_store=batch_store,
-                    )
-                cycled_headers, _ = _records(cycled.getvalue())
-                cycled_data = next(
-                    value.split("\x1f", 1)[1]
-                    for value in cycled_headers
-                    if value.startswith("\x00data\x1f")
-                )
-                state = parse_continuation_state(cycled_data).batch_state
-                self.assertEqual("group", state.screen)
-                self.assertEqual(batch.ACTION_CLOSE, state.action)
-                self.assertIsNone(batch_store.read_preview(old_preview_id))
-                self.assertIn("[Close all windows]</span>", cycled.getvalue())
-                self.assertIsNone(batch_store.active_job())
-
-                # Replaying the stale preview data and its old typed Confirm
-                # row cannot recreate the private preview or start a job.
-                stale_confirm = io.StringIO()
-                with (
-                    mock.patch("sys.stdout", stale_confirm),
-                    mock.patch("rofi_agent_plus.batch._spawn_worker") as spawn,
-                ):
-                    run_rofi(
-                        {
-                            "ROFI_RETV": "1",
-                            "ROFI_DATA": preview_data,
-                            "ROFI_INFO": _batch_row_info(
-                                "batch-confirm", batch.ACTION_RESUME, old_preview_id
-                            ),
-                        },
-                        store=store,
-                        config=PickerConfig(),
-                        batch_state_store=batch_store,
-                    )
                 spawn.assert_not_called()
-                self.assertIsNone(batch_store.active_job())
-                self.assertIn("Confirmation is stale", stale_confirm.getvalue())
+            self.assertIn("Confirmation is stale", replay)
+            self.assertIsNone(state_store.active_job())
+            preferences.save.assert_not_called()
+
+    def test_page_and_conversation_exit_discard_preview_without_provider_action(self) -> None:
+        selected = _row("local", "codex", LOCAL_ID, "$1", 1)
+        remote = _row("remote", "claude", REMOTE_ID, "$9", 9)
+        store = FakeStore(_snapshot([selected], [remote]))
+        preferences = mock.Mock(spec=ViewPreferenceStore)
+        with tempfile.TemporaryDirectory() as temporary:
+            state_store = batch.BatchStateStore(Path(temporary))
+            with mock.patch(
+                "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                return_value=contract_viewers.ViewerInspection("none", (), True),
+            ):
+                state, data, _record = self._stored_preview(store, state_store)
+            page = self._invoke(
+                {"ROFI_RETV": "11", "ROFI_DATA": data},
+                store,
+                preferences=preferences,
+                state_store=state_store,
+            )
+            self.assertIsNone(state_store.read_preview(state.record_id))
+            self.assertIn("Agents › Local", page)
+            preferences.save.assert_called_once()
+            preferences.reset_mock()
+
+            with mock.patch(
+                "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                return_value=contract_viewers.ViewerInspection("none", (), True),
+            ):
+                state, data, _record = self._stored_preview(store, state_store)
+            with (
+                mock.patch("rofi_agent_plus.rofi._try_fast_open") as fast_open,
+                mock.patch("rofi_agent_plus.rofi._open_selection") as open_session,
+            ):
+                returned = self._invoke(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": data,
+                        "ROFI_INFO": selection_payload(selected),
+                    },
+                    store,
+                    preferences=preferences,
+                    state_store=state_store,
+                )
+            self.assertIsNone(state_store.read_preview(state.record_id))
+            self.assertIn("\x00new-selection\x1f1", returned)
+            self.assertNotIn("batch-ui:", returned)
+            fast_open.assert_not_called()
+            open_session.assert_not_called()
+            preferences.save.assert_not_called()
 
     def test_changed_reference_is_listed_without_exact_target_tint(self) -> None:
         current = _row("local", "codex", LOCAL_ID, "$99", 99)
@@ -858,43 +912,69 @@ class BatchPickerTest(unittest.TestCase):
         )
         self.assertIn("current tmux association differs; no row was marked", rendered)
         self.assertIn("tmux $1", rendered)
-        self.assertNotIn("Active set in scope · observed", rendered)
         headers, rows = _records(rendered)
         session_row = next(row for row in rows if row.startswith("codex-local"))
         _, options = _options(session_row)
         self.assertNotIn("Will open existing session", options["display"])
         self.assertNotIn("foreground=", options["display"])
 
-    def test_page_exit_uses_page_ring_and_saves_only_page_preference(self) -> None:
-        local = _row("local", "codex", LOCAL_ID, "$1", 1)
-        remote = _row("remote", "claude", REMOTE_ID, "$9", 9)
-        snapshot = _snapshot([local], [remote])
-        store = FakeStore(snapshot)
-        preferences = mock.Mock(spec=ViewPreferenceStore)
-        group = BatchUIState("group", None, batch.ACTION_RESUME)
-        with tempfile.TemporaryDirectory() as temporary:
-            output = io.StringIO()
-            with mock.patch("sys.stdout", output):
-                run_rofi(
-                    {
-                        "ROFI_RETV": "11",
-                        "ROFI_DATA": _refresh_data(batch_state=group),
-                    },
-                    store=store,
-                    config=PickerConfig(),
-                    preference_store=preferences,
-                    batch_state_store=batch.BatchStateStore(Path(temporary)),
-                )
-        self.assertIn("Agents › Local", output.getvalue())
-        self.assertIn("\x00new-selection\x1f1", output.getvalue())
-        preferences.save.assert_called_once()
-        self.assertEqual(0, store.context_calls)
-        self.assertEqual([], store.refresh_calls)
+    def test_inline_preview_marks_only_exact_targets_and_shows_exclusions(self) -> None:
+        included = _row("local", "codex", LOCAL_ID, "$1", 1, name="included")
+        excluded = _row("local", "claude", REMOTE_ID, "$2", 2, name="excluded")
+        target = {
+            "hostId": "local",
+            "kind": "codex",
+            "id": LOCAL_ID,
+            "name": "included",
+            "host": "Workstation",
+            "reference": included["tmux"],
+            "requiredOption": ["@codex_session_id", LOCAL_ID],
+            "mode": "open",
+            "viewers": [],
+        }
+        preview = {
+            "action": batch.ACTION_RESUME,
+            "previewId": "b" * 32,
+            "scope": "Local · current machine as session owner",
+            "targets": [target],
+            "exclusions": [
+                {
+                    "name": "excluded",
+                    "provider": "claude",
+                    "host": "Workstation",
+                    "reason": "viewer association is ambiguous",
+                }
+            ],
+        }
 
-    def test_control_payload_with_session_fields_cannot_reach_fast_open(self) -> None:
-        cache = mock.Mock(spec=CacheStore)
-        cache.load.return_value = {"sessions": [], "errors": []}
-        prefs = mock.Mock(spec=ViewPreferenceStore)
+        rendered = render_snapshot(
+            _snapshot([included, excluded], []),
+            navigation=NavigationState("local"),
+            batch_state=BatchUIState("preview", None, batch.ACTION_RESUME, "b" * 32),
+            batch_record=preview,
+            continuation=True,
+        )
+        _, rows = _records(rendered)
+        by_id = {
+            json.loads(_options(row)[1]["info"]).get("id"): _options(row)[1]
+            for row in rows
+            if _options(row)[1].get("info", "").startswith("{")
+            and json.loads(_options(row)[1]["info"]).get("type") != "batch"
+        }
+        self.assertIn(
+            '<span foreground="#42a5f5" weight="bold">Will open existing session</span>',
+            by_id[LOCAL_ID]["display"],
+        )
+        self.assertNotIn("foreground=", by_id[REMOTE_ID]["display"])
+        exclusion = next(row for row in rows if row.startswith("Excluded · excluded"))
+        self.assertIn("viewer association is ambiguous", _options(exclusion)[1]["display"])
+
+    def test_legacy_group_state_and_forged_controls_fall_back_without_open(self) -> None:
+        row = _row("local", "codex", LOCAL_ID, "$1", 1)
+        store = FakeStore(_snapshot([row], []))
+        preferences = mock.Mock(spec=ViewPreferenceStore)
+        legacy = "batch-ui:%7B%22version%22%3A1%2C%22screen%22%3A%22group%22%2C%22action%22%3A%22close%22%7D"
+        self.assertIsNone(parse_continuation_state(legacy).batch_state)
         forged = {
             "type": "batch-confirm",
             "kind": "codex",
@@ -906,22 +986,16 @@ class BatchPickerTest(unittest.TestCase):
             "providerOptionVerified": True,
         }
         with tempfile.TemporaryDirectory() as temporary:
-            state = batch.BatchStateStore(Path(temporary))
-            output = io.StringIO()
-            with (
-                mock.patch("sys.stdout", output),
-                mock.patch("rofi_agent_plus.rofi._try_fast_open") as fast_open,
-            ):
-                run_rofi(
+            with mock.patch("rofi_agent_plus.rofi._try_fast_open") as fast_open:
+                output = self._invoke(
                     {"ROFI_RETV": "1", "ROFI_INFO": json.dumps(forged)},
-                    store=cache,
-                    config=PickerConfig(),
-                    preference_store=prefs,
-                    batch_state_store=state,
+                    store,
+                    preferences=preferences,
+                    state_store=batch.BatchStateStore(Path(temporary)),
                 )
         fast_open.assert_not_called()
-        self.assertIn("control rows cannot be opened", output.getvalue())
-        prefs.save.assert_not_called()
+        self.assertIn("control rows cannot be opened", output)
+        preferences.save.assert_not_called()
 
 
 if __name__ == "__main__":

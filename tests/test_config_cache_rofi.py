@@ -19,6 +19,7 @@ from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, PresentationContext
 from rofi_agent_plus.config import ConfigError, PickerConfig, config_from_mapping, load_config
 from rofi_agent_plus.contract_lifecycle import LifecycleError
 from rofi_agent_plus.rofi import (
+    ACTION_CLOSE,
     ACTION_NEW,
     ACTION_RESUME,
     AUTO_REFRESH_DATA_PREFIX,
@@ -321,7 +322,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.9.0", engine.VERSION)
+        self.assertEqual("0.10.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -360,8 +361,8 @@ class ProjectMetadataTest(unittest.TestCase):
         self.assertIn('-kb-element-next "" -kb-element-prev ""', readme)
         self.assertIn('-kb-accept-custom "" -kb-delete-entry ""', readme)
         self.assertIn("-kb-cancel Escape,Control+g", readme)
-        self.assertIn("`Tab` switches the action from", readme)
-        self.assertIn("`Resume` to `New session here`", readme)
+        self.assertIn("`Tab` cycles the shared action through `Resume`, `Close`, and `New`", readme)
+        self.assertIn("`Alt+A` clears search and selects that row", readme)
         self.assertNotIn("-kb-custom-4 Tab", readme)
         self.assertNotIn("-kb-custom-5 ISO_Left_Tab", readme)
         self.assertNotIn("-kb-custom-6 Escape", readme)
@@ -1708,31 +1709,34 @@ class RofiProtocolTest(unittest.TestCase):
                 )
             return output.getvalue()
 
-        new_action = invoke(ROFI_RETV_CUSTOM_7, ACTION_RESUME)
-        self.assertIn("\x00prompt\x1fAgents › All", new_action)
-        self.assertNotIn("Agents › All · New session here", new_action)
+        close_action = invoke(ROFI_RETV_CUSTOM_7, ACTION_RESUME)
+        self.assertIn("\x00prompt\x1fAgents › All", close_action)
         self.assertIn(
-            'Resume · <span foreground="#42a5f5" weight="bold">[New session here]</span>',
-            new_action,
+            'Resume · <span foreground="#42a5f5" weight="bold">[Close]</span> · New',
+            close_action,
         )
-        self.assertIn("  │  Tab: Cycle actions", new_action)
+        self.assertIn("  │  Tab: Cycle actions", close_action)
         self.assertIn(
-            "Tab: Cycle actions  │  Alt+A: Active group\u2028\u2028&lt;offline&gt; &amp; busy",
+            "Tab: Cycle actions  │  Alt+A: Select All active\u2028\u2028&lt;offline&gt; &amp; busy",
             _action_message(ACTION_RESUME, "<offline> & busy"),
         )
-        self.assertIn("Refresh errors: alpha/claude: offline", new_action)
+        self.assertIn("Refresh errors: alpha/claude: offline", close_action)
+        self.assertIn(_action_data(ACTION_CLOSE), close_action)
+        self.assertIn("\x00keep-filter\x1ftrue", close_action)
+        self.assertIn("\x00keep-selection\x1ftrue", close_action)
+        self.assertIn("\x00new-selection\x1f2", close_action)
+
+        new_action = invoke(ROFI_RETV_CUSTOM_7, ACTION_CLOSE)
+        self.assertIn("[New]</span>", new_action)
         self.assertIn(_action_data(ACTION_NEW), new_action)
-        self.assertIn("\x00keep-filter\x1ftrue", new_action)
-        self.assertIn("\x00keep-selection\x1ftrue", new_action)
-        self.assertIn("\x00new-selection\x1f2", new_action)
 
         resumed = invoke(ROFI_RETV_CUSTOM_8, ACTION_NEW)
         self.assertIn("\x00prompt\x1fAgents › All", resumed)
         self.assertIn(
-            'Enter: <span foreground="#42a5f5" weight="bold">[Resume]</span> · New session here',
+            'Resume · <span foreground="#42a5f5" weight="bold">[Close]</span> · New',
             resumed,
         )
-        self.assertIn(_action_data(ACTION_RESUME), resumed)
+        self.assertIn(_action_data(ACTION_CLOSE), resumed)
         store.presentation_context.assert_not_called()
         store.refresh.assert_not_called()
         store.spawn_background.assert_not_called()
@@ -1765,7 +1769,7 @@ class RofiProtocolTest(unittest.TestCase):
                 config=self._config(),
             )
         self.assertIn("Agents › Local", scope_output.getvalue())
-        self.assertIn("[New session here]</span>", scope_output.getvalue())
+        self.assertIn("[New]</span>", scope_output.getvalue())
         self.assertIn(_action_data(ACTION_NEW), scope_output.getvalue())
         scope_store.presentation_context.assert_not_called()
 
@@ -1790,7 +1794,7 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn("Agents › All", auto_output.getvalue())
-        self.assertIn("[New session here]</span>", auto_output.getvalue())
+        self.assertIn("[New]</span>", auto_output.getvalue())
         self.assertIn(_action_data(ACTION_NEW), auto_output.getvalue())
         self.assertIn("\x00new-selection\x1f1", auto_output.getvalue())
 
@@ -1806,7 +1810,7 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn("Agents › All", manual_output.getvalue())
-        self.assertIn("[New session here]</span>", manual_output.getvalue())
+        self.assertIn("[New]</span>", manual_output.getvalue())
         self.assertIn(_action_data(ACTION_NEW), manual_output.getvalue())
         refresh_store.spawn_background.assert_called_once()
 
@@ -1919,13 +1923,13 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn(
-            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Active group\u2028\u2028Unable to start new session: provider unavailable",
+            "[Resume]</span> · Close · New  │  Tab: Cycle actions  │  Alt+A: Select All active\u2028\u2028Unable to start new session: provider unavailable",
             output.getvalue(),
         )
         self.assertIn("Agents › All", output.getvalue())
         self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
         self.assertIn(
-            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Active group",
+            "[Resume]</span> · Close · New  │  Tab: Cycle actions  │  Alt+A: Select All active",
             output.getvalue(),
         )
         self.assertIn("\x00new-selection\x1f2", output.getvalue())
@@ -2665,7 +2669,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertNotIn("\x00keep-filter\x1f", output.getvalue())
         message = header_value(headers, "message")
         self.assertIn("[Resume]", message)
-        self.assertNotIn("[New session here]", message)
+        self.assertNotIn("[New]", message)
         continuation = parse_continuation_state(header_value(headers, "data"))
         self.assertEqual(preference.last_used, continuation.last_used)
         self.assertEqual(preference, self.preference_store.load())
@@ -2976,7 +2980,7 @@ class RofiProtocolTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertNotIn("Checking sessions…", rendered)
         self.assertNotIn("Background refresh stopped", rendered)
-        self.assertIn("[Resume]</span> · New session here  │  Tab: Cycle actions", rendered)
+        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", rendered)
         self.assertNotIn("\x00theme\x1f", rendered)
 
     def test_background_callback_polls_without_starting_another_refresh(self) -> None:
@@ -3308,7 +3312,7 @@ class RofiProtocolTest(unittest.TestCase):
             )
         expired = output.getvalue()
         self.assertNotIn("Checked just now", expired)
-        self.assertIn("[Resume]</span> · New session here  │  Tab: Cycle actions", expired)
+        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", expired)
         self.assertIn("\x00data\x1fidle", expired)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
@@ -3457,7 +3461,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual(0, result)
         rendered = output.getvalue()
         self.assertNotIn("Refresh errors: local/threads: offline", rendered)
-        self.assertIn("[Resume]</span> · New session here  │  Tab: Cycle actions", rendered)
+        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
             rendered,
@@ -3562,9 +3566,7 @@ class RofiProtocolTest(unittest.TestCase):
                 if data is None:
                     self.assertNotIn("Check stopped", rendered)
                     self.assertNotIn("Checking sessions…", rendered)
-                    self.assertIn(
-                        "[Resume]</span> · New session here  │  Tab: Cycle actions", rendered
-                    )
+                    self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", rendered)
                     self.assertIn(
                         '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
                         rendered,

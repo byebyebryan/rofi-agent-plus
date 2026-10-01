@@ -354,6 +354,132 @@ def _exclusion_reason(inspection: contract_viewers.ViewerInspection) -> str:
     }.get(inspection.status, "viewer inspection unavailable")
 
 
+def build_single_close_preview(
+    store: CacheStore,
+    config: PickerConfig,
+    selection: Mapping[str, object],
+    *,
+    context: PresentationContext | None = None,
+) -> dict[str, object]:
+    """Freeze verified local viewers for one selected conversation.
+
+    This path deliberately does not refresh provider sessions. The selected
+    row is narrowed by its typed host/provider/id and full tmux reference,
+    then the public viewer inspection verifies that exact reference and its
+    exact provider option against the current authority.
+    """
+
+    context = store.presentation_context(config) if context is None else context
+    backend = _backend_for(context)
+    identity = _backend_identity(context.backend)
+    snapshot = store.load_current(config, context)
+    catalog = _valid_catalog(snapshot)
+    host_id = selection.get("hostId")
+    kind = selection.get("kind")
+    identifier = selection.get("id")
+    selected_backend = selection.get("backend")
+    display = "Selected host"
+    reason = "selected owner host is not in the current authoritative catalog"
+    owner = next(
+        (item for item in catalog if isinstance(host_id, str) and item.get("hostId") == host_id),
+        None,
+    )
+    if owner is not None:
+        display = str(owner["display"])
+    scope = f"Selected conversation · owner {display}"
+
+    def excluded(reason_text: str, *, stop: bool = False) -> dict[str, object]:
+        result: dict[str, object] = {
+            "action": ACTION_CLOSE,
+            "backend": dict(identity),
+            "scope": _short(scope),
+            "targets": [],
+            "exclusions": [
+                {
+                    "name": _short(selection.get("name") or identifier or "Selected session"),
+                    "provider": _short(kind or ""),
+                    "host": _short(display),
+                    "reason": _short(reason_text),
+                }
+            ],
+            "createdAt": int(time.time()),
+        }
+        if stop:
+            result["stopReason"] = _short(reason_text)
+        return result
+
+    if owner is None:
+        return excluded(reason)
+    if (
+        not isinstance(host_id, str)
+        or not isinstance(kind, str)
+        or not isinstance(identifier, str)
+        or not _valid_provider_identifier(kind, identifier)
+    ):
+        return excluded("selected host/provider/session identity is invalid")
+    try:
+        if _backend_identity(selected_backend) != identity:
+            return excluded("selected session belongs to an older Host Mesh authority")
+    except LifecycleError:
+        return excluded("selected session has no verifiable Host Mesh authority")
+    if selection.get("tmuxAssociationCurrent") is not True:
+        return excluded("selected tmux association is stale or ambiguous")
+    if selection.get("providerOptionVerified") is not True:
+        return excluded("provider option association is not currently verified")
+    option = _provider_option(selection)
+    if option is None:
+        return excluded("selected provider option evidence is invalid")
+    try:
+        reference = _reference(
+            selection.get("tmux"),
+            host_id,
+            identity.get("meshRevision") if isinstance(identity.get("meshRevision"), str) else None,
+        )
+    except LifecycleError:
+        return excluded("selected tmux reference is missing or no longer current")
+
+    try:
+        inspection = contract_viewers.inspect_viewers(
+            backend,
+            reference,
+            required_option=option,
+        )
+    except contract_viewers.ViewerError as error:
+        return excluded(
+            _short(error) or "viewer inspection failed",
+            stop=error.stop_batch,
+        )
+    except (LifecycleError, engine.PickerError, OSError) as error:
+        return excluded(_short(error) or "viewer inspection failed")
+    if inspection.status != "verified":
+        return excluded(_exclusion_reason(inspection))
+    if not inspection.close_safe:
+        return excluded("closing could destroy the tmux session")
+
+    target: dict[str, object] = {
+        "hostId": host_id,
+        "kind": kind,
+        "id": identifier,
+        "name": _short(selection.get("name") or identifier),
+        "host": display,
+        "reference": _ref_payload(reference),
+        "requiredOption": list(option),
+        "mode": "close",
+        "viewers": [
+            {"viewerId": viewer.viewer_id, "windowId": viewer.window_id}
+            for viewer in inspection.viewers
+        ],
+    }
+    return {
+        "action": ACTION_CLOSE,
+        "backend": dict(identity),
+        "scope": _short(scope),
+        "targets": [target],
+        "exclusions": [],
+        "createdAt": int(time.time()),
+    }
+
+
 def build_preview(
     store: CacheStore,
     config: PickerConfig,

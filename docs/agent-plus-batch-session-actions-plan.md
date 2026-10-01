@@ -8,9 +8,9 @@ target to keep the conversation list visible while choosing batch actions.
 Agent Plus `0.9.0` implemented in-place group activation. The operator found
 that requiring Enter before showing group actions left a selection feedback
 gap and approved one shared Resume / Close / New cycle on 2026-10-01.
-The `0.10.0` implementation is in progress. Existing public viewer operations
-and finite execution guards remain its foundation. The managed fleet status
-records the selected source and deployment evidence.
+Agent Plus `0.10.0` implements that shared cycle. Existing public viewer
+operations and finite execution guards remain its foundation. The managed fleet
+status records the selected source and deployment evidence.
 
 Close all and Resume all should make switching between Snap and Starship
 convenient using the existing Active page and ordinary tmux sessions. Close
@@ -175,14 +175,17 @@ inside a preview discards it and returns to ordinary selection without opening
 the provider. Preview target cards cannot submit a batch or invoke lifecycle.
 
 Single-conversation Close uses the same fixed preview and finite job guards.
-Refresh only the selected owner host, restrict provider identity before any
-viewer inspection, and require the same complete tmux reference from the
-selected row. Never widen to another conversation or rebind to a replacement
-session. An idle conversation may close when its existing association is
-freshly verified; activity is required for the All active target, not for
-closing one verified viewer. Label the preview as a selected conversation,
-not All active sessions. Freeze the exact viewer handles and preserve tmux,
-provider processes, and other clients.
+Require the selected complete tmux reference, verified provider-option guard,
+and current Host Mesh authority. Inspect only that exact reference through the
+public Tmux viewer command; it verifies the current session and option before
+returning handles. Closing a viewer requires no provider discovery or process
+activity refresh. Never widen to another conversation or rebind to a
+replacement session. An idle conversation may close when its existing
+association is verified; activity is required for All active, not for one
+verified viewer. Missing, ambiguous, stale, or unverifiable associations show
+a no-operation reason. Label the preview as a selected conversation, not All
+active sessions. Freeze the exact viewer handles and preserve tmux, provider
+processes, and other clients.
 
 A second Enter on the typed confirmation consumes the fixed private preview
 once and starts the existing finite job. Show its scope, progress, per-target

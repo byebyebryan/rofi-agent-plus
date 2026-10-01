@@ -93,62 +93,58 @@ selection is supplied before Rofi's first display. The launcher prepares one
 initial frame and serves that same frame to the first script callback, avoiding
 another discovery pass or a race between index calculation and row display.
 
-## P10 action cycle
+## P10 shared action cycle and batch controls
 
 Up and Down navigate rows. Tab (`custom-7`, return value 16) selects the next
-named action and Shift+Tab (`custom-8`, return value 17) selects the previous
-one, wrapping `Resume` and `New session here`. The action is versioned state in
-per-dialog `ROFI_DATA`, so it survives host navigation, filters, Alt+R, and
-background refresh callbacks. The prompt and persistent message hint identify
-the selected action. Enter applies it to the highlighted leaf at callback
-time. Escape plus Ctrl+G always close through Rofi's native cancel action.
-Neither cancellation key is a script callback.
+action and Shift+Tab (`custom-8`, return value 17) selects the previous one,
+wrapping `Resume`, `Close`, and `New`. The selected action is versioned state in
+per-dialog `ROFI_DATA`, so it survives page navigation, filters, Alt+R, and
+background refresh callbacks. Left/Right changes page without changing the
+action. Enter applies the shared action to the highlighted conversation or
+typed All active control. Escape plus Ctrl+G always close through Rofi's native
+cancel path; neither cancellation key is a script callback.
 
-The P10 action cycle leaves Agent discovery and correlation, Host Mesh v1,
-Tmux Session v1, stable typed selection identity, and guarded Resume lifecycle
-operations unchanged.
+The leading typed `All active sessions (N)` control is not a conversation or
+preference target. It shows a cache-backed count of current-page active or
+waiting rows before the ordinary history cap. A real conversation remains the
+default selection when one exists; an empty page selects All active. `Alt+A`
+(`custom-4`, return value 13) clears search and selects All active without
+changing the shared action. The root allows custom-key callbacks when filtering
+leaves no matching row, while custom-input and deletion callbacks remain
+read-only. On All active, `New` displays a select-a-conversation notice without
+provider, host, viewer, or preview work.
 
-## P11 batch session actions
+On a selected conversation, `Close` prepares an inline preview only for the
+selected typed host/provider/session and exact current Tmux reference. A
+currently verified provider option and public Tmux viewer inspection must
+confirm the current association; this also permits closing verified viewers
+for an idle conversation. It does not refresh or rebind provider sessions.
+Missing, stale, ambiguous, unsupported, or unverified associations are shown
+as exclusions.
 
-The leading typed `All active sessions (N)` row and `Alt+A` (`custom-4`, return
-value 13) enter an inline group view. The row uses its own match metadata and
-is not a conversation or preference target. Normal conversation selection
-remains the default; an empty unfiltered page selects the group row. The root
-allows custom-key callbacks when filtering leaves no matching row, while
-custom-input and deletion callbacks remain read-only.
-
-The group view retains the ordinary page rows and adds any missing cached
-active/waiting rows from the same owner-host scope, deduplicated by provider
-identity. Its displayed active count is based on the uncapped cached host rows;
-“observed/in scope” badges describe cached membership only. Resume all is the
-default action; Tab and Shift+Tab cycle Resume all and Close all windows using
-cached data. Enter on a conversation returns to normal individual actions
-without running lifecycle. Alt+A returns to individual actions, and Left/Right
-exits to the page ring.
-
-Each preview refreshes the selected page's owner-host coverage once and is
-independent of Rofi's filter. Active and All cover every authoritative host;
-All reads validated per-host candidates before the flattened list cap. Local
-and named-host pages cover only their respective owner. Preview targets freeze
-complete Tmux stable references, and Close also freezes the viewer IDs found
-on this endpoint. Exact target rows receive operation badges only when both
-provider identity and the complete reference still match. Unverified,
-ambiguous, unsupported, stale, or missing associations are shown as
-exclusions. Preview target rows cannot invoke individual actions. Changing
-the operation or leaving the preview through a page/context callback removes
-that matching unconfirmed preview. Native Escape/Ctrl+G has no script callback;
-its private preview expires under the existing bounded lifetime.
+On All active, `Resume` or `Close` refreshes the selected page's owner-host
+coverage once, independently of Rofi search. Active and All cover every
+authoritative host; All reads validated per-host active candidates before the
+flattened list cap. Local and named-host pages cover only their respective
+owner. The preview freezes complete Tmux references, and Close freezes the
+viewer IDs found on this endpoint. Only exact provider identity plus complete
+reference matches receive target badges. Changed references, exclusions, and
+missing targets remain visible without eligible tint. Preview target rows are
+display-only. Changing the action or leaving through a page or conversation
+callback discards only the matching unconfirmed preview. Native Escape/Ctrl+G
+has no script callback; an unconsumed private preview retains its bounded
+expiry.
 
 Confirm consumes the private preview once and starts one background worker for
-the endpoint. A second request reports the existing job. Resume refreshes each
-selected host under a newly prepared current authority before acting and uses
-only Tmux Plus's existing-reference viewer-open path; it never calls Agent
-Plus's create or reconcile lifecycle. Close calls the public guarded viewer
-closure operation for only the frozen viewer IDs. Protocol or authority
-failures stop the remaining list, individual target failures continue, and
-ambiguous outcomes are not retried. Escape or Ctrl+G before Confirm is native
-cancellation; after Confirm it hides the UI while the fixed job continues.
-The result reports done, already open/closed, skipped, and failed counts.
+the endpoint. A second request reports the existing job. Resume revalidates
+each selected host under a newly prepared current authority and uses only Tmux
+Plus's existing-reference viewer-open path; it never calls Agent Plus create
+or reconcile lifecycle. Close uses the public guarded viewer closure operation
+for only the frozen viewer IDs. Protocol or authority failures stop the
+remaining list, individual target failures continue, and ambiguous outcomes
+are not retried. Escape or Ctrl+G before Confirm is native cancellation; after
+Confirm it hides the UI while the fixed job continues. The result reports done,
+already open/closed, skipped, and failed counts.
 
 ## New session here lifecycle
 
@@ -418,9 +414,10 @@ shared fallback rule below applies only while the executable is absent.
 The implemented Rofi interaction contract is:
 
 - Up and Down navigate rows;
-- Tab and Shift+Tab cycle `Resume` and `New session here`;
+- Tab and Shift+Tab cycle `Resume`, `Close`, and `New`;
 - Left and Right switch `Active`, `All`, `Local`, and stable remote host pages;
-- Enter applies the displayed action to a selected leaf session;
+- Enter applies the displayed action to a selected conversation or typed All active;
+- Alt+A clears search and selects All active;
 - Escape closes through Rofi's native cancel path; and
 - Ctrl+G closes unconditionally through Rofi's native cancel path.
 
