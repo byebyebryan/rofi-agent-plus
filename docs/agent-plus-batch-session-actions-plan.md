@@ -1,13 +1,16 @@
 # Agent Plus batch session actions design and implementation plan
 
-Date: 2026-09-30
+Date: 2026-10-01
 
 Status: the original menu-based batch design shipped in Agent Plus `0.8.0`
 with Tmux Plus `0.4.0`. On 2026-10-01 the operator approved an inline group
 target to keep the conversation list visible while choosing batch actions.
-Agent Plus `0.9.0` implements this refinement; the existing public viewer
-operations and finite batch execution guards remain its foundation. The managed
-fleet status records the selected source and deployment evidence.
+Agent Plus `0.9.0` implemented in-place group activation. The operator found
+that requiring Enter before showing group actions left a selection feedback
+gap and approved one shared Resume / Close / New cycle on 2026-10-01.
+The `0.10.0` implementation is in progress. Existing public viewer operations
+and finite execution guards remain its foundation. The managed fleet status
+records the selected source and deployment evidence.
 
 Close all and Resume all should make switching between Snap and Starship
 convenient using the existing Active page and ordinary tmux sessions. Close
@@ -107,59 +110,79 @@ the [tmux manual](https://man.openbsd.org/tmux) describes that behavior.
 
 ## Picker interaction
 
-### Inline group target refinement (accepted 2026-10-01)
+### Shared action cycle (accepted 2026-10-01)
 
 Replace the leading `Batch actions…` row with **All active sessions (N)**.
 This is a typed group target in the main picker. Keep the conversation list
 visible while choosing the operation, reviewing the fixed batch, and reading
 progress/results; remove the separate Close/Resume action submenu.
 
-Normal conversation actions remain Resume and New session here. The group
-has a separate Resume all / Close all windows cycle using Tab and Shift+Tab.
-Its default is Resume all. Batch state never turns an individual Enter into
-an implicit batch operation, and a group row never becomes the remembered
-conversation. Opening still restores the remembered conversation or first
-real conversation, falling back to the group only on an empty page.
+Use one persistent action bar for every selectable target:
+
+`Enter: [Resume] · Close · New  │  Tab: Cycle actions`
+
+| Action | Conversation selected | All active sessions selected |
+| --- | --- | --- |
+| Resume | Run the existing guarded individual Resume lifecycle. | Prepare a fixed Resume all preview for the whole page's owner-host scope. |
+| Close | Prepare a fixed Close preview for only this conversation's verified viewing windows here. | Prepare a fixed Close all preview for the whole page's owner-host scope. |
+| New | Run the existing guarded New session here lifecycle in the conversation's directory. | Show "Select a conversation to create a new session." and perform no operation. |
+
+Tab and Shift+Tab cycle Resume / Close / New, starting with Resume on launch.
+Moving between a conversation and the group needs no action-bar redraw: the
+same selected action applies to either target. Enter dispatches from the typed
+highlighted row, without a group activation step. Moving the highlight and
+changing pages preserve the chosen action. Alt+A clears search and selects the
+group; it does not toggle a context, change the action, or prepare a preview.
+The group warning and Alt+A are cache-only and must not query hosts, providers,
+tmux, or viewers. A group row never becomes the remembered conversation.
+Opening restores the remembered conversation or first real conversation,
+falling back to the group only on an empty page.
 
 The native Rofi 2.0.0 probe on 2026-10-01 confirmed that the selection-change
 command launches separately and its output is not parsed as a script response.
 Moving the cursor fired the hook but did not call the script executor again.
-There is no simple supported redraw through that hook. Use the agreed fallback:
-Enter on the group or Alt+A activates its context **in place**. Use only
-dialog-local finite UI state; no persistent helper, global keyboard injection,
-provider hooks, or perpetual polling for cursor tracking.
+The shared cycle avoids needing that redraw. Use only dialog-local finite UI
+state; no Rofi fork, native plugin, persistent helper, keyboard injection,
+provider hook, or perpetual polling for cursor tracking. Keep native Escape
+and Ctrl+G cancellation.
 
-The contextual message names the target group and current action. While the
-group context is active, entering a conversation returns to individual
-actions without running an operation. The next individual Enter uses the
-visible individual action. Alt+A provides direct group access and a clear way
-to return to individual actions. Page changes return to the ordinary page
-context with the usual conversation-first selection. Keep native Escape and
-Ctrl+G cancellation.
-
-Group entry clears search so affected rows remain visible. Scope remains the
-whole page's authoritative owner-host coverage. Render the uncapped scoped
-active set alongside the ordinary page rows, without duplicating catalog
-identities, so running conversations outside All's history cap are available
-for inspection. Preserve the normal cap outside group context. Keep the group
-in normal filtering and avoid provider aliases matching its display label.
+Preparing a preview clears search so affected rows remain visible. Group
+scope remains the whole page's authoritative owner-host coverage. In preview
+and results, render the uncapped scoped active set alongside ordinary page
+rows, without duplicate catalog identities. Display frozen targets absent
+from that list as target cards. Preserve the normal history cap outside these
+states. Keep the group in normal filtering and avoid provider aliases
+matching its display label.
 
 The cached count N describes observed running conversations in this scope;
-it is not an operation guarantee. Before preview, mark cached group membership
-with a subdued shared accent. Label this as the active set in scope. Do not
-perform provider, host, or viewer queries just to move the cursor or cycle
-an action. Existing discovery uncertainty and exclusion reasons remain
-visible; the cursor highlight remains distinct from the membership tint.
+it is not an operation guarantee. Mark operation membership only after the
+preview has verified exact targets. Do not perform provider, host, or viewer
+queries just to move the cursor or cycle an action. Existing discovery
+uncertainty and exclusion reasons remain visible; the cursor highlight stays
+distinct from verified target tint.
 
-Enter on the active group prepares a fresh preview using the existing guarded
-batch preparation. Keep that preview inline: the group control becomes an
+Enter on the group with Resume or Close prepares a fresh preview using the
+existing guarded batch preparation. Keep that preview inline: its control becomes an
 explicit confirmation for the chosen operation, and the conversation list
 shows exact included targets, already-open/closed states, and exclusions.
 Display frozen targets missing from the current ordinary list too. Only
 verified exact targets receive the operation membership tint. An operation
 change or page/context change invalidates the displayed confirmation; any
-new operation requires a newly prepared preview. Preview target rows cannot
-submit a batch or invoke individual session lifecycle actions.
+new operation requires a newly prepared preview. Tab changes the same shared
+cycle and returns to the main list with the relevant target selected. Alt+A
+returns to the main list with the group selected. Enter on a conversation
+inside a preview discards it and returns to ordinary selection without opening
+the provider. Preview target cards cannot submit a batch or invoke lifecycle.
+
+Single-conversation Close uses the same fixed preview and finite job guards.
+Refresh only the selected owner host, restrict provider identity before any
+viewer inspection, and require the same complete tmux reference from the
+selected row. Never widen to another conversation or rebind to a replacement
+session. An idle conversation may close when its existing association is
+freshly verified; activity is required for the All active target, not for
+closing one verified viewer. Label the preview as a selected conversation,
+not All active sessions. Freeze the exact viewer handles and preserve tmux,
+provider processes, and other clients.
 
 A second Enter on the typed confirmation consumes the fixed private preview
 once and starts the existing finite job. Show its scope, progress, per-target
@@ -170,12 +193,18 @@ picker while the confirmed job finishes. One batch runs at a time per endpoint.
 
 The refinement preserves stable row identity and the leading-row offset in
 initial launch, refresh, and page transitions. Native acceptance must cover
-conversation-first opening, group activation, Tab/Shift+Tab, target visibility,
-ordinary search, page changes, inline preview cancellation, and unchanged
+conversation-first opening, direct group dispatch, the shared Tab/Shift+Tab
+cycle, group New warning, target visibility, ordinary search, page changes,
+single Close, inline preview cancellation, and unchanged
 preferences. Use the managed invocation and observer callbacks that refuse
 provider Enter and any unowned confirmation.
 
-### Original menu release
+### Earlier UI releases
+
+Agent Plus `0.9.0` removed the operation submenu but required Enter or Alt+A
+to activate a separate group action cycle. The operator rejected that
+activation gap. The shared cycle above supersedes its presentation while
+preserving inline fixed confirmation and results.
 
 Agent Plus `0.8.0` shipped the leading Batch actions row and Alt+A, a separate
 Close/Resume/Back action menu, and fixed preview/result screens. The accepted
