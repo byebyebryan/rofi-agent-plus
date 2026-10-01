@@ -4,8 +4,8 @@ Date: 2026-09-30
 
 Status: accepted design; implementation authorized. The deployed baseline is
 `0.7.0`. The operator selected all eligible active sessions on the current page
-and a small Batch actions menu. Viewer identity and clean closure remain the
-first implementation acceptance gate.
+and a small Batch actions menu. The owned viewer fixture proof passed; producer
+and consumer implementation and deployed acceptance are in progress.
 
 Close all and Resume all should make switching between Snap and Starship
 convenient using the existing Active page and ordinary tmux sessions. Close
@@ -250,9 +250,26 @@ new bundle provenance, consumer repin, and a coordinated deployment tuple.
    gates, apply scoped chezmoi artifacts on Snap and Starship, then verify
    installed/live behavior and the real managed picker workflow on both.
 
-Each checkpoint should produce a reviewable commit when implementation is
-authorized. The first checkpoint is the remaining technical acceptance gate;
-the current read-only checks do not establish production readiness for closure.
+Each checkpoint should produce a reviewable commit. Checkpoint 1 passed on
+2026-09-30 with disposable local Snap and remote Starship sessions. Full-reference
+environment metadata bound each dedicated Kitty window to its terminal and
+attachment process generations. Normal non-PTY kitten helpers were harmless;
+extra split/tab PTY groups were detectable without terminal remote control.
+Signaling only the exact attachment through a pidfd closed the dedicated Kitty
+window naturally. The original session references and fixture pane processes
+survived, including the zero-client case with effective `destroy-unattached=off`.
+Closing the local SSH viewer preserved a second client on Starship. Fixture-only
+cleanup used guarded public kills and preserved every pre-cleanup session
+reference outside the two owned fixtures.
+
+Legacy local viewers can be adopted through a direct attachment PID joined to
+the current tmux client inventory and complete session reference. Legacy remote
+viewers lack that generic PID join and are excluded until closed manually and
+reopened through a marked attachment. The selected public extension is `viewers`,
+`close-viewer`, and strict `open --verified-viewer`, with the ordinary open path
+remaining compatible. These feasibility checks establish the closure method;
+the production commands and exact managed batch workflow still need the later
+acceptance gates.
 
 ## Acceptance and limits
 
