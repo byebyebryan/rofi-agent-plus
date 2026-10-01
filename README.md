@@ -263,6 +263,10 @@ records the Active page, remembered context, implementation order, and
 acceptance requirements. Installed and manual acceptance remain recorded in
 the managed suite status ledger.
 
+The proposed [batch session actions plan](docs/agent-plus-batch-session-actions-plan.md)
+describes Close/Resume for machine switching, the missing viewer capability,
+and implementation checkpoints. Kill all is a separate follow-up.
+
 The [session client exploration](docs/agent-plus-session-client-exploration.md)
 and its linked feasibility studies record possible future presentation work.
 They do not change the current picker or its public contracts.

@@ -1,0 +1,276 @@
+# Agent Plus batch session actions design and implementation plan
+
+Date: 2026-09-30
+
+Status: accepted design; implementation authorized. The deployed baseline is
+`0.7.0`. The operator selected all eligible active sessions on the current page
+and a small Batch actions menu. Viewer identity and clean closure remain the
+first implementation acceptance gate.
+
+Close all and Resume all should make switching between Snap and Starship
+convenient using the existing Active page and ordinary tmux sessions. Close
+removes this endpoint's viewing windows while the agents keep running. Resume
+attaches windows here to those existing sessions. Kill all has a separate,
+specialized purpose and belongs in a later implementation.
+
+Use one-shot public operations and the picker’s existing provider observations.
+Keep provider hooks, daemon/session management, automatic restarts, and saved
+workspace groups outside this implementation.
+
+The design fits the suite's ownership model. Its implementation needs one
+bounded foundation first: reliable identification and closure of a local
+viewer window. The current title-based focus helper does not establish that
+foundation. This note records the intended behavior and the acceptance gate
+for that missing capability.
+
+## Actions and scope
+
+| Action | Intended result |
+| --- | --- |
+| Close all windows | Close every verified viewing window here for eligible sessions in the chosen page scope. Preserve the tmux sessions, agent processes, and viewers on other machines. |
+| Resume all active sessions | Ensure one viewing window here for each eligible existing tmux session in scope. Reuse an existing verified viewer; otherwise attach a new one. |
+| Kill all sessions | Later specialized action: end the selected tmux sessions on their owning hosts, affecting their attached clients everywhere. |
+
+The proposed batch scope follows the page's host coverage:
+
+| Page | Host coverage |
+| --- | --- |
+| Active or All | Every authoritative host, including local |
+| Local | Only the current machine as session owner |
+| Named host | Only that host as session owner |
+
+Both initial actions target observed active conversations with an unambiguous
+existing tmux association. A local viewing window can attach to a session on
+either machine; the page's host describes the session owner. Close always
+acts on windows at the endpoint where the picker was opened.
+
+Selected scope is the whole page, independent of the current search.
+Installed Rofi is `2.0.0-dirty`; its script callback does not export the search
+text. The [2.0.0 script documentation](https://davatorium.github.io/rofi/2.0.0/rofi-script.5/)
+and [tagged callback implementation](https://raw.githubusercontent.com/davatorium/rofi/2.0.0/source/modes/script.c)
+confirm the available environment. Supporting exactly the filtered rows would
+need a tested Rofi integration that preserves native matching and row metadata.
+Reimplementing fuzzy matching in Agent Plus would add a second search policy.
+
+Prepare targets from the validated per-host rows used by Active, before the
+flattened All list's `max_sessions` cap. On All, the preview must explicitly
+say that the batch covers active sessions across the page's hosts and may
+include rows beyond the ordinary history list's cap.
+
+## Machine switching workflow
+
+1. On Snap, open Active and choose Close all windows. The preview lists the
+   session owners and the windows that will close on Snap.
+2. Confirm the batch. The same tmux sessions and agent processes continue on
+   Snap and Starship. They remain eligible for Active after refresh.
+3. At home, open Active on Starship and choose Resume all active sessions.
+4. Confirm the batch. Starship opens missing viewers for local and remote
+   sessions and reuses viewers already present there.
+
+This gives a current working set from running agents. The set can change
+between the two actions as agents exit or new sessions start. Resuming the
+exact earlier set would require a saved group, which is outside this design.
+
+## Eligibility and preview
+
+Before showing the preview, refresh observations for the selected host scope
+once. Use the existing effective activity predicate: an agent waiting for input
+counts as active. Require a current, unique tmux association and the full
+`hostId`, `serverGeneration`, `sessionId`, `createdAt` reference. Provider options
+remain Agent Plus's correlation evidence and become operation guards where
+available. Deduplicate by the complete tmux reference so two catalog rows
+cannot operate on the same runtime twice.
+
+The preview lists the exact fixed targets with conversation, provider, and
+owning host. Close also shows the number of verified windows here; Resume
+distinguishes already open from missing viewers. Show exclusions with short
+reasons, such as no tmux association, ambiguous association, stale observation,
+unreachable host, or unsupported viewer. A zero-target preview performs no
+operation.
+
+Confirmation authorizes only that frozen list. Immediately revalidate the
+relevant session or viewer before each operation. A disappeared, replaced, or
+newly ambiguous target is skipped and reported. Refresh cannot expand a batch
+after confirmation. Close freezes individual viewer handles as well as session
+references, so a window opened after preview cannot join the confirmed batch.
+
+Resume uses the public Tmux Plus `open` path for an existing reference. It
+must never call ordinary Agent Resume's create/reconcile fallback. A missing
+session or current evidence that its agent has ended makes the target a skip.
+The action never starts a replacement provider process. Native Resume remains
+available individually.
+
+Close needs proof that detaching the viewer preserves its session. A session
+configured to disappear when its last client detaches must be excluded. tmux
+normally preserves detached sessions with `destroy-unattached=off`, its default;
+the [tmux manual](https://man.openbsd.org/tmux) describes that behavior.
+
+## Picker interaction
+
+Selected entry is a small **Batch actions…** menu. The accepted placement is
+a distinct typed row before the conversations. The operator pointed out that
+a bottom row is usually outside the visible portion of a long list.
+
+Default selection stays on a conversation. On opening, restore the remembered
+conversation when present; otherwise select the first eligible conversation.
+Page changes and a missing selection also fall back to an eligible conversation.
+Select Batch actions by default only when no eligible conversation remains.
+From the first conversation in the unfiltered list, one Up reaches the menu row.
+Batch actions never becomes the remembered conversation.
+
+Account for the extra leading row when calculating all absolute selection
+indices, including the launcher's initial `-selected-row` and refresh hints.
+Verify page changes and native filtering through the managed invocation:
+ordinary matching conversations must remain easy to select, without the menu
+row taking their default selection. This is an explicit UI acceptance gate.
+
+Use a permanent row so the menu remains eligible with an empty page or no
+search matches; Rofi 2.0.0 supports
+[permanent rows](https://davatorium.github.io/rofi/2.0.0/rofi-script.5/).
+Permanent means unaffected by filtering, not pinned in the visible viewport.
+Restoring a conversation farther down can still scroll the menu row out of
+view. Provide a dedicated shortcut, after verifying the managed bindings, and
+show it in the persistent hint line for access from anywhere in the list.
+
+The menu offers Close all windows, Resume all active sessions, and Back. Each
+action opens its preview with Confirm and Back. Enter on a target row never
+executes an individual session action in this preview. Escape and Ctrl+G use
+native cancellation. Cancellation before confirmation has no session or window
+effect.
+
+Clear search when entering the menu and show the page scope prominently.
+Returning to the picker restores the source page and available selection with
+an empty search. Rofi 2.0.0 cannot supply the old search text for restoring it
+after a separate menu. Keep the existing Resume/New session here action cycle.
+Batch entry, cancellation, and execution do not overwrite the remembered
+conversation with an arbitrary last item from the batch.
+
+Execution belongs to one finite job with bounded operations and a completion
+summary. Allow one batch at a time on an endpoint; another request while it is
+running reports that status instead of starting overlapping operations.
+Use temporary private state only if needed to hand the frozen targets
+to that job. Report completed, already open/closed, skipped, and failed counts,
+with individual failures available in the result. Continue past an individual
+target failure; an authority or protocol failure stops remaining operations.
+Ambiguous outcomes are reported without automatic retries. A user-requested
+second run builds a new preview from current observations.
+
+## Viewer identity and closure
+
+Read-only inspection on 2026-09-30 found Niri window IDs and PIDs on both
+endpoints. The existing Kitty viewers had a direct tmux attach or SSH child
+alongside normal kitten helpers. Niri's CLI can close a specified window ID.
+These observations support feasibility, but no existing user window was
+closed, detached, or otherwise changed during design validation.
+
+Tmux Plus currently focuses the first matching session-name/host title, then
+launches a terminal if focus fails. Titles can change and do not identify the
+complete session reference. Batch reuse and close need the same stronger
+viewer lookup, with ambiguity surfaced instead of causing a duplicate window
+or selecting a title match for closure.
+
+The preferred starting approach is immutable launch metadata carrying the
+complete tmux reference, bound to the terminal process and its start generation.
+Niri supplies the local window ID and PID. Inspect this evidence on demand;
+there is no continuously maintained viewer registry. First try metadata in
+the dedicated launch process environment so Kitty keeps its normal app ID.
+A custom app ID would also require adjusting the current exact Kitty window
+rule and checking desktop icon behavior.
+
+Support dedicated windows with one tmux/SSH attachment. Detect and exclude
+ambiguous layouts containing other terminal work. Normal kitten helper children
+are expected and must not invalidate a dedicated window. Launch metadata records
+the intended attachment; manually retargeting a managed viewer is outside the
+supported workflow. Add live tmux client checks where available without adding
+provider lifecycle hooks.
+
+Prefer ending the exact verified viewer attachment and allowing its dedicated
+Kitty window to exit naturally. Validate this on owned local and remote fixtures.
+Compositor close can trigger Kitty's [window confirmation](https://sw.kovidgoyal.net/kitty/conf/#opt-kitty.confirm_os_window_close),
+as the earlier [Kitty study](agent-plus-session-client-kitty-results.md) observed.
+An accepted close request alone therefore cannot count as a closed window.
+Do not automate keystrokes into confirmation dialogs or change global terminal
+confirmation policy. Verify window disappearance and session survival before
+reporting closure as successful.
+
+Existing unmarked windows need an explicit transition. Adopt one only when
+live evidence proves its association; otherwise report it for manual closure.
+New attachments receive the metadata. The first checkpoint must record which
+existing windows can be supported safely and the resulting limitation.
+
+## Component ownership
+
+Tmux Plus owns generic viewer discovery, validated reuse/focus, and closure,
+alongside its existing session inventory and lifecycle. Agent Plus owns active
+conversation eligibility, host scope, previews, and batch orchestration. SSH
+Plus continues to own approved routes and host authority.
+
+Extend Tmux Plus's public process surface for local viewer inspection and
+closure. Publish bounded typed responses and fixtures for exact viewer identity,
+session association, stale handles, unsupported environments, and ambiguity.
+Reuse `open` for attachment and strengthen its viewer lookup. Publish final
+command names and wire fields with the producer checkpoint after the fixture
+proof.
+
+Agent Plus must consume the released producer bundle and public commands.
+Preserve the independent consumer boundary in
+[Suite Integration](SUITE_INTEGRATION.md): no sibling Python imports or reads
+of private Tmux Plus state. Contract extensions need a released producer commit,
+new bundle provenance, consumer repin, and a coordinated deployment tuple.
+
+## Implementation checkpoints
+
+1. **Prove viewer reuse and clean closure in Tmux Plus.** Use disposable local
+   and remote sessions and windows. Establish metadata, exact matching, process
+   generation guards, closure completion, and the legacy-window transition.
+   Repeat Resume must reuse the same viewer. Close must leave the original
+   session reference and fixture process alive, with other clients unaffected.
+   Choose the smallest proven closure method before implementing batch UI.
+2. **Publish the generic viewer capability.** Add the producer CLI, strict wire
+   contract, fixtures, focused tests, and docs. Preserve session-reference guards
+   and bounded process behavior. Verify refusal for ambiguous windows and for
+   detachment that would destroy a session. Release and sync the consumer's
+   contract bundle.
+3. **Add Agent Plus batch preparation and UI.** Build fixed eligible targets,
+   add the typed menu and previews, execute the finite batch, and display
+   results. Keep page navigation and remembered conversation behavior intact.
+   Prove that batch Resume issues existing-reference opens only and never
+   creates or starts provider sessions.
+4. **Validate and deploy the coordinated change.** Update README, integration
+   docs, and the managed suite ledger. Run source and exact-tuple candidate
+   gates, apply scoped chezmoi artifacts on Snap and Starship, then verify
+   installed/live behavior and the real managed picker workflow on both.
+
+Each checkpoint should produce a reviewable commit when implementation is
+authorized. The first checkpoint is the remaining technical acceptance gate;
+the current read-only checks do not establish production readiness for closure.
+
+## Acceptance and limits
+
+Required checks include mixed local/remote batches, duplicate catalog rows,
+multiple viewers of one session, another endpoint's client, session rename or
+replacement, stale/reused process and window IDs, unreachable hosts, and
+partial failure. Test empty scope, no search matches, menu cancellation, fixed
+preview targets, and preference preservation using the managed Rofi invocation.
+Check the leading menu row with no bookmark, a restored conversation far down
+the list, page changes, filtered refresh, and selection fallback. Real session
+selection must account for the row offset and avoid an extra Down on opening.
+Audit fixture identity and process survival after Close, then attach the same
+fixtures from the other endpoint. Repeated Resume must create no extra viewer.
+
+Initially support the managed Kitty/Niri setup and report unsupported terminals
+or ambiguous windows. Active discovery retains the current provider correlation
+limits, including native in-TUI session switching and fresh uncorrelated
+OpenCode sessions. An unreachable host can be excluded from the active batch
+even if a broken SSH window remains here; that window may need manual closure.
+These limits should be visible in the preview/results and documented.
+
+## Specialized Kill all follow-up
+
+Keep Kill all separate from the machine-switching release. Its later design
+needs an explicit destructive preview naming the owning hosts and affected
+sessions. Invoke guarded session-specific Tmux Plus kills for a frozen list;
+never use a blanket tmux server kill. Ending a session affects its clients on
+other endpoints as well. Conversations remain in provider history and can be
+resumed individually. Automatic restart, saved groups, and provider lifecycle
+management require separate scope decisions.

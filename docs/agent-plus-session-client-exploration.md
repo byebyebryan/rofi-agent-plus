@@ -77,10 +77,13 @@ remembering the last page and successfully used conversation. The
 [picker navigation plan](agent-plus-picker-navigation-plan.md) records that
 direction and replaces the initial Active-only toggle proposal. These picker
 improvements are implemented in `0.7.0`; deployment and acceptance are tracked
-in the managed suite status ledger. Bulk reopening and saved groups remain separate
-possibilities. The discussion moved to a terminal client because it could
-address window management and reconnection together. Named workspaces and
-their UI complexity remain open.
+in the managed suite status ledger. The operator subsequently selected
+Close/Resume batches as a simpler machine-switching direction; the proposed
+[batch session actions plan](agent-plus-batch-session-actions-plan.md) records
+the design and implementation gates, with specialized Kill all separate.
+The earlier discussion moved to a terminal client because it could address
+window management and reconnection together. Saved groups, named workspaces,
+and their UI complexity remain open.
 
 ## The primary object is the agent conversation
 
