@@ -114,7 +114,7 @@ a bottom row is usually outside the visible portion of a long list.
 Default selection stays on a conversation. On opening, restore the remembered
 conversation when present; otherwise select the first eligible conversation.
 Page changes and a missing selection also fall back to an eligible conversation.
-Select Batch actions by default only when no eligible conversation remains.
+Select Batch actions by default when the unfiltered page has no conversations.
 From the first conversation in the unfiltered list, one Up reaches the menu row.
 Batch actions never becomes the remembered conversation.
 
@@ -124,13 +124,22 @@ Verify page changes and native filtering through the managed invocation:
 ordinary matching conversations must remain easy to select, without the menu
 row taking their default selection. This is an explicit UI acceptance gate.
 
-Use a permanent row so the menu remains eligible with an empty page or no
-search matches; Rofi 2.0.0 supports
-[permanent rows](https://davatorium.github.io/rofi/2.0.0/rofi-script.5/).
-Permanent means unaffected by filtering, not pinned in the visible viewport.
-Restoring a conversation farther down can still scroll the menu row out of
-view. Provide a dedicated shortcut, after verifying the managed bindings, and
-show it in the persistent hint line for access from anywhere in the list.
+Let the row participate in normal filtering. Rofi's
+[list selection implementation](https://raw.githubusercontent.com/davatorium/rofi/2.0.0/source/widgets/listview.c)
+retains and clamps the selected position when results shrink. A permanent menu
+row can therefore receive selection when only one conversation matches, adding
+friction to ordinary search. Match the menu through `batch` and `actions`, using
+separate matching text and display text so provider aliases such as `cc` do not
+match across words in its label.
+
+Restoring a conversation farther down can scroll the menu row out of view.
+Provide **Alt+A** on custom callback 4 and show it in the persistent hint line
+for access from anywhere, including a filter with no matching rows. The
+installed default and managed bindings leave Alt+A free. Rofi 2.0.0 suppresses
+custom-key callbacks without a selected row when its `no-custom` flag is true;
+allow that callback transport while retaining Agent Plus's existing rejection
+of custom text and deletion as individual session actions. No free-form input
+may authorize a session operation.
 
 The menu offers Close all windows, Resume all active sessions, and Back. Each
 action opens its preview with Confirm and Back. Enter on a target row never
