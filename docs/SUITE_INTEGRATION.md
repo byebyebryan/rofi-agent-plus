@@ -108,6 +108,35 @@ The P10 action cycle leaves Agent discovery and correlation, Host Mesh v1,
 Tmux Session v1, stable typed selection identity, and guarded Resume lifecycle
 operations unchanged.
 
+## P11 batch session actions
+
+The leading typed `Batch actions…` row and `Alt+A` (`custom-4`, return value
+13) open Close all windows, Resume all active sessions, and Back. The row uses
+its own match metadata and is not a conversation or preference target. Normal
+conversation selection remains the default; an empty unfiltered page selects
+the batch row. The root allows custom-key callbacks when filtering leaves no
+matching row, while custom-input and deletion callbacks remain read-only.
+
+Each preview refreshes the selected page's owner-host coverage once and is
+independent of Rofi's filter. Active and All cover every authoritative host;
+All reads validated per-host candidates before the flattened list cap. Local
+and named-host pages cover only their respective owner. Preview targets freeze
+complete Tmux stable references, and Close also freezes the viewer IDs found
+on this endpoint. Unverified, ambiguous, unsupported, stale, or missing
+associations are shown as exclusions. Preview target rows cannot invoke
+individual actions.
+
+Confirm consumes the private preview once and starts one finite worker for the
+endpoint. A second request reports the existing job. Resume refreshes each
+selected host under a newly prepared current authority before acting and uses
+only Tmux Plus's existing-reference viewer-open path; it never calls Agent
+Plus's create or reconcile lifecycle. Close calls the public guarded viewer
+closure operation for only the frozen viewer IDs. Protocol or authority
+failures stop the remaining list, individual target failures continue, and
+ambiguous outcomes are not retried. Escape or Ctrl+G before Confirm is native
+cancellation; after Confirm it hides the UI while the fixed job continues.
+The result reports done, already open/closed, skipped, and failed counts.
+
 ## New session here lifecycle
 
 `New session here` is separate from the existing Resume fast path and its

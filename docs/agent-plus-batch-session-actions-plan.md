@@ -2,10 +2,10 @@
 
 Date: 2026-09-30
 
-Status: accepted design; implementation authorized. The deployed baseline is
-`0.7.0`. The operator selected all eligible active sessions on the current page
-and a small Batch actions menu. The owned viewer fixture proof passed; producer
-and consumer implementation and deployed acceptance are in progress.
+Status: implemented in Agent Plus `0.8.0` with Tmux Plus `0.4.0`; coordinated
+deployment is in progress. The operator selected all eligible active sessions
+on the current page and a small Batch actions menu. The source gates and owned
+public viewer and spawned batch-job fixtures passed.
 
 Close all and Resume all should make switching between Snap and Starship
 convenient using the existing Active page and ordinary tmux sessions. Close
@@ -273,8 +273,12 @@ close and repeated close preserved the session reference and pane PID. A second
 local fixture verified two dedicated windows, preservation of another tmux
 client, rejection of close with a session-level `destroy-unattached=on`, and
 fixed-handle closure that left a window opened after preview untouched. Cleanup
-reported no errors. The exact managed batch workflow and coordinated deployment
-still need the remaining acceptance gates.
+reported no errors. A real spawned Close job consumed one private preview once,
+completed through the public viewer contract, and preserved its owned session
+and process. Native Rofi Alt+A with no search matches opened the menu, Close
+built a read-only preview, and native Ctrl+G cancelled with unchanged isolated
+preferences and no job. Source gates passed 191 Tmux tests and 259 Agent tests.
+The coordinated deployment and installed gates are the remaining release work.
 
 ## Acceptance and limits
 

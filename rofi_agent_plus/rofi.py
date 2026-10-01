@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
-from . import engine
+from . import batch, engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig, load_config
 from .contract_lifecycle import ContractLifecycle, LifecycleError, fast_open_selection
@@ -31,6 +31,7 @@ ROFI_RETV_SELECTED = 1
 ROFI_RETV_CUSTOM_1 = 10
 ROFI_RETV_CUSTOM_2 = 11
 ROFI_RETV_CUSTOM_3 = 12
+ROFI_RETV_CUSTOM_4 = 13
 # 15 is retained as a migration guard for an older managed invocation that
 # still routed Escape through a script callback.  It closes immediately in
 # ``run_rofi`` and must never render a replacement list.
@@ -57,6 +58,11 @@ ACTION_DATA_VERSION = 1
 ACTION_RESUME = "resume"
 ACTION_NEW = "new-session-here"
 ACTION_ORDER = (ACTION_RESUME, ACTION_NEW)
+BATCH_UI_DATA_PREFIX = "batch-ui:"
+_BATCH_SCREENS = frozenset({"menu", "preview", "job"})
+_BATCH_ROW_TYPES = frozenset(
+    {"batch", "batch-action", "batch-back", "batch-confirm", "batch-target", "batch-job-back"}
+)
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _DISPLAY_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
@@ -161,6 +167,7 @@ class ContinuationState:
     action: str = ACTION_RESUME
     action_valid: bool = True
     last_used: SessionIdentity | None = None
+    batch_state: BatchUIState | None = None
 
     @property
     def has_lifecycle(self) -> bool:
@@ -193,7 +200,91 @@ class ContinuationState:
             action=self.action,
             action_valid=self.action_valid,
             last_used=self.last_used,
+            batch_state=self.batch_state,
         )
+
+
+@dataclass(frozen=True)
+class BatchUIState:
+    """Small typed Rofi state; frozen target lists stay in private files."""
+
+    screen: str
+    source_identity: SessionIdentity | None = None
+    action: str | None = None
+    record_id: str | None = None
+
+
+def _batch_ui_data(state: BatchUIState | None) -> str | None:
+    if state is None:
+        return None
+    payload: dict[str, object] = {"version": 1, "screen": state.screen}
+    if state.source_identity is not None:
+        payload["sourceIdentity"] = list(state.source_identity)
+    if state.action is not None:
+        payload["action"] = state.action
+    if state.record_id is not None:
+        payload["recordId"] = state.record_id
+    encoded = quote(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), safe="")
+    return BATCH_UI_DATA_PREFIX + encoded
+
+
+def _parse_batch_ui_state(value: object) -> BatchUIState | None:
+    if not isinstance(value, str):
+        return None
+    components = [
+        part[len(BATCH_UI_DATA_PREFIX) :]
+        for part in value.split(";")
+        if part.startswith(BATCH_UI_DATA_PREFIX)
+    ]
+    if len(components) != 1 or not components[0] or len(components[0]) > 4096:
+        return None
+    try:
+        payload = json.loads(unquote(components[0]))
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, Mapping)
+        or type(payload.get("version")) is not int
+        or payload.get("version") != 1
+    ):
+        return None
+    screen = payload.get("screen")
+    if not isinstance(screen, str) or screen not in _BATCH_SCREENS:
+        return None
+    allowed = {
+        "menu": {"version", "screen", "sourceIdentity"},
+        "preview": {"version", "screen", "sourceIdentity", "action", "recordId"},
+        "job": {"version", "screen", "sourceIdentity", "recordId"},
+    }[screen]
+    if set(payload) - allowed or not {"version", "screen"}.issubset(payload):
+        return None
+    source_identity: SessionIdentity | None = None
+    raw_identity = payload.get("sourceIdentity")
+    if raw_identity is not None:
+        if not isinstance(raw_identity, list) or len(raw_identity) != 3:
+            return None
+        source_identity = _session_identity(
+            {"hostId": raw_identity[0], "kind": raw_identity[1], "id": raw_identity[2]}
+        )
+        if source_identity is None:
+            return None
+    action = payload.get("action")
+    record_id = payload.get("recordId")
+    if screen == "preview":
+        if (
+            action not in {batch.ACTION_CLOSE, batch.ACTION_RESUME}
+            or not isinstance(record_id, str)
+            or not batch._ID.fullmatch(record_id)
+        ):
+            return None
+    elif screen == "job":
+        if not isinstance(record_id, str) or not batch._ID.fullmatch(record_id):
+            return None
+        if action is not None:
+            return None
+    elif action is not None or record_id is not None:
+        return None
+    return BatchUIState(screen, source_identity, action, record_id)
 
 
 def _protocol(key: str, value: object) -> str:
@@ -568,7 +659,7 @@ def _action_hint(action: str) -> str:
         if candidate == action:
             label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
         labels.append(label)
-    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions"
+    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions  │  Alt+A: Batch actions"
 
 
 def _action_message(action: str, notice: str) -> str:
@@ -897,6 +988,7 @@ def _refresh_data(
     navigation: NavigationState | None = None,
     action: str = ACTION_RESUME,
     last_used: SessionIdentity | None = None,
+    batch_state: BatchUIState | None = None,
 ) -> str:
     """Encode refresh, notices, and optional navigation state for Rofi."""
 
@@ -921,6 +1013,9 @@ def _refresh_data(
     if not values:
         values.append(AUTO_REFRESH_IDLE_DATA)
     values.append(_action_data(action))
+    batch_state_value = _batch_ui_data(batch_state)
+    if batch_state_value is not None:
+        values.append(batch_state_value)
     return ";".join(values)
 
 
@@ -986,6 +1081,7 @@ def _parse_continuation_state(value: object) -> ContinuationState:
         action=action,
         action_valid=action_valid,
         last_used=parse_last_used(value),
+        batch_state=_parse_batch_ui_state(value),
     )
 
 
@@ -1053,6 +1149,7 @@ def _render_continuation(
         navigation=target,
         action=action,
         last_used=state.last_used if last_used is None else last_used,
+        batch_state=state.batch_state,
     )
 
 
@@ -1077,6 +1174,7 @@ def render_snapshot(
     reset_selection: bool = False,
     action: str = ACTION_RESUME,
     last_used: SessionIdentity | None = None,
+    batch_state: BatchUIState | None = None,
     initial_open: bool = False,
 ) -> str:
     """Render a snapshot as Rofi script headers and rows."""
@@ -1088,7 +1186,10 @@ def render_snapshot(
     sessions = _valid_sessions(snapshot)
     headers = [
         _protocol("prompt", _action_prompt(navigation, snapshot)),
-        _protocol("no-custom", "true"),
+        # Alt+A must reach custom-4 even when native filtering leaves no row.
+        # Custom input and deletion are still rejected by their read-only
+        # callback branches below.
+        _protocol("no-custom", "false"),
         _protocol("use-hot-keys", "true"),
         _protocol("markup-rows", "true"),
     ]
@@ -1137,6 +1238,7 @@ def render_snapshot(
                     navigation=navigation,
                     action=action,
                     last_used=last_used,
+                    batch_state=batch_state,
                 ),
             )
         )
@@ -1148,7 +1250,12 @@ def render_snapshot(
         headers.append(
             _protocol(
                 "data",
-                _refresh_data(navigation=navigation, action=action, last_used=last_used),
+                _refresh_data(
+                    navigation=navigation,
+                    action=action,
+                    last_used=last_used,
+                    batch_state=batch_state,
+                ),
             )
         )
 
@@ -1160,14 +1267,28 @@ def render_snapshot(
         for index, session in enumerate(rows)
         if selected_identity is not None and _session_identity(session) == selected_identity
     ]
+    # Batch actions is a real typed leading row. Session selection indices and
+    # Rofi's initial-frame hint therefore include one extra row.
+    first_conversation = 1 if rows else 0
     if reset_selection:
-        headers.append(_protocol("new-selection", 0))
+        headers.append(_protocol("new-selection", first_conversation))
     elif len(selected_indices) == 1 and keep_selection:
-        headers.append(_protocol("new-selection", selected_indices[0]))
-    elif keep_selection and (
-        initial_open or (navigation.view == VIEW_ACTIVE and selected_identity is not None)
-    ):
-        headers.append(_protocol("new-selection", 0))
+        headers.append(_protocol("new-selection", selected_indices[0] + 1))
+    elif keep_selection and (initial_open or preserve or selected_identity is not None):
+        # A missing remembered/current selection falls back to the first real
+        # conversation, or to Batch actions when the page is empty.
+        headers.append(_protocol("new-selection", first_conversation))
+    batch_info = json.dumps({"type": "batch"}, separators=(",", ":"))
+    rendered_rows.append(
+        "batch"
+        + _row_options(
+            (
+                ("info", batch_info),
+                ("meta", "actions"),
+                ("display", "Batch actions…"),
+            )
+        )
+    )
     for session in rows:
         kind = str(session.get("kind") or "")
         info = selection_payload(session)
@@ -1242,6 +1363,11 @@ def render_snapshot(
         if empty_urgent:
             empty_options.append(("urgent", "true"))
         rendered_rows.append(status + _row_options(empty_options))
+        if keep_selection and (initial_open or selected_identity is not None):
+            # The only selectable row on an empty page is the batch entry.
+            # The status row is explicitly nonselectable.
+            if not any(record.startswith("\x00new-selection\x1f") for record in headers):
+                headers.append(_protocol("new-selection", 0))
 
     if continuation:
         return ROFI_RECORD_SEPARATOR.join((*headers, *rendered_rows)) + ROFI_RECORD_SEPARATOR
@@ -1327,8 +1453,10 @@ def _parse_row_selection(raw: str | None) -> tuple[str, dict[str, Any]]:
             payload = json.loads(raw)
         except json.JSONDecodeError:
             payload = None
-        if isinstance(payload, dict) and payload.get("type") == "group":
-            raise engine.PickerError("Rofi group rows are no longer actionable")
+        if isinstance(payload, dict) and "type" in payload:
+            if payload.get("type") == "batch" and set(payload) == {"type"}:
+                return "batch", {}
+            raise engine.PickerError("Rofi control rows are not session action targets")
     return "session", _parse_selection(raw)
 
 
@@ -1830,12 +1958,653 @@ def _auto_refresh_callback(
     )
 
 
+def _batch_scope(navigation: NavigationState) -> batch.Scope:
+    return batch.Scope(navigation.view, navigation.host_id)
+
+
+def _batch_row_info(row_type: str, action: str | None = None) -> str:
+    payload: dict[str, object] = {"type": row_type}
+    if action is not None:
+        payload["action"] = action
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _parse_batch_row(raw: str | None) -> Mapping[str, object] | None:
+    if not isinstance(raw, str) or not raw or len(raw) > 4096:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    row_type = value.get("type")
+    if row_type not in _BATCH_ROW_TYPES:
+        return None
+    if row_type == "batch-action":
+        return (
+            value
+            if set(value) == {"type", "action"}
+            and value.get("action") in {batch.ACTION_CLOSE, batch.ACTION_RESUME}
+            else None
+        )
+    if row_type == "batch-target":
+        return value if set(value) == {"type"} else None
+    return value if set(value) == {"type"} else None
+
+
+def _batch_record(
+    text: str,
+    *,
+    row_type: str,
+    meta: str,
+    display: str | None = None,
+    action: str | None = None,
+    nonselectable: bool = False,
+) -> str:
+    options: list[tuple[str, object]] = [
+        ("info", _batch_row_info(row_type, action)),
+        ("meta", meta),
+    ]
+    if display is not None:
+        options.append(("display", _pango_escape(display)))
+    if nonselectable:
+        options.append(("nonselectable", "true"))
+    return _pango_escape(text) + _row_options(options)
+
+
+def _batch_data(
+    continuation_state: ContinuationState,
+    navigation: NavigationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    batch_state: BatchUIState,
+) -> str:
+    active = continuation_state.active()
+    return _refresh_data(
+        active.refresh_deadline,
+        active.error_deadline,
+        active.error_message,
+        check_deadline=active.check_deadline,
+        navigation=navigation,
+        action=action,
+        last_used=last_used,
+        batch_state=batch_state,
+    )
+
+
+def _render_batch_screen(
+    *,
+    prompt: str,
+    message: str,
+    rows: Sequence[str],
+    continuation_state: ContinuationState,
+    navigation: NavigationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    batch_state: BatchUIState,
+    polling: bool = False,
+    selected_row: int | None = 0,
+    preserve_selection: bool = False,
+) -> str:
+    headers = [
+        _protocol("prompt", prompt),
+        _protocol("no-custom", "false"),
+        _protocol("use-hot-keys", "true"),
+        _protocol("markup-rows", "true"),
+        _protocol(
+            "message", "\u2028".join(_pango_escape(part) for part in message.split("\u2028"))
+        ),
+        _protocol(
+            "data",
+            _batch_data(continuation_state, navigation, action, last_used, batch_state),
+        ),
+        _protocol("theme", _timeout_theme(AUTO_REFRESH_POLL_SECONDS if polling else 0)),
+    ]
+    if preserve_selection:
+        headers.append(_protocol("keep-selection", "true"))
+    if selected_row is not None:
+        headers.append(_protocol("new-selection", max(0, selected_row)))
+    visible_rows = list(rows) or ["Batch actions" + _row_options((("nonselectable", "true"),))]
+    return ROFI_RECORD_SEPARATOR.join((*headers, *visible_rows)) + ROFI_RECORD_SEPARATOR
+
+
+def _batch_scope_message(scope: str) -> str:
+    return f"Scope: {scope}\u2028Search is ignored for batch targets"
+
+
+def _batch_menu_rows() -> list[str]:
+    return [
+        _batch_record(
+            "Close all windows",
+            row_type="batch-action",
+            action=batch.ACTION_CLOSE,
+            meta="close all windows batch",
+            display="Close all windows",
+        ),
+        _batch_record(
+            "Resume all active sessions",
+            row_type="batch-action",
+            action=batch.ACTION_RESUME,
+            meta="resume all active sessions batch",
+            display="Resume all active sessions",
+        ),
+        _batch_record("Back", row_type="batch-back", meta="back picker"),
+    ]
+
+
+def _render_batch_menu(
+    snapshot: Mapping[str, Any] | None,
+    navigation: NavigationState,
+    continuation_state: ContinuationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    state: BatchUIState,
+    *,
+    notice: str = "",
+) -> str:
+    catalog = batch._valid_catalog(snapshot)
+    scope = batch.scope_label(catalog, _batch_scope(navigation))
+    breadcrumb = _breadcrumb(navigation, snapshot)
+    message = _batch_scope_message(scope)
+    if notice:
+        message += "\u2028" + sanitize(notice)
+    return _render_batch_screen(
+        prompt=f"{breadcrumb} › Batch actions",
+        message=message,
+        rows=_batch_menu_rows(),
+        continuation_state=continuation_state,
+        navigation=navigation,
+        action=action,
+        last_used=last_used,
+        batch_state=state,
+    )
+
+
+def _preview_display(record: Mapping[str, object]) -> tuple[list[str], bool]:
+    action = record.get("action")
+    targets = record.get("targets")
+    exclusions = record.get("exclusions")
+    stop_reason = record.get("stopReason")
+    valid_targets = targets if isinstance(targets, list) else []
+    rows: list[str] = []
+    can_confirm = bool(valid_targets) and not bool(stop_reason)
+    if can_confirm:
+        label = (
+            "Confirm close all windows"
+            if action == batch.ACTION_CLOSE
+            else "Confirm resume all active sessions"
+        )
+        rows.append(
+            _batch_record(
+                label,
+                row_type="batch-confirm",
+                meta="confirm batch",
+                display=label,
+            )
+        )
+    elif not valid_targets:
+        rows.append(
+            _batch_record(
+                "No eligible targets · nothing to confirm",
+                row_type="batch-target",
+                meta="no targets",
+                nonselectable=True,
+            )
+        )
+    if stop_reason:
+        rows.append(
+            _batch_record(
+                "Preview stopped · " + sanitize(stop_reason),
+                row_type="batch-target",
+                meta="preview stopped",
+                nonselectable=True,
+            )
+        )
+    for target in valid_targets:
+        if not isinstance(target, Mapping):
+            continue
+        name = sanitize(target.get("name") or target.get("id") or "Agent")
+        provider = PROVIDER_LABELS.get(
+            str(target.get("kind") or ""), sanitize(target.get("kind") or "Agent")
+        )
+        host = sanitize(target.get("host") or target.get("hostId") or "host")
+        mode = target.get("mode")
+        if mode == "already_closed":
+            state = "already closed"
+        elif mode == "already_open":
+            state = "already open"
+        elif action == batch.ACTION_CLOSE:
+            viewers = target.get("viewers")
+            count = len(viewers) if isinstance(viewers, list) else 0
+            state = f"will close {count} window{'s' if count != 1 else ''} here"
+        else:
+            state = "will open existing session here"
+        text = f"{name}  ·  {provider}  ·  {host}  ·  {state}"
+        rows.append(
+            _batch_record(
+                text,
+                row_type="batch-target",
+                meta=f"{name} {provider} {host} {state}",
+                display=text,
+                nonselectable=True,
+            )
+        )
+    if isinstance(exclusions, list):
+        for item in exclusions:
+            if not isinstance(item, Mapping):
+                continue
+            name = sanitize(item.get("name") or "Session")
+            provider = sanitize(item.get("provider") or "")
+            host = sanitize(item.get("host") or "")
+            reason = sanitize(item.get("reason") or "excluded")
+            text = "Excluded · " + "  ·  ".join(
+                part for part in (name, provider, host, reason) if part
+            )
+            rows.append(
+                _batch_record(
+                    text,
+                    row_type="batch-target",
+                    meta=text,
+                    display=text,
+                    nonselectable=True,
+                )
+            )
+    rows.append(_batch_record("Back", row_type="batch-back", meta="back menu"))
+    return rows, can_confirm
+
+
+def _render_batch_preview(
+    record: Mapping[str, object],
+    navigation: NavigationState,
+    continuation_state: ContinuationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    state: BatchUIState,
+    *,
+    notice: str = "",
+) -> str:
+    scope = sanitize(record.get("scope") or batch.scope_label([], _batch_scope(navigation)))
+    rows, can_confirm = _preview_display(record)
+    action_label = (
+        "Close all windows"
+        if record.get("action") == batch.ACTION_CLOSE
+        else "Resume all active sessions"
+    )
+    count = len(record.get("targets", [])) if isinstance(record.get("targets"), list) else 0
+    message = _batch_scope_message(scope)
+    message += f"\u2028{action_label}: {count} fixed target{'s' if count != 1 else ''}"
+    message += " · Enter on target rows does nothing"
+    if can_confirm:
+        message += " · Confirm applies only this preview"
+    if notice:
+        message += "\u2028" + sanitize(notice)
+    return _render_batch_screen(
+        prompt=f"{_breadcrumb(navigation)} › {action_label} preview",
+        message=message,
+        rows=rows,
+        continuation_state=continuation_state,
+        navigation=navigation,
+        action=action,
+        last_used=last_used,
+        batch_state=state,
+    )
+
+
+def _job_screen_rows(job: Mapping[str, object]) -> list[str]:
+    status = sanitize(job.get("status") or "unknown")
+    rows = [
+        _batch_record(
+            "Batch " + status + " · " + batch.job_summary(job),
+            row_type="batch-target",
+            meta="batch status",
+            display="Batch " + status + " · " + batch.job_summary(job),
+            nonselectable=True,
+        )
+    ]
+    stop_reason = sanitize(job.get("stopReason") or "")
+    if stop_reason:
+        rows.append(
+            _batch_record(
+                "Stopped · " + stop_reason,
+                row_type="batch-target",
+                meta="batch stop reason",
+                nonselectable=True,
+            )
+        )
+    for result in batch.result_rows(job):
+        text = "  ·  ".join(
+            part
+            for part in (
+                result["name"],
+                PROVIDER_LABELS.get(result["provider"], result["provider"]),
+                result["host"],
+                result["status"],
+                result["reason"],
+            )
+            if part
+        )
+        rows.append(
+            _batch_record(
+                text,
+                row_type="batch-target",
+                meta=text,
+                display=text,
+                nonselectable=True,
+            )
+        )
+    rows.append(_batch_record("Back to picker", row_type="batch-job-back", meta="back picker"))
+    return rows
+
+
+def _render_batch_job(
+    job: Mapping[str, object] | None,
+    continuation_state: ContinuationState,
+    navigation: NavigationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    state: BatchUIState,
+    *,
+    notice: str = "",
+) -> str:
+    valid_job = job if isinstance(job, Mapping) else {}
+    status = valid_job.get("status")
+    polling = status in {"queued", "running"}
+    scope = sanitize(valid_job.get("scope") or batch.scope_label([], _batch_scope(navigation)))
+    message = _batch_scope_message(scope)
+    if polling:
+        message += "\u2028The confirmed finite batch is running; Escape hides this view"
+    else:
+        message += "\u2028" + batch.job_summary(valid_job)
+    if notice:
+        message += "\u2028" + sanitize(notice)
+    rows = (
+        _job_screen_rows(valid_job)
+        if valid_job
+        else [
+            _batch_record(
+                "Batch result is unavailable",
+                row_type="batch-target",
+                meta="invalid job",
+                nonselectable=True,
+            ),
+            _batch_record("Back to picker", row_type="batch-job-back", meta="back picker"),
+        ]
+    )
+    return _render_batch_screen(
+        prompt=f"{_breadcrumb(navigation)} › Batch result",
+        message=message,
+        rows=rows,
+        continuation_state=continuation_state,
+        navigation=navigation,
+        action=action,
+        last_used=last_used,
+        batch_state=state,
+        polling=polling,
+    )
+
+
+def _root_after_batch(
+    store: CacheStore,
+    config: PickerConfig,
+    navigation: NavigationState,
+    continuation_state: ContinuationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    source_identity: SessionIdentity | None,
+    *,
+    notice: str = "",
+) -> str:
+    snapshot = _presentation_snapshot(store, config)
+    selected_identity = source_identity or last_used
+    active = continuation_state.active()
+    if active.error_deadline is not None:
+        message = active.error_message
+    elif active.refresh_deadline is not None:
+        message = "Checking sessions…"
+    elif active.check_deadline is not None:
+        message = "Checked just now"
+    else:
+        message = notice
+    timeout: bool | None = (
+        True if active.has_lifecycle else False if continuation_state.has_lifecycle else None
+    )
+    return render_snapshot(
+        snapshot,
+        message=message,
+        selected_identity=selected_identity,
+        preserve=False,
+        continuation=True,
+        timeout=timeout,
+        refresh_deadline=active.refresh_deadline,
+        error_deadline=active.error_deadline,
+        check_deadline=active.check_deadline,
+        checking=active.refresh_deadline is not None,
+        clear_message=not bool(message),
+        navigation=navigation,
+        keep_filter=False,
+        keep_selection=True,
+        action=action,
+        last_used=last_used,
+        initial_open=True,
+    )
+
+
+def _handle_batch_screen(
+    environ: Mapping[str, str],
+    store: CacheStore,
+    config: PickerConfig,
+    continuation_state: ContinuationState,
+    navigation: NavigationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    batch_store: batch.BatchStateStore,
+) -> str:
+    state = continuation_state.batch_state
+    assert state is not None
+    retv = int(environ.get("ROFI_RETV", "0") or "0")
+    selected_row = (
+        _parse_batch_row(environ.get("ROFI_INFO")) if retv == ROFI_RETV_SELECTED else None
+    )
+    source_identity = state.source_identity
+    if state.screen == "menu":
+        try:
+            if retv == ROFI_RETV_SELECTED and selected_row is not None:
+                if selected_row.get("type") == "batch-back":
+                    return _root_after_batch(
+                        store,
+                        config,
+                        navigation,
+                        continuation_state,
+                        action,
+                        last_used,
+                        source_identity,
+                    )
+                if selected_row.get("type") != "batch-action":
+                    return _render_batch_menu(
+                        _presentation_snapshot(store, config),
+                        navigation,
+                        continuation_state,
+                        action,
+                        last_used,
+                        state,
+                        notice="Choose one of the batch actions or Back.",
+                    )
+                current = batch_store.active_job()
+                if current is not None:
+                    job_id = current.get("jobId")
+                    if isinstance(job_id, str) and batch._ID.fullmatch(job_id):
+                        job_state = BatchUIState("job", source_identity, None, job_id)
+                        return _render_batch_job(
+                            current, continuation_state, navigation, action, last_used, job_state
+                        )
+                choice = str(selected_row.get("action"))
+                preview = batch.build_preview(store, config, _batch_scope(navigation), choice)
+                preview_id = batch_store.write_preview(preview)
+                preview_state = BatchUIState("preview", source_identity, choice, preview_id)
+                persisted = batch_store.read_preview(preview_id)
+                if persisted is None:
+                    raise batch.BatchError("Batch preview could not be saved safely")
+                return _render_batch_preview(
+                    persisted, navigation, continuation_state, action, last_used, preview_state
+                )
+            if retv == ROFI_RETV_CUSTOM_4:
+                current = batch_store.active_job()
+                if current is not None:
+                    job_id = current.get("jobId")
+                    if isinstance(job_id, str) and batch._ID.fullmatch(job_id):
+                        job_state = BatchUIState("job", source_identity, None, job_id)
+                        return _render_batch_job(
+                            current, continuation_state, navigation, action, last_used, job_state
+                        )
+                return _render_batch_menu(
+                    _presentation_snapshot(store, config),
+                    navigation,
+                    continuation_state,
+                    action,
+                    last_used,
+                    state,
+                )
+            return _render_batch_menu(
+                _presentation_snapshot(store, config),
+                navigation,
+                continuation_state,
+                action,
+                last_used,
+                state,
+            )
+        except batch.BatchBusy as error:
+            current = batch_store.current_job(error.job_id)
+            job_state = BatchUIState("job", source_identity, None, error.job_id)
+            return _render_batch_job(
+                current, continuation_state, navigation, action, last_used, job_state
+            )
+        except Exception as error:  # noqa: BLE001 - visible batch preparation boundary
+            return _render_batch_menu(
+                _presentation_snapshot(store, config),
+                navigation,
+                continuation_state,
+                action,
+                last_used,
+                state,
+                notice=f"Batch preview failed: {sanitize(error)}",
+            )
+
+    if state.screen == "preview":
+        record = batch_store.read_preview(state.record_id or "")
+        if record is None:
+            return _render_batch_menu(
+                _presentation_snapshot(store, config),
+                navigation,
+                continuation_state,
+                action,
+                last_used,
+                BatchUIState("menu", source_identity),
+                notice="Preview expired; choose an action again.",
+            )
+        if retv == ROFI_RETV_SELECTED and selected_row is not None:
+            row_type = selected_row.get("type")
+            if row_type == "batch-back":
+                return _render_batch_menu(
+                    _presentation_snapshot(store, config),
+                    navigation,
+                    continuation_state,
+                    action,
+                    last_used,
+                    BatchUIState("menu", source_identity),
+                )
+            if row_type == "batch-confirm":
+                try:
+                    job_id, queued = batch_store.consume_and_submit(state.record_id or "")
+                    job_state = BatchUIState("job", source_identity, None, job_id)
+                    return _render_batch_job(
+                        queued, continuation_state, navigation, action, last_used, job_state
+                    )
+                except batch.BatchBusy as error:
+                    current = batch_store.current_job(error.job_id)
+                    job_state = BatchUIState("job", source_identity, None, error.job_id)
+                    return _render_batch_job(
+                        current, continuation_state, navigation, action, last_used, job_state
+                    )
+                except Exception as error:  # noqa: BLE001 - one-confirmation boundary
+                    return _render_batch_preview(
+                        record,
+                        navigation,
+                        continuation_state,
+                        action,
+                        last_used,
+                        state,
+                        notice=f"Batch was not submitted: {sanitize(error)}",
+                    )
+            if row_type == "batch-target":
+                return _render_batch_preview(
+                    record,
+                    navigation,
+                    continuation_state,
+                    action,
+                    last_used,
+                    state,
+                    notice="Target rows are display only; choose Confirm to run the fixed preview.",
+                )
+        if retv == ROFI_RETV_CUSTOM_19:
+            # Pre-confirm previews are immutable and do not poll provider or
+            # viewer state. The exact displayed target list remains frozen.
+            return _render_batch_preview(
+                record, navigation, continuation_state, action, last_used, state
+            )
+        return _render_batch_preview(
+            record, navigation, continuation_state, action, last_used, state
+        )
+
+    if state.screen == "job":
+        job = batch_store.current_job(state.record_id)
+        if isinstance(job, Mapping) and job.get("status") in {"queued", "running"}:
+            batch_store.active_job()
+            job = batch_store.current_job(state.record_id)
+        if retv == ROFI_RETV_SELECTED and selected_row is not None:
+            if selected_row.get("type") == "batch-job-back":
+                return _root_after_batch(
+                    store,
+                    config,
+                    navigation,
+                    continuation_state,
+                    action,
+                    last_used,
+                    source_identity,
+                )
+            if selected_row.get("type") == "batch-target":
+                return _render_batch_job(
+                    job,
+                    continuation_state,
+                    navigation,
+                    action,
+                    last_used,
+                    state,
+                    notice="Result rows are display only.",
+                )
+        if retv == ROFI_RETV_CUSTOM_19:
+            return _render_batch_job(job, continuation_state, navigation, action, last_used, state)
+        if retv == ROFI_RETV_CUSTOM_4:
+            return _render_batch_job(job, continuation_state, navigation, action, last_used, state)
+        return _render_batch_job(job, continuation_state, navigation, action, last_used, state)
+    return _render_batch_menu(
+        _presentation_snapshot(store, config),
+        navigation,
+        continuation_state,
+        action,
+        last_used,
+        BatchUIState("menu", source_identity),
+        notice="Batch view state was reset.",
+    )
+
+
 def run_rofi(
     environ: Mapping[str, str] | None = None,
     *,
     store: CacheStore | None = None,
     config: PickerConfig | None = None,
     preference_store: ViewPreferenceStore | None = None,
+    batch_state_store: batch.BatchStateStore | None = None,
 ) -> int:
     """Process one Rofi script invocation."""
 
@@ -1883,6 +2652,7 @@ def run_rofi(
         in {
             ROFI_RETV_SELECTED,
             ROFI_RETV_CUSTOM_1,
+            ROFI_RETV_CUSTOM_4,
             ROFI_RETV_CUSTOM_7,
             ROFI_RETV_CUSTOM_8,
             ROFI_RETV_CUSTOM_19,
@@ -1953,6 +2723,110 @@ def run_rofi(
             )
         print(rendered, end="")
         return 0
+
+    batch_state_store = batch_state_store or batch.BatchStateStore()
+    if continuation_state.batch_state is not None:
+        try:
+            rendered = _handle_batch_screen(
+                environ,
+                store,
+                config,
+                continuation_state,
+                navigation,
+                action,
+                last_used,
+                batch_state_store,
+            )
+        except Exception as exc:  # noqa: BLE001 - typed batch UI boundary
+            safe_state = continuation_state.batch_state
+            rendered = _render_batch_menu(
+                _presentation_snapshot(store, config),
+                navigation,
+                continuation_state,
+                action,
+                last_used,
+                BatchUIState("menu", safe_state.source_identity),
+                notice=f"Batch view failed safely: {sanitize(exc)}",
+            )
+        print(rendered, end="")
+        return 0
+
+    if retv == ROFI_RETV_CUSTOM_4:
+        try:
+            active_job = batch_state_store.active_job()
+            if active_job is not None:
+                job_id = active_job.get("jobId")
+                if isinstance(job_id, str) and batch._ID.fullmatch(job_id):
+                    state = BatchUIState("job", callback_selection_identity, None, job_id)
+                    rendered = _render_batch_job(
+                        active_job,
+                        continuation_state,
+                        navigation,
+                        action,
+                        last_used,
+                        state,
+                    )
+                else:
+                    rendered = _render_batch_menu(
+                        _presentation_snapshot(store, config),
+                        navigation,
+                        continuation_state,
+                        action,
+                        last_used,
+                        BatchUIState("menu", callback_selection_identity),
+                        notice="A batch is already running.",
+                    )
+            else:
+                rendered = _render_batch_menu(
+                    _presentation_snapshot(store, config),
+                    navigation,
+                    continuation_state,
+                    action,
+                    last_used,
+                    BatchUIState("menu", callback_selection_identity),
+                )
+        except Exception as exc:  # noqa: BLE001 - cache-only batch entry boundary
+            rendered = _render_batch_menu(
+                None,
+                navigation,
+                continuation_state,
+                action,
+                last_used,
+                BatchUIState("menu", callback_selection_identity),
+                notice=f"Batch actions unavailable: {sanitize(exc)}",
+            )
+        print(rendered, end="")
+        return 0
+
+    if retv == ROFI_RETV_SELECTED:
+        raw_info = environ.get("ROFI_INFO")
+        if raw_info:
+            try:
+                typed_payload = json.loads(raw_info)
+            except (ValueError, json.JSONDecodeError):
+                typed_payload = None
+            if isinstance(typed_payload, Mapping) and "type" in typed_payload:
+                parsed_control = _parse_batch_row(raw_info)
+                if typed_payload.get("type") == "batch" and parsed_control is not None:
+                    rendered = _render_batch_menu(
+                        _presentation_snapshot(store, config),
+                        navigation,
+                        continuation_state,
+                        action,
+                        last_used,
+                        BatchUIState("menu", None),
+                    )
+                else:
+                    rendered = emit_error(
+                        _presentation_snapshot(store, config),
+                        "Rofi control rows cannot be opened as sessions.",
+                        preserve=True,
+                        continuation=True,
+                        navigation=navigation,
+                        action=action,
+                    )
+                print(rendered, end="")
+                return 0
 
     if retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
         # Tab only changes the named, per-dialog action.  It must never

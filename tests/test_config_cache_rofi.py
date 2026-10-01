@@ -114,7 +114,17 @@ def parse_rendered_records(output: str) -> tuple[list[str], list[str]]:
         records = output.removesuffix(ROFI_RECORD_SEPARATOR).split(ROFI_RECORD_SEPARATOR)
         headers = [record for record in records if record.startswith("\x00")]
         records = [record for record in records if not record.startswith("\x00")]
-    return headers, [record for record in records if record]
+    records = [record for record in records if record]
+    # Most pre-batch rendering tests exercise conversation formatting; the
+    # leading typed batch row has focused assertions in tests/test_batch.py.
+    if records:
+        try:
+            info = parse_row_options(records[0])[1].get("info")
+            if info and json.loads(info) == {"type": "batch"}:
+                records = records[1:]
+        except (AssertionError, json.JSONDecodeError):
+            pass
+    return headers, records
 
 
 def header_value(headers: list[str], key: str) -> str:
@@ -311,7 +321,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.7.0", engine.VERSION)
+        self.assertEqual("0.8.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -1424,7 +1434,7 @@ class RofiProtocolTest(unittest.TestCase):
             ["A", "C"],
             [parse_row_options(row)[0].split("  ·  ")[0] for row in active_rows],
         )
-        self.assertIn("\x00new-selection\x1f0", active_headers)
+        self.assertIn("\x00new-selection\x1f1", active_headers)
 
         local_output = render_snapshot(
             snapshot,
@@ -1432,7 +1442,7 @@ class RofiProtocolTest(unittest.TestCase):
             selected_identity=selected_identity,
         )
         local_headers, _ = parse_rendered_records(local_output)
-        self.assertIn("\x00new-selection\x1f1", local_headers)
+        self.assertIn("\x00new-selection\x1f2", local_headers)
 
     def test_active_and_local_remain_the_local_only_page_ring(self) -> None:
         store = mock.Mock(spec=CacheStore)
@@ -1625,7 +1635,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("navigation:", cycled)
         self.assertIn("\x00keep-filter\x1ftrue", cycled)
         self.assertIn("\x00keep-selection\x1ftrue", cycled)
-        self.assertIn("\x00new-selection\x1f0", cycled)
+        self.assertIn("\x00new-selection\x1f1", cycled)
 
         local = NavigationState("local")
         cycled_right = invoke(ROFI_RETV_CUSTOM_2, local)
@@ -1643,7 +1653,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("background-refresh:1010;error-notice:1003:", cycled_left)
         self.assertIn("\x00keep-filter\x1ftrue", cycled_left)
         self.assertIn("\x00keep-selection\x1ftrue", cycled_left)
-        self.assertIn("\x00new-selection\x1f0", cycled_left)
+        self.assertIn("\x00new-selection\x1f1", cycled_left)
         store.presentation_context.assert_not_called()
 
     def test_action_cycle_wraps_preserves_identity_and_only_reads_cache(self) -> None:
@@ -1691,14 +1701,14 @@ class RofiProtocolTest(unittest.TestCase):
         )
         self.assertIn("  │  Tab: Cycle actions", new_action)
         self.assertIn(
-            "Tab: Cycle actions\u2028\u2028&lt;offline&gt; &amp; busy",
+            "Tab: Cycle actions  │  Alt+A: Batch actions\u2028\u2028&lt;offline&gt; &amp; busy",
             _action_message(ACTION_RESUME, "<offline> & busy"),
         )
         self.assertIn("Refresh errors: alpha/claude: offline", new_action)
         self.assertIn(_action_data(ACTION_NEW), new_action)
         self.assertIn("\x00keep-filter\x1ftrue", new_action)
         self.assertIn("\x00keep-selection\x1ftrue", new_action)
-        self.assertIn("\x00new-selection\x1f1", new_action)
+        self.assertIn("\x00new-selection\x1f2", new_action)
 
         resumed = invoke(ROFI_RETV_CUSTOM_8, ACTION_NEW)
         self.assertIn("\x00prompt\x1fAgents › All", resumed)
@@ -1766,7 +1776,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("Agents › All", auto_output.getvalue())
         self.assertIn("[New session here]</span>", auto_output.getvalue())
         self.assertIn(_action_data(ACTION_NEW), auto_output.getvalue())
-        self.assertIn("\x00new-selection\x1f0", auto_output.getvalue())
+        self.assertIn("\x00new-selection\x1f1", auto_output.getvalue())
 
         manual_output = io.StringIO()
         with mock.patch("sys.stdout", manual_output):
@@ -1893,15 +1903,16 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn(
-            "[Resume]</span> · New session here  │  Tab: Cycle actions\u2028\u2028Unable to start new session: provider unavailable",
+            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Batch actions\u2028\u2028Unable to start new session: provider unavailable",
             output.getvalue(),
         )
         self.assertIn("Agents › All", output.getvalue())
         self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
         self.assertIn(
-            "[Resume]</span> · New session here  │  Tab: Cycle actions", output.getvalue()
+            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Batch actions",
+            output.getvalue(),
         )
-        self.assertIn("\x00new-selection\x1f1", output.getvalue())
+        self.assertIn("\x00new-selection\x1f2", output.getvalue())
 
     def test_navigation_failure_resets_selection_and_rearms_the_next_callback(self) -> None:
         store = mock.Mock(spec=CacheStore)
@@ -2153,7 +2164,10 @@ class RofiProtocolTest(unittest.TestCase):
             self.assertIn("background-refresh:1010;error-notice:1003:", rendered)
             self.assertIn("\x00keep-filter\x1ftrue", rendered)
             self.assertIn("\x00keep-selection\x1ftrue", rendered)
-            self.assertIn("\x00new-selection\x1f0", rendered)
+            self.assertIn(
+                "\x00new-selection\x1f" + ("1" if expected in {"Local", "All"} else "0"),
+                rendered,
+            )
 
     def test_active_navigation_is_carried_by_refresh_continuations(self) -> None:
         active_row = session(name="working", active=True, activityState="waiting")
@@ -2258,7 +2272,7 @@ class RofiProtocolTest(unittest.TestCase):
                 store=store,
                 config=self._config(),
             )
-        self.assertIn("Unable to open session", output.getvalue())
+        self.assertIn("Rofi control rows cannot be opened as sessions", output.getvalue())
         opener.assert_called_once()
 
         forged = json.loads(selection_payload(session()))
@@ -2273,7 +2287,7 @@ class RofiProtocolTest(unittest.TestCase):
                 store=store,
                 config=self._config(),
             )
-        self.assertIn("Unable to open session", output.getvalue())
+        self.assertIn("Rofi control rows cannot be opened as sessions", output.getvalue())
         opener.assert_called_once()
 
     def test_refresh_and_open_failure_preserve_empty_host_scope(self) -> None:
@@ -2627,7 +2641,7 @@ class RofiProtocolTest(unittest.TestCase):
 
         headers, rows = parse_rendered_records(output.getvalue())
         self.assertIn("\x00prompt\x1fAgents › Active", headers)
-        self.assertEqual("1", header_value(headers, "new-selection"))
+        self.assertEqual("2", header_value(headers, "new-selection"))
         self.assertEqual(
             ["first", "remembered", "last"],
             [parse_row_options(row)[0].split("  ·  ")[0] for row in rows],
@@ -2676,7 +2690,7 @@ class RofiProtocolTest(unittest.TestCase):
         headers, rows = parse_rendered_records(output.getvalue())
         self.assertIn("Contract refresh failed", header_value(headers, "message"))
         self.assertEqual(2, len(rows))
-        self.assertEqual("1", header_value(headers, "new-selection"))
+        self.assertEqual("2", header_value(headers, "new-selection"))
         self.assertEqual(preference, self.preference_store.load())
 
     def test_initial_open_missing_host_or_row_falls_back_without_rewriting_bookmark(self) -> None:
@@ -2713,7 +2727,7 @@ class RofiProtocolTest(unittest.TestCase):
                     )
                 headers, _ = parse_rendered_records(output.getvalue())
                 self.assertIn(f"\x00prompt\x1fAgents › {expected}", headers)
-                self.assertEqual("0", header_value(headers, "new-selection"))
+                self.assertEqual("1", header_value(headers, "new-selection"))
                 self.assertEqual(missing, self.preference_store.load())
 
     def test_page_navigation_saves_page_without_reloading_preference_file(self) -> None:
@@ -2897,7 +2911,7 @@ class RofiProtocolTest(unittest.TestCase):
                 preference_store=self.preference_store,
             )
         timeout_headers, _ = parse_rendered_records(output.getvalue())
-        self.assertEqual("0", header_value(timeout_headers, "new-selection"))
+        self.assertEqual("1", header_value(timeout_headers, "new-selection"))
         self.assertEqual(original, self.preference_store.load())
         self.assertEqual(before, self.preference_store.path.read_bytes())
 
@@ -3124,7 +3138,7 @@ class RofiProtocolTest(unittest.TestCase):
 
         headers, rows = parse_rendered_records(output.getvalue())
         self.assertIn("\x00keep-selection\x1ftrue", headers)
-        self.assertIn("\x00new-selection\x1f1", headers)
+        self.assertIn("\x00new-selection\x1f2", headers)
         self.assertEqual("newer", parse_row_options(rows[0])[0].split("  ·  ")[0])
         selected_row = json.loads(parse_row_options(rows[1])[1]["info"])
         self.assertEqual(
@@ -3174,7 +3188,7 @@ class RofiProtocolTest(unittest.TestCase):
                     run_rofi(environ, store=store, config=self._config())
                 headers, rows = parse_rendered_records(output.getvalue())
                 self.assertIn("\x00keep-selection\x1ftrue", headers)
-                self.assertNotIn("\x00new-selection\x1f", output.getvalue())
+                self.assertIn("\x00new-selection\x1f1", output.getvalue())
                 self.assertTrue(rows)
 
     def test_refresh_continuations_keep_identity_for_polling_notices_and_stop(self) -> None:
@@ -3230,7 +3244,7 @@ class RofiProtocolTest(unittest.TestCase):
                     )
                 rendered = output.getvalue()
                 self.assertIn("\x00keep-selection\x1ftrue", rendered)
-                self.assertIn("\x00new-selection\x1f1", rendered)
+                self.assertIn("\x00new-selection\x1f2", rendered)
 
     def test_completion_notice_persists_through_navigation_then_clears_on_expiry(self) -> None:
         selected = session(name="fresh", recencyAt=1000)
@@ -3264,7 +3278,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn(f"{CHECK_NOTICE_DATA_PREFIX}1002", navigated)
         self.assertIn("\x00keep-filter\x1ftrue", navigated)
         self.assertIn("\x00keep-selection\x1ftrue", navigated)
-        self.assertIn("\x00new-selection\x1f0", navigated)
+        self.assertIn("\x00new-selection\x1f1", navigated)
 
         output = io.StringIO()
         with (
@@ -3633,7 +3647,10 @@ class EntrypointTest(unittest.TestCase):
 
     def test_direct_and_symlink_entrypoints_show_help_without_bytecode(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        environment = {
+            key: value for key, value in os.environ.items() if not key.startswith("ROFI_")
+        }
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         direct = subprocess.run(
             [str(root / "bin" / "rofi-agent-plus"), "--help"],
             capture_output=True,

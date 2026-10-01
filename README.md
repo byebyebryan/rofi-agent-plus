@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.7.0` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.8.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -36,6 +36,7 @@ The executable can be run directly from a checkout:
 ./bin/rofi-agent-plus list | jq
 ./bin/rofi-agent-plus-rofi -show agent-plus -modes "agent-plus:$(pwd)/bin/rofi-agent-plus" \
   -kb-custom-1 Alt+r -kb-custom-2 Right -kb-custom-3 Left \
+  -kb-custom-4 Alt+a \
   -kb-custom-7 Tab -kb-custom-8 ISO_Left_Tab \
   -kb-element-next "" -kb-element-prev "" \
   -kb-accept-custom "" -kb-delete-entry "" \
@@ -54,16 +55,20 @@ switches the action from `Resume` to `New session here`; `Shift+Tab` cycles in
 reverse, with wraparound.
 The prompt shows the page; the persistent message below the filter shows
 `Enter:` with both actions and highlights the selected one. A divider separates
-`Tab: Cycle actions` on the same line, and any notice follows after a blank
-line. Enter applies that action to the row highlighted at Enter. Left
+`Tab: Cycle actions` and `Alt+A: Batch actions` on the same line, and any notice
+follows after a blank line. A leading typed `Batch actions…` row also opens the
+menu. The first conversation remains the default selection when one exists;
+the batch row is selected on an empty page. Enter applies the selected
+conversation action to the row highlighted at Enter. Left
 and Right cycle `Active`, `All`, `Local`, and the remote hosts in stable Host
 Mesh order.
 Escape and `Ctrl+G` use Rofi's
 native cancel path and always close. View changes preserve the filter and reset
 the selection. `Alt+R` starts a background refresh while retaining the current
-rows, filter, selection, and action. Custom input and deletion remain disabled. Rofi
-must be launched with `-eh 2` so each list element reserves height for both
-display lines.
+rows, filter, selection, and action. Custom input and deletion callbacks are
+read-only rejected; custom-key callbacks remain enabled so `Alt+A` works when
+filtering leaves no matching row. Rofi must be launched with `-eh 2` so each
+conversation reserves height for both display lines.
 
 The Rofi callback boundary fails closed: configuration, model, and callback
 errors become bounded notices. Left and Right read only the cached snapshot;
@@ -79,11 +84,39 @@ page's recent-session cap, so older observed running conversations remain
 visible. Search a host or provider name to narrow this page. Switching pages
 does not trigger discovery; `Alt+R` refreshes as usual.
 
+## Batch session actions
+
+`Batch actions…` and `Alt+A` open **Close all windows**, **Resume all active
+sessions**, and **Back**. A preview refreshes the selected page's authoritative
+host coverage once and ignores the current search. Active and All cover every
+authoritative owner host; All can include active rows beyond its ordinary
+history-list cap. Local covers only this machine as owner, and a named-host
+page covers that host. The preview freezes stable tmux references and any
+viewing windows selected for closure. Target rows are display-only; Confirm
+acts on the frozen list, while Back or native Escape/Ctrl+G has no session or
+window effect.
+
+Close removes only verified viewing windows on the current endpoint and keeps
+the tmux sessions and provider processes running. Resume revalidates current
+active evidence and opens only an existing tmux reference through Tmux Plus;
+it never creates a session or starts a provider. Retained, stale, missing, or
+ambiguous associations and unsupported or unverified viewers appear as
+exclusions. Confirmed work runs as one finite background job, reports
+completed, already open/closed, skipped, and failed targets, and continues
+after an individual target failure. Escape after Confirm hides the picker while
+the authorized fixed list finishes.
+
+Batch viewers currently require the managed Kitty/Niri setup. Legacy remote
+windows may need closing manually once and reopening through Agent/Tmux Plus.
+Manual provider or tmux switching inside a viewer does not update its managed
+launch identity; those internal transitions remain outside this workflow.
+
 The host catalog is authoritative and ordered by Host Mesh, while provider
 groups are not navigation scopes. Provider icons remain visible, and provider
 names and aliases remain in filter metadata, so searching for `codex`,
-`claude`, `Claude Code`, or `opencode` still works. Every selectable row is a
-leaf session with typed JSON metadata; forged group metadata is rejected.
+`claude`, `Claude Code`, or `opencode` still works. Conversation rows carry
+typed session metadata; the separate batch row and batch controls cannot enter
+the session open or create path.
 
 Rows use a two-line layout: the session title is primary, while a smaller
 secondary line shows the display host, shortened working directory, age, and

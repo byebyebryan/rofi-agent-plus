@@ -1344,7 +1344,7 @@ class ContractBackendAssemblyTest(unittest.TestCase):
         self.assertNotIn("providerOptionVerified", correlated["tmux"])
         self.assertEqual("active", correlated["activityState"])
         rendered = render_snapshot({"sessions": [correlated], "errors": []})
-        info = rendered.split("\x00info\x1f", 1)[1].split("\x1fmeta\x1f", 1)[0]
+        info = rendered.split("\x00info\x1f", 2)[2].split("\x1fmeta\x1f", 1)[0]
         selected = _parse_selection(info)
         self.assertIs(selected["providerOptionVerified"], True)
         self.assertNotIn("providerOptionVerified", selected["tmux"])
@@ -1440,7 +1440,7 @@ class ContractBackendAssemblyTest(unittest.TestCase):
             },
         }
         rendered = render_snapshot({"sessions": [row], "errors": []})
-        info = rendered.split("\x00info\x1f", 1)[1].split("\x1fmeta\x1f", 1)[0]
+        info = rendered.split("\x00info\x1f", 2)[2].split("\x1fmeta\x1f", 1)[0]
         selected = _parse_selection(info)
         self.assertTrue(selected["contractMode"])
         with self.assertRaisesRegex(PickerError, "prepared authority"):

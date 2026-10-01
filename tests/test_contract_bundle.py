@@ -322,7 +322,15 @@ class ContractBundleTest(unittest.TestCase):
     def test_raw_fixture_index_covers_all_public_lifecycle_commands(self) -> None:
         index = _json(CONTRACTS["tmux-session-v1"] / "fixtures/index.json")
         assert isinstance(index, dict)
-        commands = {"inventory", "open", "create", "rename", "kill"}
+        commands = {
+            "inventory",
+            "open",
+            "viewers",
+            "close-viewer",
+            "create",
+            "rename",
+            "kill",
+        }
         raw_cases = [case for case in index["cases"] if case["kind"] == "raw"]
         self.assertGreaterEqual(len(raw_cases), 2)
         for case in raw_cases:

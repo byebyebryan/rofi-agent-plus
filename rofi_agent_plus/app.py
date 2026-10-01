@@ -8,7 +8,7 @@ import os
 import sys
 from collections.abc import Sequence
 
-from . import engine
+from . import batch, engine
 from .cache import CacheStore
 from .config import ConfigError, PickerConfig, load_config
 from .launcher import initial_frame
@@ -67,6 +67,14 @@ def diagnostic_main(argv: Sequence[str] | None = None) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    # The batch worker is deliberately an explicit finite CLI branch. Its
+    # spawner removes every ROFI_* variable, and a native Rofi parent cannot
+    # accidentally route this invocation back through script mode.
+    if argv and argv[0] == "_batch-worker":
+        if len(argv) != 2:
+            print("rofi-agent-plus: invalid batch worker invocation", file=sys.stderr)
+            return 2
+        return batch.worker_main(argv[1])
     if "ROFI_RETV" in os.environ:
         prepared = initial_frame(os.environ)
         if prepared is not None:

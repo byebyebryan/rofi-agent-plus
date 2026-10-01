@@ -72,6 +72,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Right",
             "-kb-custom-3",
             "Left",
+            "-kb-custom-4",
+            "Alt+a",
             "-kb-custom-7",
             "Tab",
             "-kb-custom-8",
