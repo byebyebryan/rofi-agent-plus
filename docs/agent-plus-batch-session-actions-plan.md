@@ -267,9 +267,14 @@ the current tmux client inventory and complete session reference. Legacy remote
 viewers lack that generic PID join and are excluded until closed manually and
 reopened through a marked attachment. The selected public extension is `viewers`,
 `close-viewer`, and strict `open --verified-viewer`, with the ordinary open path
-remaining compatible. These feasibility checks establish the closure method;
-the production commands and exact managed batch workflow still need the later
-acceptance gates.
+remaining compatible. The production public commands subsequently passed the same local and remote
+owned fixtures: strict open registered a viewer, repeated open reused it, exact
+close and repeated close preserved the session reference and pane PID. A second
+local fixture verified two dedicated windows, preservation of another tmux
+client, rejection of close with a session-level `destroy-unattached=on`, and
+fixed-handle closure that left a window opened after preview untouched. Cleanup
+reported no errors. The exact managed batch workflow and coordinated deployment
+still need the remaining acceptance gates.
 
 ## Acceptance and limits
 
