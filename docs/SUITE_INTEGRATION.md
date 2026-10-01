@@ -110,24 +110,37 @@ operations unchanged.
 
 ## P11 batch session actions
 
-The leading typed `Batch actions…` row and `Alt+A` (`custom-4`, return value
-13) open Close all windows, Resume all active sessions, and Back. The row uses
-its own match metadata and is not a conversation or preference target. Normal
-conversation selection remains the default; an empty unfiltered page selects
-the batch row. The root allows custom-key callbacks when filtering leaves no
-matching row, while custom-input and deletion callbacks remain read-only.
+The leading typed `All active sessions (N)` row and `Alt+A` (`custom-4`, return
+value 13) enter an inline group view. The row uses its own match metadata and
+is not a conversation or preference target. Normal conversation selection
+remains the default; an empty unfiltered page selects the group row. The root
+allows custom-key callbacks when filtering leaves no matching row, while
+custom-input and deletion callbacks remain read-only.
+
+The group view retains the ordinary page rows and adds any missing cached
+active/waiting rows from the same owner-host scope, deduplicated by provider
+identity. Its displayed active count is based on the uncapped cached host rows;
+“observed/in scope” badges describe cached membership only. Resume all is the
+default action; Tab and Shift+Tab cycle Resume all and Close all windows using
+cached data. Enter on a conversation returns to normal individual actions
+without running lifecycle. Alt+A returns to individual actions, and Left/Right
+exits to the page ring.
 
 Each preview refreshes the selected page's owner-host coverage once and is
 independent of Rofi's filter. Active and All cover every authoritative host;
 All reads validated per-host candidates before the flattened list cap. Local
 and named-host pages cover only their respective owner. Preview targets freeze
 complete Tmux stable references, and Close also freezes the viewer IDs found
-on this endpoint. Unverified, ambiguous, unsupported, stale, or missing
-associations are shown as exclusions. Preview target rows cannot invoke
-individual actions.
+on this endpoint. Exact target rows receive operation badges only when both
+provider identity and the complete reference still match. Unverified,
+ambiguous, unsupported, stale, or missing associations are shown as
+exclusions. Preview target rows cannot invoke individual actions. Changing
+the operation or leaving the preview through a page/context callback removes
+that matching unconfirmed preview. Native Escape/Ctrl+G has no script callback;
+its private preview expires under the existing bounded lifetime.
 
-Confirm consumes the private preview once and starts one finite worker for the
-endpoint. A second request reports the existing job. Resume refreshes each
+Confirm consumes the private preview once and starts one background worker for
+the endpoint. A second request reports the existing job. Resume refreshes each
 selected host under a newly prepared current authority before acting and uses
 only Tmux Plus's existing-reference viewer-open path; it never calls Agent
 Plus's create or reconcile lifecycle. Close calls the public guarded viewer

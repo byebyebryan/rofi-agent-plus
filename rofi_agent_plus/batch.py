@@ -701,6 +701,20 @@ class BatchStateStore:
                 return None
             return record
 
+    def discard_preview(self, preview_id: str) -> bool:
+        """Remove only the current unconfirmed preview with this identity."""
+        if not _ID.fullmatch(preview_id):
+            return False
+        with self.locked():
+            record = self._read_preview()
+            if record is None or record.get("previewId") != preview_id:
+                return False
+            try:
+                self.preview_path.unlink()
+            except FileNotFoundError:
+                return False
+            return True
+
     def _worker_active_locked(self) -> bool:
         with self.worker_lock(blocking=False) as acquired:
             return not acquired

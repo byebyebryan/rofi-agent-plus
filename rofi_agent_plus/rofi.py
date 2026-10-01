@@ -59,10 +59,8 @@ ACTION_RESUME = "resume"
 ACTION_NEW = "new-session-here"
 ACTION_ORDER = (ACTION_RESUME, ACTION_NEW)
 BATCH_UI_DATA_PREFIX = "batch-ui:"
-_BATCH_SCREENS = frozenset({"menu", "preview", "job"})
-_BATCH_ROW_TYPES = frozenset(
-    {"batch", "batch-action", "batch-back", "batch-confirm", "batch-target", "batch-job-back"}
-)
+_BATCH_SCREENS = frozenset({"group", "preview", "job"})
+_BATCH_ROW_TYPES = frozenset({"batch", "batch-group", "batch-confirm", "batch-target", "batch-job"})
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _DISPLAY_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 
@@ -210,6 +208,8 @@ class BatchUIState:
 
     screen: str
     source_identity: SessionIdentity | None = None
+    # This is the separate group action cycle. Individual Resume/New action
+    # state remains in ContinuationState.action and cannot be changed by it.
     action: str | None = None
     record_id: str | None = None
 
@@ -252,7 +252,7 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
     if not isinstance(screen, str) or screen not in _BATCH_SCREENS:
         return None
     allowed = {
-        "menu": {"version", "screen", "sourceIdentity"},
+        "group": {"version", "screen", "sourceIdentity", "action"},
         "preview": {"version", "screen", "sourceIdentity", "action", "recordId"},
         "job": {"version", "screen", "sourceIdentity", "recordId"},
     }[screen]
@@ -270,19 +270,20 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
             return None
     action = payload.get("action")
     record_id = payload.get("recordId")
+    if screen in {"group", "preview"}:
+        if action not in {batch.ACTION_CLOSE, batch.ACTION_RESUME}:
+            return None
+    elif action is not None:
+        return None
     if screen == "preview":
-        if (
-            action not in {batch.ACTION_CLOSE, batch.ACTION_RESUME}
-            or not isinstance(record_id, str)
-            or not batch._ID.fullmatch(record_id)
-        ):
+        if not isinstance(record_id, str) or not batch._ID.fullmatch(record_id):
             return None
     elif screen == "job":
         if not isinstance(record_id, str) or not batch._ID.fullmatch(record_id):
             return None
-        if action is not None:
-            return None
-    elif action is not None or record_id is not None:
+    elif screen == "group" and record_id is not None:
+        return None
+    elif screen not in {"group", "preview"}:
         return None
     return BatchUIState(screen, source_identity, action, record_id)
 
@@ -596,6 +597,80 @@ def _active_sessions(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]
     return sorted(active, key=_session_sort_key)
 
 
+def _group_sessions(
+    snapshot: Mapping[str, Any] | None,
+    navigation: NavigationState,
+) -> list[dict[str, Any]]:
+    """Return deduplicated cached active/waiting rows in the batch owner scope.
+
+    Per-host records are uncapped, unlike the flattened All page. Observation
+    status still controls eligibility for the visible active set: retained or
+    failed activity evidence must not receive the membership accent.
+    """
+
+    catalog = _host_catalog(snapshot)
+    if navigation.view in {VIEW_ACTIVE, VIEW_ALL}:
+        wanted_hosts = {str(item["hostId"]).casefold() for item in catalog}
+    else:
+        scoped_host = _scope_host_id(snapshot, navigation)
+        wanted_hosts = {scoped_host.casefold()} if scoped_host is not None else set()
+    rows: list[dict[str, Any]] = []
+    seen: set[SessionIdentity] = set()
+    for host in catalog:
+        host_id = str(host["hostId"])
+        if host_id.casefold() not in wanted_hosts:
+            continue
+        record = _host_record(snapshot, host_id)
+        raw_rows = record.get("sessions") if isinstance(record, Mapping) else None
+        if not isinstance(raw_rows, list):
+            continue
+        for row in _valid_sessions({"sessions": raw_rows}):
+            if _session_host(row).casefold() != host_id.casefold():
+                continue
+            identity = _session_identity(row)
+            if identity is None or identity in seen:
+                continue
+            _, urgent, active = _row_observation(row, snapshot, None)
+            waiting = row.get("activityState") == "waiting"
+            if not urgent and (active or waiting):
+                seen.add(identity)
+                rows.append(row)
+    return sorted(rows, key=_session_sort_key)
+
+
+def _group_rows_for_navigation(
+    sessions: Sequence[Mapping[str, Any]],
+    snapshot: Mapping[str, Any] | None,
+    navigation: NavigationState,
+) -> tuple[list[dict[str, Any]], set[SessionIdentity]]:
+    """Merge the ordinary page with active rows beyond its flattened cap."""
+
+    ordinary = _sessions_for_navigation(sessions, navigation, snapshot)
+    active_rows = _group_sessions(snapshot, navigation)
+    merged: list[dict[str, Any]] = []
+    indices: dict[SessionIdentity, int] = {}
+    for row in ordinary:
+        identity = _session_identity(row)
+        if identity is None or identity in indices:
+            continue
+        indices[identity] = len(merged)
+        merged.append(dict(row))
+    membership: set[SessionIdentity] = set()
+    for row in active_rows:
+        identity = _session_identity(row)
+        if identity is None:
+            continue
+        membership.add(identity)
+        if identity in indices:
+            # The host-scoped active record is the fresher presentation for a
+            # logical identity that also appears in the flattened page.
+            merged[indices[identity]] = dict(row)
+        else:
+            indices[identity] = len(merged)
+            merged.append(dict(row))
+    return sorted(merged, key=_session_sort_key), membership
+
+
 def _sessions_for_navigation(
     sessions: Sequence[Mapping[str, Any]],
     navigation: NavigationState,
@@ -659,7 +734,7 @@ def _action_hint(action: str) -> str:
         if candidate == action:
             label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
         labels.append(label)
-    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions  │  Alt+A: Batch actions"
+    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions  │  Alt+A: Active group"
 
 
 def _action_message(action: str, notice: str) -> str:
@@ -910,6 +985,7 @@ def _row_display(
     *,
     snapshot: Mapping[str, Any] | None = None,
     refresh_active: bool = False,
+    batch_badge: str | None = None,
 ) -> str:
     """Return the two-line Pango presentation for one session row."""
 
@@ -927,14 +1003,117 @@ def _row_display(
         now,
         refresh_active=refresh_active,
     )
+    secondary_markup = [_pango_escape(part) for part in secondary_parts]
     if status:
-        secondary_parts.append(status)
-    secondary = "  ·  ".join(secondary_parts)
+        secondary_markup.append(_pango_escape(status))
+    if batch_badge:
+        secondary_markup.append(
+            f'<span foreground="#42a5f5" weight="bold">{_pango_escape(batch_badge)}</span>'
+        )
+    secondary = "  ·  ".join(secondary_markup)
     return (
         f"<b>{_pango_escape(name)}</b>"
         f'{ROW_SEPARATOR}<span size="smaller" alpha="75%">'
-        f"{_pango_escape(secondary)}</span>"
+        f"{secondary}</span>"
     )
+
+
+def _batch_reference_key(value: Mapping[str, Any]) -> tuple[object, ...] | None:
+    """Return the complete immutable tmux identity used by batch targets."""
+
+    required = ("hostId", "meshRevision", "serverGeneration", "sessionId", "createdAt")
+    if any(key not in value for key in required):
+        return None
+    host_id = value.get("hostId")
+    revision = value.get("meshRevision")
+    server_generation = value.get("serverGeneration")
+    session_id = value.get("sessionId")
+    created_at = value.get("createdAt")
+    if (
+        not isinstance(host_id, str)
+        or not host_id
+        or (revision is not None and not isinstance(revision, str))
+        or not isinstance(server_generation, str)
+        or not server_generation
+        or not isinstance(session_id, str)
+        or re.fullmatch(r"\$[0-9]+", session_id, re.ASCII) is None
+        or type(created_at) is not int
+        or created_at < 0
+    ):
+        return None
+    return tuple(value.get(key) for key in required)
+
+
+def _target_identity_key(target: Mapping[str, Any]) -> SessionIdentity | None:
+    return _session_identity(target)
+
+
+def _target_matches_session(
+    target: Mapping[str, Any],
+    session: Mapping[str, Any],
+) -> bool:
+    """Match a frozen target by logical provider identity and full tmux ref."""
+
+    target_identity = _target_identity_key(target)
+    session_identity = _session_identity(session)
+    reference = target.get("reference")
+    tmux = session.get("tmux")
+    backend = session.get("backend")
+    if (
+        target_identity is None
+        or target_identity != session_identity
+        or not isinstance(reference, Mapping)
+        or not isinstance(tmux, Mapping)
+    ):
+        return False
+    current_reference = dict(tmux)
+    current_reference.setdefault("hostId", session.get("hostId"))
+    if isinstance(backend, Mapping):
+        current_reference.setdefault("meshRevision", backend.get("meshRevision"))
+    expected_key = _batch_reference_key(reference)
+    current_key = _batch_reference_key(current_reference)
+    return expected_key is not None and expected_key == current_key
+
+
+def _batch_target_badge(
+    target: Mapping[str, Any],
+    action: str,
+    result: Mapping[str, Any] | None = None,
+) -> str:
+    """Format exact target state without implying a new viewer operation."""
+
+    if result is not None:
+        status = str(result.get("status") or "running").replace("_", " ").title()
+        reason = sanitize(result.get("reason") or "")
+        return status + (f" · {reason}" if reason else "")
+    mode = target.get("mode")
+    if mode == "already_closed":
+        return "Already closed"
+    if mode == "already_open":
+        return "Already open"
+    if action == batch.ACTION_CLOSE:
+        viewers = target.get("viewers")
+        count = len(viewers) if isinstance(viewers, list) else 0
+        return f"Will close {count} window{'s' if count != 1 else ''}"
+    return "Will open existing session"
+
+
+def _frozen_target_card(
+    target: Mapping[str, Any], action: str, result: Mapping[str, Any] | None = None
+) -> str:
+    name = sanitize(target.get("name") or target.get("id") or "Agent")
+    provider = PROVIDER_LABELS.get(
+        str(target.get("kind") or ""), sanitize(target.get("kind") or "Agent")
+    )
+    host = sanitize(target.get("host") or target.get("hostId") or "host")
+    reference = target.get("reference")
+    tmux_id = (
+        sanitize(reference.get("sessionId") or "unknown")
+        if isinstance(reference, Mapping)
+        else "unknown"
+    )
+    status = _batch_target_badge(target, action, result)
+    return f"Frozen target · {name}  ·  {provider}  ·  {host}  ·  tmux {tmux_id}  ·  {status}"
 
 
 def _provider_icon(kind: str) -> str:
@@ -1175,6 +1354,11 @@ def render_snapshot(
     action: str = ACTION_RESUME,
     last_used: SessionIdentity | None = None,
     batch_state: BatchUIState | None = None,
+    batch_record: Mapping[str, object] | None = None,
+    batch_job: Mapping[str, object] | None = None,
+    batch_notice: str = "",
+    batch_initial_control: bool = False,
+    polling_job: bool = False,
     initial_open: bool = False,
 ) -> str:
     """Render a snapshot as Rofi script headers and rows."""
@@ -1210,13 +1394,31 @@ def render_snapshot(
     notice_message = sanitize(message)
     if not notice_message and isinstance(snapshot, Mapping) and not clear_message:
         notice_message = summarize_errors(snapshot.get("errors", []))
-    effective_message = _action_message(action, notice_message)
+    inline_batch = batch_state is not None
+    if inline_batch:
+        effective_message = _batch_context_message(
+            snapshot,
+            navigation,
+            batch_state,
+            batch_record,
+            batch_job,
+            batch_notice or notice_message,
+        )
+    else:
+        effective_message = _action_message(action, notice_message)
     headers.append(_protocol("message", effective_message))
     if timeout is not None:
         if timeout:
-            if refresh_deadline is None and error_deadline is None and check_deadline is None:
+            if (
+                not polling_job
+                and refresh_deadline is None
+                and error_deadline is None
+                and check_deadline is None
+            ):
                 refresh_deadline = time.time() + AUTO_REFRESH_MAX_SECONDS
-            if refresh_deadline is not None:
+            if polling_job:
+                timeout_delay = AUTO_REFRESH_POLL_SECONDS
+            elif refresh_deadline is not None:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
             elif error_deadline is not None:
                 timeout_delay = max(1, math.ceil(error_deadline - time.time()))
@@ -1261,37 +1463,72 @@ def render_snapshot(
 
     rendered_rows: list[str] = []
     emitted = 0
-    rows = _sessions_for_navigation(sessions, navigation, snapshot)
+    if inline_batch:
+        rows, active_membership = _group_rows_for_navigation(sessions, snapshot, navigation)
+    else:
+        rows = _sessions_for_navigation(sessions, navigation, snapshot)
+        active_membership = set()
     selected_indices = [
         index
         for index, session in enumerate(rows)
         if selected_identity is not None and _session_identity(session) == selected_identity
     ]
-    # Batch actions is a real typed leading row. Session selection indices and
-    # Rofi's initial-frame hint therefore include one extra row.
+    # Every picker frame starts with one typed control row. Session identity
+    # overrides therefore use the leading-row offset in root and inline views.
     first_conversation = 1 if rows else 0
     if reset_selection:
         headers.append(_protocol("new-selection", first_conversation))
     elif len(selected_indices) == 1 and keep_selection:
         headers.append(_protocol("new-selection", selected_indices[0] + 1))
+    elif batch_initial_control:
+        headers.append(_protocol("new-selection", 0))
     elif keep_selection and (initial_open or preserve or selected_identity is not None):
         # A missing remembered/current selection falls back to the first real
-        # conversation, or to Batch actions when the page is empty.
+        # conversation, or to the active group row when the page is empty.
         headers.append(_protocol("new-selection", first_conversation))
-    batch_info = json.dumps({"type": "batch"}, separators=(",", ":"))
-    rendered_rows.append(
-        "batch"
-        + _row_options(
-            (
-                ("info", batch_info),
-                ("meta", "actions"),
-                ("display", "Batch actions…"),
+    if inline_batch:
+        rendered_rows.append(
+            _inline_batch_control_row(
+                snapshot,
+                navigation,
+                batch_state,
+                batch_record,
+                batch_job,
+                batch_notice,
             )
         )
-    )
+        target_badges, _target_results, unmatched_targets = _inline_target_presentation(
+            rows,
+            batch_state,
+            batch_record,
+            batch_job,
+        )
+    else:
+        active_count = len(_group_sessions(snapshot, navigation))
+        root_label = f"All active sessions ({active_count})"
+        rendered_rows.append(
+            root_label
+            + _row_options(
+                (
+                    ("info", json.dumps({"type": "batch"}, separators=(",", ":"))),
+                    ("meta", "all active sessions"),
+                    ("display", _pango_escape(root_label)),
+                )
+            )
+        )
+        target_badges, unmatched_targets = {}, []
     for session in rows:
         kind = str(session.get("kind") or "")
         info = selection_payload(session)
+        identity = _session_identity(session)
+        badge = target_badges.get(identity) if identity is not None else None
+        if (
+            badge is None
+            and inline_batch
+            and batch_state.screen == "group"
+            and identity in active_membership
+        ):
+            badge = "Active set in scope · observed"
         search_metadata = " ".join(
             (
                 *(
@@ -1322,6 +1559,7 @@ def render_snapshot(
                     now,
                     snapshot=snapshot,
                     refresh_active=checking,
+                    batch_badge=badge,
                 ),
             ),
         ]
@@ -1331,12 +1569,48 @@ def render_snapshot(
             now,
             refresh_active=checking,
         )
-        if row_active:
+        if row_active or (
+            identity in active_membership and session.get("activityState") == "waiting"
+        ):
             options.append(("active", "true"))
         if row_urgent:
             options.append(("urgent", "true"))
         rendered_rows.append(_row_text(session, now) + _row_options(options))
         emitted += 1
+
+    for card in unmatched_targets:
+        rendered_rows.append(
+            _batch_record(
+                card,
+                row_type="batch-target",
+                meta=card,
+                display=card,
+                nonselectable=True,
+            )
+        )
+
+    if inline_batch and batch_state.screen == "preview" and batch_record is not None:
+        exclusions = batch_record.get("exclusions")
+        if isinstance(exclusions, list):
+            for item in exclusions:
+                if not isinstance(item, Mapping):
+                    continue
+                name = sanitize(item.get("name") or "Session")
+                provider = sanitize(item.get("provider") or "")
+                host = sanitize(item.get("host") or "")
+                reason = sanitize(item.get("reason") or "excluded")
+                card = "Excluded · " + "  ·  ".join(
+                    part for part in (name, provider, host, reason) if part
+                )
+                rendered_rows.append(
+                    _batch_record(
+                        card,
+                        row_type="batch-target",
+                        meta=card,
+                        display=card,
+                        nonselectable=True,
+                    )
+                )
 
     if emitted == 0:
         scope_host = _scope_host_id(snapshot, navigation)
@@ -1962,10 +2236,23 @@ def _batch_scope(navigation: NavigationState) -> batch.Scope:
     return batch.Scope(navigation.view, navigation.host_id)
 
 
-def _batch_row_info(row_type: str, action: str | None = None) -> str:
+_BATCH_ACTION_ORDER = (batch.ACTION_RESUME, batch.ACTION_CLOSE)
+
+
+def _batch_action_label(action: str) -> str:
+    return "Resume all" if action == batch.ACTION_RESUME else "Close all windows"
+
+
+def _batch_row_info(
+    row_type: str,
+    action: str | None = None,
+    record_id: str | None = None,
+) -> str:
     payload: dict[str, object] = {"type": row_type}
     if action is not None:
         payload["action"] = action
+    if record_id is not None:
+        payload["recordId"] = record_id
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -1981,14 +2268,22 @@ def _parse_batch_row(raw: str | None) -> Mapping[str, object] | None:
     row_type = value.get("type")
     if row_type not in _BATCH_ROW_TYPES:
         return None
-    if row_type == "batch-action":
+    if row_type == "batch-group":
         return (
             value
-            if set(value) == {"type", "action"}
-            and value.get("action") in {batch.ACTION_CLOSE, batch.ACTION_RESUME}
+            if set(value) == {"type", "action"} and value.get("action") in _BATCH_ACTION_ORDER
             else None
         )
-    if row_type == "batch-target":
+    if row_type == "batch-confirm":
+        return (
+            value
+            if set(value) == {"type", "action", "recordId"}
+            and value.get("action") in _BATCH_ACTION_ORDER
+            and isinstance(value.get("recordId"), str)
+            and batch._ID.fullmatch(value["recordId"]) is not None
+            else None
+        )
+    if row_type == "batch-target" or row_type == "batch-job":
         return value if set(value) == {"type"} else None
     return value if set(value) == {"type"} else None
 
@@ -2000,10 +2295,11 @@ def _batch_record(
     meta: str,
     display: str | None = None,
     action: str | None = None,
+    record_id: str | None = None,
     nonselectable: bool = False,
 ) -> str:
     options: list[tuple[str, object]] = [
-        ("info", _batch_row_info(row_type, action)),
+        ("info", _batch_row_info(row_type, action, record_id)),
         ("meta", meta),
     ]
     if display is not None:
@@ -2013,334 +2309,240 @@ def _batch_record(
     return _pango_escape(text) + _row_options(options)
 
 
-def _batch_data(
-    continuation_state: ContinuationState,
-    navigation: NavigationState,
-    action: str,
-    last_used: SessionIdentity | None,
-    batch_state: BatchUIState,
-) -> str:
-    active = continuation_state.active()
-    return _refresh_data(
-        active.refresh_deadline,
-        active.error_deadline,
-        active.error_message,
-        check_deadline=active.check_deadline,
-        navigation=navigation,
-        action=action,
-        last_used=last_used,
-        batch_state=batch_state,
+def _batch_can_confirm(
+    state: BatchUIState,
+    record: Mapping[str, Any] | None,
+) -> bool:
+    targets = record.get("targets") if isinstance(record, Mapping) else None
+    return bool(
+        record is not None
+        and record.get("previewId") == state.record_id
+        and record.get("action") == state.action
+        and isinstance(targets, list)
+        and targets
+        and not record.get("stopReason")
     )
 
 
-def _render_batch_screen(
-    *,
-    prompt: str,
-    message: str,
-    rows: Sequence[str],
-    continuation_state: ContinuationState,
-    navigation: NavigationState,
-    action: str,
-    last_used: SessionIdentity | None,
-    batch_state: BatchUIState,
-    polling: bool = False,
-    selected_row: int | None = 0,
-    preserve_selection: bool = False,
-) -> str:
-    headers = [
-        _protocol("prompt", prompt),
-        _protocol("no-custom", "false"),
-        _protocol("use-hot-keys", "true"),
-        _protocol("markup-rows", "true"),
-        _protocol(
-            "message", "\u2028".join(_pango_escape(part) for part in message.split("\u2028"))
-        ),
-        _protocol(
-            "data",
-            _batch_data(continuation_state, navigation, action, last_used, batch_state),
-        ),
-        _protocol("theme", _timeout_theme(AUTO_REFRESH_POLL_SECONDS if polling else 0)),
-    ]
-    if preserve_selection:
-        headers.append(_protocol("keep-selection", "true"))
-    if selected_row is not None:
-        headers.append(_protocol("new-selection", max(0, selected_row)))
-    visible_rows = list(rows) or ["Batch actions" + _row_options((("nonselectable", "true"),))]
-    return ROFI_RECORD_SEPARATOR.join((*headers, *visible_rows)) + ROFI_RECORD_SEPARATOR
-
-
-def _batch_scope_message(scope: str) -> str:
-    return f"Scope: {scope}\u2028Search is ignored for batch targets"
-
-
-def _batch_menu_rows() -> list[str]:
-    return [
-        _batch_record(
-            "Close all windows",
-            row_type="batch-action",
-            action=batch.ACTION_CLOSE,
-            meta="close all windows batch",
-            display="Close all windows",
-        ),
-        _batch_record(
-            "Resume all active sessions",
-            row_type="batch-action",
-            action=batch.ACTION_RESUME,
-            meta="resume all active sessions batch",
-            display="Resume all active sessions",
-        ),
-        _batch_record("Back", row_type="batch-back", meta="back picker"),
-    ]
-
-
-def _render_batch_menu(
+def _inline_batch_control_row(
     snapshot: Mapping[str, Any] | None,
     navigation: NavigationState,
-    continuation_state: ContinuationState,
-    action: str,
-    last_used: SessionIdentity | None,
     state: BatchUIState,
-    *,
-    notice: str = "",
+    record: Mapping[str, object] | None,
+    job: Mapping[str, object] | None,
+    notice: str,
 ) -> str:
-    catalog = batch._valid_catalog(snapshot)
-    scope = batch.scope_label(catalog, _batch_scope(navigation))
-    breadcrumb = _breadcrumb(navigation, snapshot)
-    message = _batch_scope_message(scope)
-    if notice:
-        message += "\u2028" + sanitize(notice)
-    return _render_batch_screen(
-        prompt=f"{breadcrumb} › Batch actions",
-        message=message,
-        rows=_batch_menu_rows(),
-        continuation_state=continuation_state,
-        navigation=navigation,
-        action=action,
-        last_used=last_used,
-        batch_state=state,
-    )
-
-
-def _preview_display(record: Mapping[str, object]) -> tuple[list[str], bool]:
-    action = record.get("action")
-    targets = record.get("targets")
-    exclusions = record.get("exclusions")
-    stop_reason = record.get("stopReason")
-    valid_targets = targets if isinstance(targets, list) else []
-    rows: list[str] = []
-    can_confirm = bool(valid_targets) and not bool(stop_reason)
-    if can_confirm:
-        label = (
-            "Confirm close all windows"
-            if action == batch.ACTION_CLOSE
-            else "Confirm resume all active sessions"
+    if state.screen == "group":
+        count = len(_group_sessions(snapshot, navigation))
+        label = f"All active sessions ({count}) · {_batch_action_label(state.action or batch.ACTION_RESUME)}"
+        return _batch_record(
+            label,
+            row_type="batch-group",
+            action=state.action or batch.ACTION_RESUME,
+            meta="all active sessions group",
+            display=label,
         )
-        rows.append(
-            _batch_record(
+    if state.screen == "preview":
+        if _batch_can_confirm(state, record):
+            targets = record.get("targets")
+            count = len(targets) if isinstance(targets, list) else 0
+            label = f"Confirm {_batch_action_label(state.action or batch.ACTION_RESUME)} · {count} fixed targets"
+            return _batch_record(
                 label,
                 row_type="batch-confirm",
-                meta="confirm batch",
+                action=state.action,
+                record_id=state.record_id,
+                meta="confirm fixed batch targets",
                 display=label,
             )
+        stop_reason = sanitize(record.get("stopReason") or "") if record else ""
+        label = (
+            "Preview stopped · " + stop_reason
+            if stop_reason
+            else "No eligible targets · nothing to confirm"
         )
-    elif not valid_targets:
-        rows.append(
-            _batch_record(
-                "No eligible targets · nothing to confirm",
-                row_type="batch-target",
-                meta="no targets",
-                nonselectable=True,
-            )
-        )
-    if stop_reason:
-        rows.append(
-            _batch_record(
-                "Preview stopped · " + sanitize(stop_reason),
-                row_type="batch-target",
-                meta="preview stopped",
-                nonselectable=True,
-            )
-        )
-    for target in valid_targets:
-        if not isinstance(target, Mapping):
-            continue
-        name = sanitize(target.get("name") or target.get("id") or "Agent")
-        provider = PROVIDER_LABELS.get(
-            str(target.get("kind") or ""), sanitize(target.get("kind") or "Agent")
-        )
-        host = sanitize(target.get("host") or target.get("hostId") or "host")
-        mode = target.get("mode")
-        if mode == "already_closed":
-            state = "already closed"
-        elif mode == "already_open":
-            state = "already open"
-        elif action == batch.ACTION_CLOSE:
-            viewers = target.get("viewers")
-            count = len(viewers) if isinstance(viewers, list) else 0
-            state = f"will close {count} window{'s' if count != 1 else ''} here"
-        else:
-            state = "will open existing session here"
-        text = f"{name}  ·  {provider}  ·  {host}  ·  {state}"
-        rows.append(
-            _batch_record(
-                text,
-                row_type="batch-target",
-                meta=f"{name} {provider} {host} {state}",
-                display=text,
-                nonselectable=True,
-            )
-        )
-    if isinstance(exclusions, list):
-        for item in exclusions:
-            if not isinstance(item, Mapping):
-                continue
-            name = sanitize(item.get("name") or "Session")
-            provider = sanitize(item.get("provider") or "")
-            host = sanitize(item.get("host") or "")
-            reason = sanitize(item.get("reason") or "excluded")
-            text = "Excluded · " + "  ·  ".join(
-                part for part in (name, provider, host, reason) if part
-            )
-            rows.append(
-                _batch_record(
-                    text,
-                    row_type="batch-target",
-                    meta=text,
-                    display=text,
-                    nonselectable=True,
-                )
-            )
-    rows.append(_batch_record("Back", row_type="batch-back", meta="back menu"))
-    return rows, can_confirm
-
-
-def _render_batch_preview(
-    record: Mapping[str, object],
-    navigation: NavigationState,
-    continuation_state: ContinuationState,
-    action: str,
-    last_used: SessionIdentity | None,
-    state: BatchUIState,
-    *,
-    notice: str = "",
-) -> str:
-    scope = sanitize(record.get("scope") or batch.scope_label([], _batch_scope(navigation)))
-    rows, can_confirm = _preview_display(record)
-    action_label = (
-        "Close all windows"
-        if record.get("action") == batch.ACTION_CLOSE
-        else "Resume all active sessions"
-    )
-    count = len(record.get("targets", [])) if isinstance(record.get("targets"), list) else 0
-    message = _batch_scope_message(scope)
-    message += f"\u2028{action_label}: {count} fixed target{'s' if count != 1 else ''}"
-    message += " · Enter on target rows does nothing"
-    if can_confirm:
-        message += " · Confirm applies only this preview"
-    if notice:
-        message += "\u2028" + sanitize(notice)
-    return _render_batch_screen(
-        prompt=f"{_breadcrumb(navigation)} › {action_label} preview",
-        message=message,
-        rows=rows,
-        continuation_state=continuation_state,
-        navigation=navigation,
-        action=action,
-        last_used=last_used,
-        batch_state=state,
-    )
-
-
-def _job_screen_rows(job: Mapping[str, object]) -> list[str]:
-    status = sanitize(job.get("status") or "unknown")
-    rows = [
-        _batch_record(
-            "Batch " + status + " · " + batch.job_summary(job),
+        if notice:
+            label += " · " + sanitize(notice)
+        return _batch_record(
+            label,
             row_type="batch-target",
-            meta="batch status",
-            display="Batch " + status + " · " + batch.job_summary(job),
+            meta="preview cannot be confirmed",
+            display=label,
             nonselectable=True,
         )
-    ]
-    stop_reason = sanitize(job.get("stopReason") or "")
-    if stop_reason:
-        rows.append(
-            _batch_record(
-                "Stopped · " + stop_reason,
-                row_type="batch-target",
-                meta="batch stop reason",
-                nonselectable=True,
-            )
-        )
-    for result in batch.result_rows(job):
-        text = "  ·  ".join(
-            part
-            for part in (
-                result["name"],
-                PROVIDER_LABELS.get(result["provider"], result["provider"]),
-                result["host"],
-                result["status"],
-                result["reason"],
-            )
-            if part
-        )
-        rows.append(
-            _batch_record(
-                text,
-                row_type="batch-target",
-                meta=text,
-                display=text,
-                nonselectable=True,
-            )
-        )
-    rows.append(_batch_record("Back to picker", row_type="batch-job-back", meta="back picker"))
-    return rows
+    status = sanitize(job.get("status") or "unavailable") if job else "unavailable"
+    label = f"Batch {status} · {batch.job_summary(job or {})}"
+    return _batch_record(
+        label,
+        row_type="batch-job",
+        meta="batch job status",
+        display=label,
+        nonselectable=True,
+    )
 
 
-def _render_batch_job(
+def _inline_target_presentation(
+    rows: Sequence[Mapping[str, Any]],
+    state: BatchUIState,
+    record: Mapping[str, Any] | None,
+    job: Mapping[str, Any] | None,
+) -> tuple[dict[SessionIdentity, str], list[Mapping[str, Any]], list[str]]:
+    badges: dict[SessionIdentity, str] = {}
+    targets: object = None
+    action = state.action or batch.ACTION_RESUME
+    results: list[object] = []
+    if state.screen == "preview" and isinstance(record, Mapping):
+        targets = record.get("targets")
+        action = str(record.get("action") or action)
+    elif state.screen == "job" and isinstance(job, Mapping):
+        targets = job.get("targets")
+        action = str(job.get("action") or action)
+        raw_results = job.get("results")
+        if isinstance(raw_results, list):
+            results = raw_results
+    target_rows = targets if isinstance(targets, list) else []
+    missing: list[str] = []
+    for index, target in enumerate(target_rows):
+        if not isinstance(target, Mapping):
+            continue
+        raw_result = results[index] if index < len(results) else None
+        result = raw_result if isinstance(raw_result, Mapping) else None
+        matched = [row for row in rows if _target_matches_session(target, row)]
+        if matched:
+            badge = _batch_target_badge(target, action, result)
+            for row in matched:
+                identity = _session_identity(row)
+                if identity is not None:
+                    badges[identity] = badge
+            continue
+        identity = _target_identity_key(target)
+        if any(_session_identity(row) == identity for row in rows):
+            card = _frozen_target_card(target, action, result)
+            card += " · current tmux association differs; no row was marked"
+        else:
+            card = _frozen_target_card(target, action, result)
+            card += " · target is not in the current conversation rows"
+        missing.append(card)
+    return badges, results, missing
+
+
+def _batch_context_message(
+    snapshot: Mapping[str, Any] | None,
+    navigation: NavigationState,
+    state: BatchUIState,
+    record: Mapping[str, object] | None,
     job: Mapping[str, object] | None,
+    notice: str,
+) -> str:
+    catalog = _host_catalog(snapshot)
+    scope = (
+        sanitize(record.get("scope") or batch.scope_label(catalog, _batch_scope(navigation)))
+        if state.screen == "preview" and isinstance(record, Mapping)
+        else sanitize(job.get("scope") or batch.scope_label(catalog, _batch_scope(navigation)))
+        if state.screen == "job" and isinstance(job, Mapping)
+        else batch.scope_label(catalog, _batch_scope(navigation))
+    )
+    lines = [f"All active sessions · Scope: {_pango_escape(scope)}"]
+    if state.screen == "group":
+        action = state.action if state.action in _BATCH_ACTION_ORDER else batch.ACTION_RESUME
+        labels = [
+            (
+                f'<span foreground="#42a5f5" weight="bold">'
+                f"[{_pango_escape(_batch_action_label(candidate))}]</span>"
+                if candidate == action
+                else _pango_escape(_batch_action_label(candidate))
+            )
+            for candidate in _BATCH_ACTION_ORDER
+        ]
+        lines.extend(
+            (
+                f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions",
+                _pango_escape(
+                    "Enter on the group prepares a fixed preview; Enter on a conversation "
+                    "switches to individual actions · Shift+Tab reverses the group action cycle"
+                ),
+                _pango_escape("Alt+A returns to individual actions"),
+            )
+        )
+    elif state.screen == "preview":
+        targets = record.get("targets") if isinstance(record, Mapping) else None
+        count = len(targets) if isinstance(targets, list) else 0
+        lines.extend(
+            (
+                _pango_escape(
+                    f"Preview: {_batch_action_label(state.action or batch.ACTION_RESUME)} · "
+                    f"{count} fixed eligible target{'s' if count != 1 else ''}"
+                    " · Search does not change the frozen list"
+                ),
+                _pango_escape(
+                    "Only Confirm runs this exact preview; Tab/Shift+Tab discards it and "
+                    "changes the action · Alt+A returns to the group"
+                ),
+            )
+        )
+    else:
+        status = (
+            sanitize(job.get("status") or "unavailable")
+            if isinstance(job, Mapping)
+            else "unavailable"
+        )
+        lines.extend(
+            (
+                _pango_escape(f"Batch {status} · {batch.job_summary(job or {})}"),
+                _pango_escape(
+                    "The confirmed job keeps running if Escape closes this view "
+                    "· Alt+A returns to individual actions"
+                ),
+            )
+        )
+    if notice:
+        lines.append(_pango_escape(sanitize(notice)))
+    return "\u2028".join(lines)
+
+
+def _render_batch_inline(
+    snapshot: Mapping[str, Any] | None,
     continuation_state: ContinuationState,
     navigation: NavigationState,
     action: str,
     last_used: SessionIdentity | None,
     state: BatchUIState,
     *,
+    record: Mapping[str, object] | None = None,
+    job: Mapping[str, object] | None = None,
+    selected_identity: SessionIdentity | None = None,
     notice: str = "",
+    keep_filter: bool = False,
+    initial_control: bool = False,
 ) -> str:
-    valid_job = job if isinstance(job, Mapping) else {}
-    status = valid_job.get("status")
-    polling = status in {"queued", "running"}
-    scope = sanitize(valid_job.get("scope") or batch.scope_label([], _batch_scope(navigation)))
-    message = _batch_scope_message(scope)
-    if polling:
-        message += "\u2028The confirmed finite batch is running; Escape hides this view"
-    else:
-        message += "\u2028" + batch.job_summary(valid_job)
-    if notice:
-        message += "\u2028" + sanitize(notice)
-    rows = (
-        _job_screen_rows(valid_job)
-        if valid_job
-        else [
-            _batch_record(
-                "Batch result is unavailable",
-                row_type="batch-target",
-                meta="invalid job",
-                nonselectable=True,
-            ),
-            _batch_record("Back to picker", row_type="batch-job-back", meta="back picker"),
-        ]
+    active = continuation_state.active()
+    polling_job = bool(
+        state.screen == "job"
+        and isinstance(job, Mapping)
+        and job.get("status") in {"queued", "running"}
     )
-    return _render_batch_screen(
-        prompt=f"{_breadcrumb(navigation)} › Batch result",
-        message=message,
-        rows=rows,
-        continuation_state=continuation_state,
+    return render_snapshot(
+        snapshot,
+        message=notice,
+        selected_identity=selected_identity,
+        continuation=True,
+        timeout=True if active.has_lifecycle or polling_job else False,
+        refresh_deadline=active.refresh_deadline,
+        error_deadline=active.error_deadline,
+        check_deadline=active.check_deadline,
+        checking=active.refresh_deadline is not None,
+        clear_message=True,
         navigation=navigation,
+        keep_filter=keep_filter,
+        keep_selection=True,
         action=action,
         last_used=last_used,
         batch_state=state,
-        polling=polling,
+        batch_record=record,
+        batch_job=job,
+        batch_notice=notice,
+        batch_initial_control=initial_control,
+        polling_job=polling_job,
     )
 
 
@@ -2390,6 +2592,58 @@ def _root_after_batch(
     )
 
 
+def _page_after_batch(
+    store: CacheStore,
+    config: PickerConfig,
+    navigation: NavigationState,
+    continuation_state: ContinuationState,
+    action: str,
+    last_used: SessionIdentity | None,
+    preference_store: ViewPreferenceStore,
+    direction: int,
+) -> str:
+    """Exit inline batch state through the ordinary cache-only page ring."""
+
+    snapshot = _presentation_snapshot(store, config)
+    next_navigation = _cycled_scope(snapshot, navigation, direction)
+    _save_preference_best_effort(preference_store, next_navigation, last_used)
+    active = continuation_state.active()
+    timeout: bool | None = (
+        True if active.has_lifecycle else False if continuation_state.has_lifecycle else None
+    )
+    return render_snapshot(
+        snapshot,
+        selected_identity=None,
+        preserve=True,
+        continuation=True,
+        timeout=timeout,
+        refresh_deadline=active.refresh_deadline,
+        error_deadline=active.error_deadline,
+        check_deadline=active.check_deadline,
+        checking=active.refresh_deadline is not None,
+        clear_message=True,
+        navigation=next_navigation,
+        keep_filter=True,
+        keep_selection=True,
+        reset_selection=True,
+        action=action,
+        last_used=last_used,
+    )
+
+
+def _batch_job_state(
+    batch_store: batch.BatchStateStore,
+    source_identity: SessionIdentity | None,
+) -> tuple[BatchUIState, Mapping[str, object]] | None:
+    current = batch_store.active_job()
+    if current is None:
+        return None
+    job_id = current.get("jobId")
+    if not isinstance(job_id, str) or batch._ID.fullmatch(job_id) is None:
+        return None
+    return BatchUIState("job", source_identity, None, job_id), current
+
+
 def _handle_batch_screen(
     environ: Mapping[str, str],
     store: CacheStore,
@@ -2399,203 +2653,356 @@ def _handle_batch_screen(
     action: str,
     last_used: SessionIdentity | None,
     batch_store: batch.BatchStateStore,
+    preference_store: ViewPreferenceStore,
 ) -> str:
     state = continuation_state.batch_state
     assert state is not None
-    retv = int(environ.get("ROFI_RETV", "0") or "0")
-    selected_row = (
-        _parse_batch_row(environ.get("ROFI_INFO")) if retv == ROFI_RETV_SELECTED else None
-    )
+    try:
+        retv = int(environ.get("ROFI_RETV", "0") or "0")
+    except ValueError:
+        retv = 0
+    raw_info = environ.get("ROFI_INFO")
+    selected_row = _parse_batch_row(raw_info) if retv == ROFI_RETV_SELECTED else None
+    selected_identity = _parse_selected_identity(raw_info)
     source_identity = state.source_identity
-    if state.screen == "menu":
+    conversation_identity: SessionIdentity | None = None
+    if retv == ROFI_RETV_SELECTED and raw_info:
         try:
-            if retv == ROFI_RETV_SELECTED and selected_row is not None:
-                if selected_row.get("type") == "batch-back":
-                    return _root_after_batch(
-                        store,
-                        config,
-                        navigation,
-                        continuation_state,
-                        action,
-                        last_used,
-                        source_identity,
-                    )
-                if selected_row.get("type") != "batch-action":
-                    return _render_batch_menu(
-                        _presentation_snapshot(store, config),
-                        navigation,
-                        continuation_state,
-                        action,
-                        last_used,
-                        state,
-                        notice="Choose one of the batch actions or Back.",
-                    )
-                current = batch_store.active_job()
-                if current is not None:
-                    job_id = current.get("jobId")
-                    if isinstance(job_id, str) and batch._ID.fullmatch(job_id):
-                        job_state = BatchUIState("job", source_identity, None, job_id)
-                        return _render_batch_job(
-                            current, continuation_state, navigation, action, last_used, job_state
-                        )
-                choice = str(selected_row.get("action"))
-                preview = batch.build_preview(store, config, _batch_scope(navigation), choice)
+            row_kind, selected_session = _parse_row_selection(raw_info)
+            if row_kind == "session":
+                conversation_identity = _session_identity(selected_session)
+        except engine.PickerError:
+            pass
+
+    def render_context(
+        state_value: BatchUIState = state,
+        *,
+        snapshot: Mapping[str, Any] | None = None,
+        record: Mapping[str, object] | None = None,
+        job: Mapping[str, object] | None = None,
+        selected: SessionIdentity | None = selected_identity,
+        notice: str = "",
+        keep_filter: bool = False,
+        initial_control: bool = False,
+    ) -> str:
+        if snapshot is None:
+            snapshot = _presentation_snapshot(store, config)
+        return _render_batch_inline(
+            snapshot,
+            continuation_state,
+            navigation,
+            action,
+            last_used,
+            state_value,
+            record=record,
+            job=job,
+            selected_identity=selected,
+            notice=notice,
+            keep_filter=keep_filter,
+            initial_control=initial_control,
+        )
+
+    def discard_current_preview() -> str:
+        if state.screen != "preview" or state.record_id is None:
+            return ""
+        try:
+            batch_store.discard_preview(state.record_id)
+        except (batch.BatchError, OSError):
+            return "Could not invalidate this preview; it is still available."
+        return ""
+
+    if retv in {ROFI_RETV_CUSTOM_2, ROFI_RETV_CUSTOM_3}:
+        failure = discard_current_preview()
+        if failure:
+            return render_context(
+                record=batch_store.read_preview(state.record_id or ""),
+                notice=failure,
+            )
+        direction = 1 if retv == ROFI_RETV_CUSTOM_2 else -1
+        return _page_after_batch(
+            store,
+            config,
+            navigation,
+            continuation_state,
+            action,
+            last_used,
+            preference_store,
+            direction,
+        )
+
+    if retv == ROFI_RETV_CUSTOM_4:
+        if state.screen == "preview":
+            failure = discard_current_preview()
+            if failure:
+                return render_context(
+                    record=batch_store.read_preview(state.record_id or ""),
+                    notice=failure,
+                )
+            group_state = BatchUIState("group", source_identity, state.action)
+            return render_context(
+                group_state,
+                selected=None,
+                notice="Preview discarded; the fixed target list was not changed.",
+                initial_control=True,
+            )
+        # Alt+A in the group or job view returns to ordinary individual actions.
+        return _root_after_batch(
+            store,
+            config,
+            navigation,
+            continuation_state,
+            action,
+            last_used,
+            selected_identity or source_identity,
+        )
+
+    if retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
+        direction = 1 if retv == ROFI_RETV_CUSTOM_7 else -1
+        if state.screen == "group":
+            current_action = (
+                state.action if state.action in _BATCH_ACTION_ORDER else batch.ACTION_RESUME
+            )
+            next_action = _BATCH_ACTION_ORDER[
+                (_BATCH_ACTION_ORDER.index(current_action) + direction) % len(_BATCH_ACTION_ORDER)
+            ]
+            return render_context(
+                BatchUIState("group", source_identity, next_action),
+                selected=None,
+                keep_filter=True,
+            )
+        if state.screen == "preview":
+            current_action = (
+                state.action if state.action in _BATCH_ACTION_ORDER else batch.ACTION_RESUME
+            )
+            next_action = _BATCH_ACTION_ORDER[
+                (_BATCH_ACTION_ORDER.index(current_action) + direction) % len(_BATCH_ACTION_ORDER)
+            ]
+            # The one-file private preview is no longer referenced by the
+            # dialog. A new Enter must prepare a fresh operation preview.
+            failure = discard_current_preview()
+            if failure:
+                return render_context(
+                    record=batch_store.read_preview(state.record_id or ""),
+                    notice=failure,
+                )
+            return render_context(
+                BatchUIState("group", source_identity, next_action),
+                selected=None,
+                notice=f"Preview discarded; {_batch_action_label(next_action)} is selected.",
+                initial_control=True,
+            )
+        job = batch_store.current_job(state.record_id)
+        return render_context(
+            job=job,
+            keep_filter=True,
+            notice="The confirmed action is fixed until the job finishes.",
+        )
+
+    if retv == ROFI_RETV_CUSTOM_19:
+        if state.screen == "job":
+            active_job = batch_store.active_job()
+            job = (
+                batch_store.current_job(state.record_id)
+                if active_job is None or active_job.get("jobId") != state.record_id
+                else active_job
+            )
+            return render_context(job=job, keep_filter=True)
+        if state.screen == "preview":
+            record = batch_store.read_preview(state.record_id or "")
+            if record is None:
+                return render_context(
+                    BatchUIState("group", source_identity, state.action),
+                    selected=None,
+                    notice="Preview expired; choose the group action again.",
+                    initial_control=True,
+                )
+            return render_context(record=record, keep_filter=True)
+        return render_context(keep_filter=True)
+
+    if retv == ROFI_RETV_CUSTOM_1:
+        if state.screen != "group":
+            return render_context(
+                record=(
+                    batch_store.read_preview(state.record_id or "")
+                    if state.screen == "preview"
+                    else None
+                ),
+                job=(batch_store.current_job(state.record_id) if state.screen == "job" else None),
+                keep_filter=True,
+                notice="The preview or confirmed job stays fixed while you are viewing it.",
+            )
+        try:
+            context = _presentation_context(store, config)
+            snapshot = _presentation_snapshot(store, config, context)
+            polling, deadline = _start_background_refresh(
+                store,
+                _refresh_scope(store, config, context),
+            )
+            if not polling:
+                return render_context(
+                    snapshot=snapshot, keep_filter=True, notice="Unable to start background refresh"
+                )
+            active = continuation_state.active()
+            next_state = ContinuationState(
+                navigation=navigation,
+                refresh_deadline=deadline,
+                error_deadline=active.error_deadline,
+                error_message=active.error_message,
+                check_deadline=active.check_deadline,
+                action=action,
+                action_valid=continuation_state.action_valid,
+                last_used=last_used,
+                batch_state=state,
+            )
+            return _render_batch_inline(
+                snapshot,
+                next_state,
+                navigation,
+                action,
+                last_used,
+                state,
+                selected_identity=selected_identity,
+                notice="Checking sessions…",
+                keep_filter=True,
+            )
+        except Exception as error:  # noqa: BLE001 - explicit refresh boundary
+            return render_context(keep_filter=True, notice=f"Refresh failed: {sanitize(error)}")
+
+    if retv in {2, 3}:
+        notice = "Custom input is disabled" if retv == 2 else "Deletion is disabled"
+        record = (
+            batch_store.read_preview(state.record_id or "") if state.screen == "preview" else None
+        )
+        job = batch_store.current_job(state.record_id) if state.screen == "job" else None
+        return render_context(record=record, job=job, keep_filter=True, notice=notice)
+
+    if retv == ROFI_RETV_SELECTED:
+        if conversation_identity is not None:
+            failure = discard_current_preview()
+            if failure:
+                return render_context(
+                    record=batch_store.read_preview(state.record_id or ""),
+                    notice=failure,
+                )
+            return _root_after_batch(
+                store,
+                config,
+                navigation,
+                continuation_state,
+                action,
+                last_used,
+                conversation_identity,
+            )
+        if selected_row is None:
+            record = (
+                batch_store.read_preview(state.record_id or "")
+                if state.screen == "preview"
+                else None
+            )
+            job = batch_store.current_job(state.record_id) if state.screen == "job" else None
+            return render_context(
+                record=record,
+                job=job,
+                notice="Unrecognized control row; no batch action was taken.",
+            )
+
+        row_type = selected_row.get("type")
+        if state.screen == "group":
+            if (
+                row_type != "batch-group"
+                or selected_row.get("action") != state.action
+                or state.action not in _BATCH_ACTION_ORDER
+            ):
+                return render_context(notice="This control does not match the active group action.")
+            try:
+                current_job = _batch_job_state(batch_store, source_identity)
+                if current_job is not None:
+                    job_state, job = current_job
+                    return render_context(job_state, job=job, selected=None, initial_control=True)
+                preview = batch.build_preview(
+                    store,
+                    config,
+                    _batch_scope(navigation),
+                    state.action,
+                )
                 preview_id = batch_store.write_preview(preview)
-                preview_state = BatchUIState("preview", source_identity, choice, preview_id)
+                preview_state = BatchUIState("preview", source_identity, state.action, preview_id)
                 persisted = batch_store.read_preview(preview_id)
                 if persisted is None:
                     raise batch.BatchError("Batch preview could not be saved safely")
-                return _render_batch_preview(
-                    persisted, navigation, continuation_state, action, last_used, preview_state
+                return render_context(
+                    preview_state,
+                    record=persisted,
+                    selected=None,
+                    initial_control=True,
                 )
-            if retv == ROFI_RETV_CUSTOM_4:
-                current = batch_store.active_job()
-                if current is not None:
-                    job_id = current.get("jobId")
-                    if isinstance(job_id, str) and batch._ID.fullmatch(job_id):
-                        job_state = BatchUIState("job", source_identity, None, job_id)
-                        return _render_batch_job(
-                            current, continuation_state, navigation, action, last_used, job_state
-                        )
-                return _render_batch_menu(
-                    _presentation_snapshot(store, config),
-                    navigation,
-                    continuation_state,
-                    action,
-                    last_used,
-                    state,
+            except batch.BatchBusy as error:
+                job = batch_store.current_job(error.job_id)
+                job_state = BatchUIState("job", source_identity, None, error.job_id)
+                return render_context(job_state, job=job, selected=None, initial_control=True)
+            except Exception as error:  # noqa: BLE001 - bounded preview boundary
+                return render_context(
+                    notice=f"Batch preview failed: {sanitize(error)}",
+                    keep_filter=True,
                 )
-            return _render_batch_menu(
-                _presentation_snapshot(store, config),
-                navigation,
-                continuation_state,
-                action,
-                last_used,
-                state,
-            )
-        except batch.BatchBusy as error:
-            current = batch_store.current_job(error.job_id)
-            job_state = BatchUIState("job", source_identity, None, error.job_id)
-            return _render_batch_job(
-                current, continuation_state, navigation, action, last_used, job_state
-            )
-        except Exception as error:  # noqa: BLE001 - visible batch preparation boundary
-            return _render_batch_menu(
-                _presentation_snapshot(store, config),
-                navigation,
-                continuation_state,
-                action,
-                last_used,
-                state,
-                notice=f"Batch preview failed: {sanitize(error)}",
-            )
 
-    if state.screen == "preview":
-        record = batch_store.read_preview(state.record_id or "")
-        if record is None:
-            return _render_batch_menu(
-                _presentation_snapshot(store, config),
-                navigation,
-                continuation_state,
-                action,
-                last_used,
-                BatchUIState("menu", source_identity),
-                notice="Preview expired; choose an action again.",
-            )
-        if retv == ROFI_RETV_SELECTED and selected_row is not None:
-            row_type = selected_row.get("type")
-            if row_type == "batch-back":
-                return _render_batch_menu(
-                    _presentation_snapshot(store, config),
-                    navigation,
-                    continuation_state,
-                    action,
-                    last_used,
-                    BatchUIState("menu", source_identity),
-                )
+        if state.screen == "preview":
+            record = batch_store.read_preview(state.record_id or "")
             if row_type == "batch-confirm":
+                typed_matches = (
+                    selected_row.get("action") == state.action
+                    and selected_row.get("recordId") == state.record_id
+                )
+                if not typed_matches or not _batch_can_confirm(state, record):
+                    current_job = _batch_job_state(batch_store, source_identity)
+                    if current_job is not None:
+                        job_state, job = current_job
+                        return render_context(
+                            job_state,
+                            job=job,
+                            selected=None,
+                            initial_control=True,
+                        )
+                    return render_context(
+                        record=record,
+                        notice="Confirmation is stale or does not match the frozen preview.",
+                    )
                 try:
                     job_id, queued = batch_store.consume_and_submit(state.record_id or "")
                     job_state = BatchUIState("job", source_identity, None, job_id)
-                    return _render_batch_job(
-                        queued, continuation_state, navigation, action, last_used, job_state
+                    return render_context(
+                        job_state,
+                        job=queued,
+                        selected=None,
+                        initial_control=True,
                     )
                 except batch.BatchBusy as error:
-                    current = batch_store.current_job(error.job_id)
+                    job = batch_store.current_job(error.job_id)
                     job_state = BatchUIState("job", source_identity, None, error.job_id)
-                    return _render_batch_job(
-                        current, continuation_state, navigation, action, last_used, job_state
-                    )
+                    return render_context(job_state, job=job, selected=None, initial_control=True)
                 except Exception as error:  # noqa: BLE001 - one-confirmation boundary
-                    return _render_batch_preview(
-                        record,
-                        navigation,
-                        continuation_state,
-                        action,
-                        last_used,
-                        state,
+                    return render_context(
+                        record=record,
                         notice=f"Batch was not submitted: {sanitize(error)}",
                     )
             if row_type == "batch-target":
-                return _render_batch_preview(
-                    record,
-                    navigation,
-                    continuation_state,
-                    action,
-                    last_used,
-                    state,
-                    notice="Target rows are display only; choose Confirm to run the fixed preview.",
+                return render_context(
+                    record=record,
+                    notice="Target and exclusion rows are display only.",
                 )
-        if retv == ROFI_RETV_CUSTOM_19:
-            # Pre-confirm previews are immutable and do not poll provider or
-            # viewer state. The exact displayed target list remains frozen.
-            return _render_batch_preview(
-                record, navigation, continuation_state, action, last_used, state
+            return render_context(
+                record=record, notice="Only the matching Confirm row can submit this preview."
             )
-        return _render_batch_preview(
-            record, navigation, continuation_state, action, last_used, state
-        )
 
-    if state.screen == "job":
-        job = batch_store.current_job(state.record_id)
-        if isinstance(job, Mapping) and job.get("status") in {"queued", "running"}:
-            batch_store.active_job()
+        if state.screen == "job":
             job = batch_store.current_job(state.record_id)
-        if retv == ROFI_RETV_SELECTED and selected_row is not None:
-            if selected_row.get("type") == "batch-job-back":
-                return _root_after_batch(
-                    store,
-                    config,
-                    navigation,
-                    continuation_state,
-                    action,
-                    last_used,
-                    source_identity,
-                )
-            if selected_row.get("type") == "batch-target":
-                return _render_batch_job(
-                    job,
-                    continuation_state,
-                    navigation,
-                    action,
-                    last_used,
-                    state,
-                    notice="Result rows are display only.",
-                )
-        if retv == ROFI_RETV_CUSTOM_19:
-            return _render_batch_job(job, continuation_state, navigation, action, last_used, state)
-        if retv == ROFI_RETV_CUSTOM_4:
-            return _render_batch_job(job, continuation_state, navigation, action, last_used, state)
-        return _render_batch_job(job, continuation_state, navigation, action, last_used, state)
-    return _render_batch_menu(
-        _presentation_snapshot(store, config),
-        navigation,
-        continuation_state,
-        action,
-        last_used,
-        BatchUIState("menu", source_identity),
-        notice="Batch view state was reset.",
-    )
+            if row_type == "batch-job":
+                return render_context(job=job, keep_filter=True)
+            return render_context(job=job, notice="Job result rows are display only.")
+
+    record = batch_store.read_preview(state.record_id or "") if state.screen == "preview" else None
+    job = batch_store.current_job(state.record_id) if state.screen == "job" else None
+    return render_context(record=record, job=job, keep_filter=True)
 
 
 def run_rofi(
@@ -2736,64 +3143,68 @@ def run_rofi(
                 action,
                 last_used,
                 batch_state_store,
+                preference_store,
             )
         except Exception as exc:  # noqa: BLE001 - typed batch UI boundary
             safe_state = continuation_state.batch_state
-            rendered = _render_batch_menu(
+            rendered = _render_batch_inline(
                 _presentation_snapshot(store, config),
-                navigation,
                 continuation_state,
+                navigation,
                 action,
                 last_used,
-                BatchUIState("menu", safe_state.source_identity),
+                BatchUIState("group", safe_state.source_identity, batch.ACTION_RESUME),
                 notice=f"Batch view failed safely: {sanitize(exc)}",
+                initial_control=True,
             )
         print(rendered, end="")
         return 0
 
     if retv == ROFI_RETV_CUSTOM_4:
         try:
-            active_job = batch_state_store.active_job()
-            if active_job is not None:
-                job_id = active_job.get("jobId")
-                if isinstance(job_id, str) and batch._ID.fullmatch(job_id):
-                    state = BatchUIState("job", callback_selection_identity, None, job_id)
-                    rendered = _render_batch_job(
-                        active_job,
-                        continuation_state,
-                        navigation,
-                        action,
-                        last_used,
-                        state,
-                    )
-                else:
-                    rendered = _render_batch_menu(
-                        _presentation_snapshot(store, config),
-                        navigation,
-                        continuation_state,
-                        action,
-                        last_used,
-                        BatchUIState("menu", callback_selection_identity),
-                        notice="A batch is already running.",
-                    )
-            else:
-                rendered = _render_batch_menu(
-                    _presentation_snapshot(store, config),
-                    navigation,
+            snapshot = _presentation_snapshot(store, config)
+            current_job = _batch_job_state(
+                batch_state_store,
+                callback_selection_identity or last_used,
+            )
+            if current_job is not None:
+                state, job = current_job
+                rendered = _render_batch_inline(
+                    snapshot,
                     continuation_state,
+                    navigation,
                     action,
                     last_used,
-                    BatchUIState("menu", callback_selection_identity),
+                    state,
+                    job=job,
+                    initial_control=True,
+                )
+            else:
+                rendered = _render_batch_inline(
+                    snapshot,
+                    continuation_state,
+                    navigation,
+                    action,
+                    last_used,
+                    BatchUIState(
+                        "group",
+                        callback_selection_identity or last_used,
+                        batch.ACTION_RESUME,
+                    ),
+                    initial_control=True,
                 )
         except Exception as exc:  # noqa: BLE001 - cache-only batch entry boundary
-            rendered = _render_batch_menu(
+            rendered = _render_batch_inline(
                 None,
-                navigation,
                 continuation_state,
+                navigation,
                 action,
                 last_used,
-                BatchUIState("menu", callback_selection_identity),
-                notice=f"Batch actions unavailable: {sanitize(exc)}",
+                BatchUIState(
+                    "group", callback_selection_identity or last_used, batch.ACTION_RESUME
+                ),
+                notice=f"Active group unavailable: {sanitize(exc)}",
+                initial_control=True,
             )
         print(rendered, end="")
         return 0
@@ -2808,14 +3219,30 @@ def run_rofi(
             if isinstance(typed_payload, Mapping) and "type" in typed_payload:
                 parsed_control = _parse_batch_row(raw_info)
                 if typed_payload.get("type") == "batch" and parsed_control is not None:
-                    rendered = _render_batch_menu(
-                        _presentation_snapshot(store, config),
-                        navigation,
-                        continuation_state,
-                        action,
-                        last_used,
-                        BatchUIState("menu", None),
-                    )
+                    snapshot = _presentation_snapshot(store, config)
+                    current_job = _batch_job_state(batch_state_store, last_used)
+                    if current_job is not None:
+                        state, job = current_job
+                        rendered = _render_batch_inline(
+                            snapshot,
+                            continuation_state,
+                            navigation,
+                            action,
+                            last_used,
+                            state,
+                            job=job,
+                            initial_control=True,
+                        )
+                    else:
+                        rendered = _render_batch_inline(
+                            snapshot,
+                            continuation_state,
+                            navigation,
+                            action,
+                            last_used,
+                            BatchUIState("group", last_used, batch.ACTION_RESUME),
+                            initial_control=True,
+                        )
                 else:
                     rendered = emit_error(
                         _presentation_snapshot(store, config),

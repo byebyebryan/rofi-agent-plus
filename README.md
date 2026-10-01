@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.8.0` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.9.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -54,12 +54,13 @@ search and `Resume` as its action. Up and Down move through rows. `Tab`
 switches the action from `Resume` to `New session here`; `Shift+Tab` cycles in
 reverse, with wraparound.
 The prompt shows the page; the persistent message below the filter shows
-`Enter:` with both actions and highlights the selected one. A divider separates
-`Tab: Cycle actions` and `Alt+A: Batch actions` on the same line, and any notice
-follows after a blank line. A leading typed `Batch actions…` row also opens the
-menu. The first conversation remains the default selection when one exists;
-the batch row is selected on an empty page. Enter applies the selected
-conversation action to the row highlighted at Enter. Left
+`Enter:` with both individual actions and highlights the selected one. The
+hint also shows `Tab: Cycle actions` and `Alt+A: Active group`. The leading
+typed `All active sessions (N)` row enters the group view on Enter; `Alt+A`
+opens the same view even when filtering leaves no matching row. The first
+conversation remains the default selection when one exists; the group row is
+selected on an empty page. Enter on a conversation runs the selected
+individual action. Left
 and Right cycle `Active`, `All`, `Local`, and the remote hosts in stable Host
 Mesh order.
 Escape and `Ctrl+G` use Rofi's
@@ -86,25 +87,38 @@ does not trigger discovery; `Alt+R` refreshes as usual.
 
 ## Batch session actions
 
-`Batch actions…` and `Alt+A` open **Close all windows**, **Resume all active
-sessions**, and **Back**. A preview refreshes the selected page's authoritative
-host coverage once and ignores the current search. Active and All cover every
-authoritative owner host; All can include active rows beyond its ordinary
-history-list cap. Local covers only this machine as owner, and a named-host
-page covers that host. The preview freezes stable tmux references and any
-viewing windows selected for closure. Target rows are display-only; Confirm
-acts on the frozen list, while Back or native Escape/Ctrl+G has no session or
-window effect.
+The leading `All active sessions (N)` row and `Alt+A` enter the active group
+view. The list shows the ordinary page rows plus any missing uncapped active or
+waiting sessions in the page's owner-host scope. The `N` count and an
+“observed/in scope” badge describe cached membership, not guaranteed viewer
+eligibility. In group view, **Resume all** is selected by default; `Tab` and
+`Shift+Tab` switch between it and **Close all windows**. The header names the
+scope, and cycling actions only uses cached data. Enter on the group prepares
+a fixed preview. Enter on a conversation returns to individual actions
+without opening it; its next Enter uses the visible individual action bar.
+`Alt+A` returns to individual actions, while Left/Right exits to the page ring.
+
+The preview refreshes the selected page's authoritative host coverage once and
+ignores the current search. Active and All cover every authoritative owner
+host; All can include active rows beyond its ordinary history-list cap. Local
+covers only this machine as owner, and a named-host page covers that host. The
+preview freezes stable tmux references and any viewing windows selected for
+closure. Exact frozen targets receive an operation badge; exclusions and frozen
+targets that no longer match a current full reference remain visible without
+being marked as eligible. Target rows are display-only. `Tab` or `Shift+Tab`
+discards the preview and changes the operation; Enter must prepare a new
+preview before Confirm is available. Native Escape/Ctrl+G before confirmation
+has no session or window effect.
 
 Close removes only verified viewing windows on the current endpoint and keeps
 the tmux sessions and provider processes running. Resume revalidates current
 active evidence and opens only an existing tmux reference through Tmux Plus;
 it never creates a session or starts a provider. Retained, stale, missing, or
 ambiguous associations and unsupported or unverified viewers appear as
-exclusions. Confirmed work runs as one finite background job, reports
-completed, already open/closed, skipped, and failed targets, and continues
-after an individual target failure. Escape after Confirm hides the picker while
-the authorized fixed list finishes.
+exclusions. Confirmed work runs as one background job, reports completed,
+already open/closed, skipped, and failed targets, and continues after an
+individual target failure. Escape after Confirm closes the view while the
+authorized fixed list finishes.
 
 Batch viewers currently require the managed Kitty/Niri setup. Legacy remote
 windows may need closing manually once and reopening through Agent/Tmux Plus.
@@ -115,8 +129,8 @@ The host catalog is authoritative and ordered by Host Mesh, while provider
 groups are not navigation scopes. Provider icons remain visible, and provider
 names and aliases remain in filter metadata, so searching for `codex`,
 `claude`, `Claude Code`, or `opencode` still works. Conversation rows carry
-typed session metadata; the separate batch row and batch controls cannot enter
-the session open or create path.
+typed session metadata; the typed active-group control and batch controls
+cannot enter the session open or create path.
 
 Rows use a two-line layout: the session title is primary, while a smaller
 secondary line shows the display host, shortened working directory, age, and

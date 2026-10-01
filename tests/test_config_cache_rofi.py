@@ -321,7 +321,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.8.0", engine.VERSION)
+        self.assertEqual("0.9.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -1167,6 +1167,22 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("claude claude-code claude code", meta)
         self.assertIn("host  ·  /srv/project  ·  0s  ·  waiting", display)
 
+        unsafe_secondary = session(
+            kind="claude",
+            name="safe title",
+            host="host<&>",
+            cwd="/srv/a<&>/project",
+            recencyAt=100,
+            activityState="waiting",
+        )
+        _, unsafe_rows = parse_rendered_records(
+            render_snapshot({"sessions": [unsafe_secondary]}, now=100)
+        )
+        unsafe_row = next(record for record in unsafe_rows if record.startswith("safe title"))
+        _, unsafe_options = parse_row_options(unsafe_row)
+        self.assertIn("host&lt;&amp;&gt;", unsafe_options["display"])
+        self.assertIn("/srv/a&lt;&amp;&gt;/project", unsafe_options["display"])
+
     def test_each_provider_uses_its_icon_and_retains_search_terms(self) -> None:
         for kind in PROVIDER_LABELS:
             identifier = OPENCODE_ID if kind == "opencode" else THREAD_ID
@@ -1701,7 +1717,7 @@ class RofiProtocolTest(unittest.TestCase):
         )
         self.assertIn("  │  Tab: Cycle actions", new_action)
         self.assertIn(
-            "Tab: Cycle actions  │  Alt+A: Batch actions\u2028\u2028&lt;offline&gt; &amp; busy",
+            "Tab: Cycle actions  │  Alt+A: Active group\u2028\u2028&lt;offline&gt; &amp; busy",
             _action_message(ACTION_RESUME, "<offline> & busy"),
         )
         self.assertIn("Refresh errors: alpha/claude: offline", new_action)
@@ -1903,13 +1919,13 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn(
-            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Batch actions\u2028\u2028Unable to start new session: provider unavailable",
+            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Active group\u2028\u2028Unable to start new session: provider unavailable",
             output.getvalue(),
         )
         self.assertIn("Agents › All", output.getvalue())
         self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
         self.assertIn(
-            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Batch actions",
+            "[Resume]</span> · New session here  │  Tab: Cycle actions  │  Alt+A: Active group",
             output.getvalue(),
         )
         self.assertIn("\x00new-selection\x1f2", output.getvalue())

@@ -5,8 +5,9 @@ Date: 2026-09-30
 Status: the original menu-based batch design shipped in Agent Plus `0.8.0`
 with Tmux Plus `0.4.0`. On 2026-10-01 the operator approved an inline group
 target to keep the conversation list visible while choosing batch actions.
-This refinement is being implemented; the existing public viewer operations
-and finite batch execution guards remain its foundation.
+Agent Plus `0.9.0` implements this refinement; the existing public viewer
+operations and finite batch execution guards remain its foundation. The managed
+fleet status records the selected source and deployment evidence.
 
 Close all and Resume all should make switching between Snap and Starship
 convenient using the existing Active page and ordinary tmux sessions. Close
