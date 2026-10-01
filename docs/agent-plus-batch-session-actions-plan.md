@@ -2,9 +2,11 @@
 
 Date: 2026-09-30
 
-Status: implemented in Agent Plus `0.8.0` with Tmux Plus `0.4.0`. The operator selected all eligible active sessions
-on the current page and a small Batch actions menu. The source gates and owned
-public viewer and spawned batch-job fixtures passed.
+Status: the original menu-based batch design shipped in Agent Plus `0.8.0`
+with Tmux Plus `0.4.0`. On 2026-10-01 the operator approved an inline group
+target to keep the conversation list visible while choosing batch actions.
+This refinement is being implemented; the existing public viewer operations
+and finite batch execution guards remain its foundation.
 
 Close all and Resume all should make switching between Snap and Starship
 convenient using the existing Active page and ordinary tmux sessions. Close
@@ -16,11 +18,9 @@ Use one-shot public operations and the picker’s existing provider observations
 Keep provider hooks, daemon/session management, automatic restarts, and saved
 workspace groups outside this implementation.
 
-The design fits the suite's ownership model. Its implementation needs one
-bounded foundation first: reliable identification and closure of a local
-viewer window. The current title-based focus helper does not establish that
-foundation. This note records the intended behavior and the acceptance gate
-for that missing capability.
+The design fits the suite's ownership model. Tmux Plus `0.4.0` supplies the
+verified viewer foundation through its public contract. This UI refinement
+uses that released capability and changes no provider lifecycle contract.
 
 ## Actions and scope
 
@@ -106,62 +106,82 @@ the [tmux manual](https://man.openbsd.org/tmux) describes that behavior.
 
 ## Picker interaction
 
-Selected entry is a small **Batch actions…** menu. The accepted placement is
-a distinct typed row before the conversations. The operator pointed out that
-a bottom row is usually outside the visible portion of a long list.
+### Inline group target refinement (accepted 2026-10-01)
 
-Default selection stays on a conversation. On opening, restore the remembered
-conversation when present; otherwise select the first eligible conversation.
-Page changes and a missing selection also fall back to an eligible conversation.
-Select Batch actions by default when the unfiltered page has no conversations.
-From the first conversation in the unfiltered list, one Up reaches the menu row.
-Batch actions never becomes the remembered conversation.
+Replace the leading `Batch actions…` row with **All active sessions (N)**.
+This is a typed group target in the main picker. Keep the conversation list
+visible while choosing the operation, reviewing the fixed batch, and reading
+progress/results; remove the separate Close/Resume action submenu.
 
-Account for the extra leading row when calculating all absolute selection
-indices, including the launcher's initial `-selected-row` and refresh hints.
-Verify page changes and native filtering through the managed invocation:
-ordinary matching conversations must remain easy to select, without the menu
-row taking their default selection. This is an explicit UI acceptance gate.
+Normal conversation actions remain Resume and New session here. The group
+has a separate Resume all / Close all windows cycle using Tab and Shift+Tab.
+Its default is Resume all. Batch state never turns an individual Enter into
+an implicit batch operation, and a group row never becomes the remembered
+conversation. Opening still restores the remembered conversation or first
+real conversation, falling back to the group only on an empty page.
 
-Let the row participate in normal filtering. Rofi's
-[list selection implementation](https://raw.githubusercontent.com/davatorium/rofi/2.0.0/source/widgets/listview.c)
-retains and clamps the selected position when results shrink. A permanent menu
-row can therefore receive selection when only one conversation matches, adding
-friction to ordinary search. Match the menu through `batch` and `actions`, using
-separate matching text and display text so provider aliases such as `cc` do not
-match across words in its label.
+Prefer changing the action bar when the native highlighted row changes if a
+simple supported Rofi integration can do so. Prove this before selecting that
+implementation. Rofi's selection-change command is distinct from the normal
+script callback and does not itself define a script redraw. If immediate
+updates require extra machinery, Enter on the group or Alt+A activates its
+context **in place**. This fallback was explicitly included in the accepted
+proposal. Use only dialog-local finite UI state; no persistent helper, global
+keyboard injection, provider hooks, or perpetual polling for cursor tracking.
 
-Restoring a conversation farther down can scroll the menu row out of view.
-Provide **Alt+A** on custom callback 4 and show it in the persistent hint line
-for access from anywhere, including a filter with no matching rows. The
-installed default and managed bindings leave Alt+A free. Rofi 2.0.0 suppresses
-custom-key callbacks without a selected row when its `no-custom` flag is true;
-allow that callback transport while retaining Agent Plus's existing rejection
-of custom text and deletion as individual session actions. No free-form input
-may authorize a session operation.
+The contextual message names the target group and current action. While the
+group context is active, entering a conversation returns to individual
+actions without running an operation. The next individual Enter uses the
+visible individual action. Alt+A provides direct group access and a clear way
+to return to individual actions. Page changes return to the ordinary page
+context with the usual conversation-first selection. Keep native Escape and
+Ctrl+G cancellation.
 
-The menu offers Close all windows, Resume all active sessions, and Back. Each
-action opens its preview with Confirm and Back. Enter on a target row never
-executes an individual session action in this preview. Escape and Ctrl+G use
-native cancellation. Cancellation before confirmation has no session or window
-effect.
+Group entry clears search so affected rows remain visible. Scope remains the
+whole page's authoritative owner-host coverage. Render the uncapped scoped
+active set alongside the ordinary page rows, without duplicating catalog
+identities, so running conversations outside All's history cap are available
+for inspection. Preserve the normal cap outside group context. Keep the group
+in normal filtering and avoid provider aliases matching its display label.
 
-Clear search when entering the menu and show the page scope prominently.
-Returning to the picker restores the source page and available selection with
-an empty search. Rofi 2.0.0 cannot supply the old search text for restoring it
-after a separate menu. Keep the existing Resume/New session here action cycle.
-Batch entry, cancellation, and execution do not overwrite the remembered
-conversation with an arbitrary last item from the batch.
+The cached count N describes observed running conversations in this scope;
+it is not an operation guarantee. Before preview, mark cached group membership
+with a subdued shared accent. Label this as the active set in scope. Do not
+perform provider, host, or viewer queries just to move the cursor or cycle
+an action. Existing discovery uncertainty and exclusion reasons remain
+visible; the cursor highlight remains distinct from the membership tint.
 
-Execution belongs to one finite job with bounded operations and a completion
-summary. Allow one batch at a time on an endpoint; another request while it is
-running reports that status instead of starting overlapping operations.
-Use temporary private state only if needed to hand the frozen targets
-to that job. Report completed, already open/closed, skipped, and failed counts,
-with individual failures available in the result. Continue past an individual
-target failure; an authority or protocol failure stops remaining operations.
-Ambiguous outcomes are reported without automatic retries. A user-requested
-second run builds a new preview from current observations.
+Enter on the active group prepares a fresh preview using the existing guarded
+batch preparation. Keep that preview inline: the group control becomes an
+explicit confirmation for the chosen operation, and the conversation list
+shows exact included targets, already-open/closed states, and exclusions.
+Display frozen targets missing from the current ordinary list too. Only
+verified exact targets receive the operation membership tint. An operation
+change or page/context change invalidates the displayed confirmation; any
+new operation requires a newly prepared preview. Preview target rows cannot
+submit a batch or invoke individual session lifecycle actions.
+
+A second Enter on the typed confirmation consumes the fixed private preview
+once and starts the existing finite job. Show its scope, progress, per-target
+results, and completion summary inline with the conversation list. Poll only
+while the finite job or the picker's existing bounded refresh requires it.
+Escape before confirmation has no session effects; afterward it hides the
+picker while the confirmed job finishes. One batch runs at a time per endpoint.
+
+The refinement preserves stable row identity and the leading-row offset in
+initial launch, refresh, and page transitions. Native acceptance must cover
+conversation-first opening, group activation, Tab/Shift+Tab, target visibility,
+ordinary search, page changes, inline preview cancellation, and unchanged
+preferences. Use the managed invocation and observer callbacks that refuse
+provider Enter and any unowned confirmation.
+
+### Original menu release
+
+Agent Plus `0.8.0` shipped the leading Batch actions row and Alt+A, a separate
+Close/Resume/Back action menu, and fixed preview/result screens. The accepted
+2026-10-01 refinement above supersedes that presentation. Its whole-page scope,
+full-reference viewer guards, fixed private previews, single-job execution,
+and preference rules carry forward.
 
 ## Viewer identity and closure
 
@@ -171,11 +191,10 @@ alongside normal kitten helpers. Niri's CLI can close a specified window ID.
 These observations support feasibility, but no existing user window was
 closed, detached, or otherwise changed during design validation.
 
-Tmux Plus currently focuses the first matching session-name/host title, then
-launches a terminal if focus fails. Titles can change and do not identify the
-complete session reference. Batch reuse and close need the same stronger
-viewer lookup, with ambiguity surfaced instead of causing a duplicate window
-or selecting a title match for closure.
+The original viewer investigation found ordinary open using session-name/host
+titles. Tmux Plus `0.4.0` now supplies full-reference metadata lookup for batch
+reuse and close, with uncertainty surfaced through the public viewer contract.
+Ordinary open retains its compatible fallback behavior.
 
 The preferred starting approach is immutable launch metadata carrying the
 complete tmux reference, bound to the terminal process and its start generation.
