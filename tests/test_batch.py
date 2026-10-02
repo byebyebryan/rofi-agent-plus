@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -156,6 +157,151 @@ def _options(row: str) -> tuple[str, dict[str, str]]:
 
 
 class BatchPreparationTest(unittest.TestCase):
+    def test_inspections_are_bounded_concurrent_and_keep_catalog_order(self) -> None:
+        rows = [
+            _row("local", "codex", f"{i:08d}-0000-0000-0000-000000000001", f"${i}", i)
+            for i in range(1, 9)
+        ]
+        barrier = threading.Barrier(4)
+        lock = threading.Lock()
+        active = 0
+        maximum = 0
+
+        def inspect(_backend: object, reference: object, **kwargs: object) -> object:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                barrier.wait(timeout=5)
+                self.assertEqual(
+                    ("@codex_thread_id", rows[reference.created_at - 1]["id"]),
+                    kwargs["required_option"],
+                )
+                return contract_viewers.ViewerInspection("none", (), True)
+            finally:
+                with lock:
+                    active -= 1
+
+        with mock.patch(
+            "rofi_agent_plus.batch.contract_viewers.inspect_viewers", side_effect=inspect
+        ):
+            preview = batch.build_preview(
+                FakeStore(_snapshot(rows, [])), PickerConfig(), batch.Scope("all"), ACTION_RESUME
+            )
+        self.assertEqual(4, maximum)
+        self.assertEqual(
+            [row["id"] for row in rows], [target["id"] for target in preview["targets"]]
+        )
+
+    def test_protocol_failure_stops_before_next_inspection_chunk(self) -> None:
+        rows = [
+            _row("local", "codex", f"{i:08d}-0000-0000-0000-000000000001", f"${i}", i)
+            for i in range(1, 9)
+        ]
+
+        def inspect(_backend: object, reference: object, **_kwargs: object) -> object:
+            if reference.session_id == "$1":
+                raise contract_viewers.ViewerError(
+                    "stale_mesh", "authority changed", stop_batch=True
+                )
+            return contract_viewers.ViewerInspection("none", (), True)
+
+        with mock.patch(
+            "rofi_agent_plus.batch.contract_viewers.inspect_viewers", side_effect=inspect
+        ) as inspect_mock:
+            preview = batch.build_preview(
+                FakeStore(_snapshot(rows, [])), PickerConfig(), batch.Scope("all"), ACTION_RESUME
+            )
+        self.assertEqual(4, inspect_mock.call_count)
+        self.assertEqual([], preview["targets"])
+        self.assertIn("stopReason", preview)
+
+    def test_preparation_cancellation_superseding_and_expiry_prevent_late_publish(self) -> None:
+        store = FakeStore(_snapshot([_row("local", "codex", LOCAL_ID, "$1", 1)], []))
+        with tempfile.TemporaryDirectory() as temporary:
+            state = batch.BatchStateStore(Path(temporary))
+            first = state.start_preparation(ACTION_RESUME, batch.Scope("all"), spawn=False)
+            self.assertEqual(
+                first, state.start_preparation(ACTION_RESUME, batch.Scope("all"), spawn=False)
+            )
+            with mock.patch(
+                "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                return_value=contract_viewers.ViewerInspection("none", (), True),
+            ):
+                preview = batch.build_preview(
+                    store, PickerConfig(), batch.Scope("all"), ACTION_RESUME
+                )
+            state.discard_preparation(first)
+            self.assertFalse(state.finish_preparation(first, preview))
+            second = state.start_preparation(ACTION_RESUME, batch.Scope("all"), spawn=False)
+            third = state.start_preparation(ACTION_CLOSE, batch.Scope("local"), spawn=False)
+            self.assertNotEqual(second, third)
+            self.assertFalse(state.finish_preparation(second, preview))
+            state.fail_preparation(second, "old helper failed")
+            self.assertEqual("pending", state.read_preparation(third)["status"])
+            state.discard_preparation(second)
+            self.assertIsNotNone(state.read_preparation(third))
+            with mock.patch("rofi_agent_plus.batch.time.time", return_value=time.time() + 121):
+                self.assertIsNone(state.read_preparation(third))
+                self.assertFalse(state.finish_preparation(third, preview))
+            self.assertIsNone(state.current_job())
+            self.assertFalse(state.preview_path.exists())
+
+    def test_pending_helper_cannot_replace_a_single_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = batch.BatchStateStore(Path(temporary))
+            request = state.start_preparation(ACTION_CLOSE, batch.Scope("all"), spawn=False)
+            preview = {
+                "action": ACTION_CLOSE,
+                "backend": BACKEND_IDENTITY,
+                "scope": "Selected conversation",
+                "targets": [],
+                "exclusions": [],
+            }
+            preview_id = state.write_preview(preview)
+            self.assertFalse(state.finish_preparation(request, preview))
+            self.assertIsNotNone(state.read_preview(preview_id))
+
+    def test_helper_failure_and_invalid_private_records_are_visible_and_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = batch.BatchStateStore(Path(temporary))
+            request = state.start_preparation(ACTION_RESUME, batch.Scope("all"), spawn=False)
+            with mock.patch(
+                "rofi_agent_plus.batch.load_config", side_effect=batch.BatchError("bad config")
+            ):
+                self.assertEqual(1, batch.preparation_main(request, store=state))
+            self.assertEqual("failed", state.read_preparation(request)["status"])
+            self.assertEqual("bad config", state.read_preparation(request)["error"])
+            with state.locked():
+                malformed = dict(state._read(state.preparation_path))
+                malformed["status"] = []
+                state._write(state.preparation_path, malformed)
+            self.assertIsNone(state.read_preparation(request))
+            self.assertEqual(2, batch.preparation_main("invalid", store=state))
+            self.assertIsNone(state.current_job())
+
+    def test_preparation_spawner_removes_rofi_environment_and_reports_spawn_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = batch.BatchStateStore(Path(temporary))
+            with (
+                mock.patch.dict(os.environ, {"ROFI_RETV": "1", "ROFI_DATA": "state"}),
+                mock.patch("rofi_agent_plus.batch.subprocess.Popen") as popen,
+            ):
+                request = state.start_preparation(ACTION_RESUME, batch.Scope("host", "remote"))
+            self.assertEqual(["_batch-prepare", request], popen.call_args.args[0][-2:])
+            self.assertFalse(any(key.startswith("ROFI_") for key in popen.call_args.kwargs["env"]))
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            state.discard_preparation(request)
+            with mock.patch(
+                "rofi_agent_plus.batch.subprocess.Popen", side_effect=OSError("missing")
+            ):
+                with self.assertRaises(batch.BatchError):
+                    state.start_preparation(ACTION_CLOSE, batch.Scope("all"))
+            record = state._read(state.preparation_path)
+            self.assertEqual("failed", record["status"])
+            self.assertIsNone(state.current_job())
+
     def test_all_page_uses_uncapped_per_host_rows_and_mixed_owner_hosts(self) -> None:
         local = _row("local", "codex", LOCAL_ID, "$1", 1)
         remote = _row("remote", "claude", REMOTE_ID, "$9", 9)
@@ -172,7 +318,7 @@ class BatchPreparationTest(unittest.TestCase):
         self.assertIsNone(store.refresh_calls[0]["host_ids"])
         self.assertEqual([LOCAL_ID, REMOTE_ID], [target["id"] for target in preview["targets"]])
         self.assertEqual(
-            ["$1", "$9"], [inspect.call_args_list[i].args[1].session_id for i in range(2)]
+            ["$1", "$9"], sorted(call.args[1].session_id for call in inspect.call_args_list)
         )
         self.assertIn("beyond the ordinary list cap", preview["scope"])
 
@@ -478,6 +624,73 @@ class BatchPickerTest(unittest.TestCase):
             dict(state_store.read_preview(preview_id) or {}),
         )
 
+    def test_preparing_action_page_and_conversation_exits_cancel_even_after_helper_finishes(
+        self,
+    ) -> None:
+        row = _row("local", "codex", LOCAL_ID, "$1", 1)
+        for ready in (False, True):
+            for retv, info in (
+                ("16", '{"type":"batch-target"}'),
+                ("11", '{"type":"batch-target"}'),
+                ("13", '{"type":"batch-target"}'),
+                ("1", selection_payload(row)),
+            ):
+                with (
+                    self.subTest(ready=ready, retv=retv),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    store = FakeStore(_snapshot([row], []))
+                    state_store = batch.BatchStateStore(Path(temporary))
+                    request = state_store.start_preparation(
+                        ACTION_RESUME, batch.Scope("all"), spawn=False
+                    )
+                    data = _refresh_data(
+                        action=ACTION_RESUME,
+                        batch_state=BatchUIState("preparing", None, ACTION_RESUME, request),
+                    )
+                    if ready:
+                        with mock.patch(
+                            "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                            return_value=contract_viewers.ViewerInspection("none", (), True),
+                        ):
+                            preview = batch.build_preview(
+                                store, PickerConfig(), batch.Scope("all"), ACTION_RESUME
+                            )
+                        state_store.finish_preparation(request, preview)
+                    with mock.patch("rofi_agent_plus.rofi._open_selection") as open_session:
+                        output = self._invoke(
+                            {"ROFI_RETV": retv, "ROFI_DATA": data, "ROFI_INFO": info},
+                            store,
+                            preferences=mock.Mock(spec=ViewPreferenceStore),
+                            state_store=state_store,
+                        )
+                    self.assertIsNone(parse_continuation_state(self._data(output)).batch_state)
+                    self.assertIsNone(state_store.read_preparation(request))
+                    self.assertFalse(state_store.preview_path.exists())
+                    self.assertIsNone(state_store.current_job())
+                    open_session.assert_not_called()
+
+    def test_preparation_failure_or_expiry_returns_to_list_without_submission(self) -> None:
+        row = _row("local", "codex", LOCAL_ID, "$1", 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            state_store = batch.BatchStateStore(Path(temporary))
+            request = state_store.start_preparation(ACTION_RESUME, batch.Scope("all"), spawn=False)
+            data = _refresh_data(
+                action=ACTION_RESUME,
+                batch_state=BatchUIState("preparing", None, ACTION_RESUME, request),
+            )
+            state_store.fail_preparation(request, "fixture preparation failed")
+            output = self._invoke(
+                {"ROFI_RETV": str(ROFI_RETV_CUSTOM_19), "ROFI_DATA": data},
+                FakeStore(_snapshot([row], [])),
+                preferences=mock.Mock(spec=ViewPreferenceStore),
+                state_store=state_store,
+            )
+            self.assertIn("fixture preparation failed", output)
+            self.assertIn(LOCAL_ID, output)
+            self.assertIsNone(parse_continuation_state(self._data(output)).batch_state)
+            self.assertIsNone(state_store.current_job())
+
     def test_leading_row_action_cycle_and_conversation_offset(self) -> None:
         row = _row("local", "codex", LOCAL_ID, "$1", 1)
         headers, rows = _records(
@@ -612,7 +825,7 @@ class BatchPickerTest(unittest.TestCase):
             self.assertEqual([], store.refresh_calls)
             preferences.save.assert_not_called()
 
-    def test_all_active_resume_and_close_enter_preview_directly(self) -> None:
+    def test_all_active_prepares_asynchronously_then_requires_explicit_confirm(self) -> None:
         row = _row("local", "codex", LOCAL_ID, "$1", 1)
         for action in (ACTION_RESUME, ACTION_CLOSE):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
@@ -626,10 +839,10 @@ class BatchPickerTest(unittest.TestCase):
                     if action == ACTION_CLOSE
                     else contract_viewers.ViewerInspection("none", (), True)
                 )
-                with mock.patch(
-                    "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
-                    return_value=inspection,
-                ) as inspect:
+                with (
+                    mock.patch("rofi_agent_plus.batch._spawn_helper") as spawn,
+                    mock.patch("rofi_agent_plus.batch.contract_viewers.inspect_viewers") as inspect,
+                ):
                     output = self._invoke(
                         {
                             "ROFI_RETV": "1",
@@ -640,20 +853,82 @@ class BatchPickerTest(unittest.TestCase):
                         preferences=preferences,
                         state_store=state_store,
                     )
-                state = parse_continuation_state(self._data(output)).batch_state
-                record = state_store.read_preview(state.record_id)
-                self.assertEqual("preview", state.screen)
+                pending_data = self._data(output)
+                state = parse_continuation_state(pending_data).batch_state
+                self.assertEqual("preparing", state.screen)
                 self.assertIsNone(state.source_identity)
+                self.assertIn("Preparing preview…", output)
+                self.assertIn('action: "kb-custom-19"', output)
+                self.assertIn(LOCAL_ID, output)
+                self.assertIn("\x00new-selection\x1f0", output)
+                self.assertNotIn("\x00keep-filter\x1ftrue", output)
+                self.assertEqual([], store.refresh_calls)
+                self.assertEqual(0, store.context_calls)
+                inspect.assert_not_called()
+                spawn.assert_called_once_with("_batch-prepare", state.record_id)
+                _, pending_rows = _records(output)
+                _, pending_control = _options(pending_rows[0])
+                early_enter = self._invoke(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": pending_data,
+                        "ROFI_INFO": pending_control["info"],
+                    },
+                    store,
+                    preferences=preferences,
+                    state_store=state_store,
+                )
+                self.assertIn("Preparing preview…", early_enter)
+                self.assertIsNone(state_store.current_job())
+
+                with (
+                    mock.patch("rofi_agent_plus.batch.load_config", return_value=PickerConfig()),
+                    mock.patch(
+                        "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                        return_value=inspection,
+                    ) as inspect,
+                ):
+                    self.assertEqual(
+                        0,
+                        batch.preparation_main(
+                            state.record_id, store=state_store, cache_store=store
+                        ),
+                    )
+                ready = self._invoke(
+                    {
+                        "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                        "ROFI_DATA": pending_data,
+                        "ROFI_INFO": pending_control["info"],
+                    },
+                    store,
+                    preferences=preferences,
+                    state_store=state_store,
+                )
+                preview_data = self._data(ready)
+                preview_state = parse_continuation_state(preview_data).batch_state
+                self.assertEqual("preview", preview_state.screen)
+                record = state_store.read_preview(preview_state.record_id)
                 self.assertEqual(action, record["action"])
                 self.assertEqual(1, len(record["targets"]))
                 expected_mode = "close" if action == ACTION_CLOSE else "open"
                 self.assertEqual(expected_mode, record["targets"][0]["mode"])
-                self.assertIn("All active sessions · Scope:", output)
-                self.assertIn("fixed target", output)
-                self.assertNotIn("\x00keep-filter\x1ftrue", output)
+                self.assertIn("All active sessions · Scope:", ready)
+                self.assertIn("fixed target", ready)
                 self.assertEqual(1, len(store.refresh_calls))
                 inspect.assert_called_once()
                 preferences.save.assert_not_called()
+                self.assertIsNone(state_store.current_job())
+                _, ready_rows = _records(ready)
+                _, confirm = _options(ready_rows[0])
+                with mock.patch("rofi_agent_plus.batch._spawn_worker") as worker:
+                    self._invoke(
+                        {"ROFI_RETV": "1", "ROFI_DATA": preview_data, "ROFI_INFO": confirm["info"]},
+                        store,
+                        preferences=preferences,
+                        state_store=state_store,
+                    )
+                self.assertEqual("queued", state_store.current_job()["status"])
+                worker.assert_called_once()
 
     def test_single_idle_close_freezes_only_exact_viewer_and_confirms_once(self) -> None:
         selected = _row("local", "codex", LOCAL_ID, "$1", 1, active=False, activityState="idle")
@@ -788,22 +1063,18 @@ class BatchPickerTest(unittest.TestCase):
                 "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
                 return_value=contract_viewers.ViewerInspection("none", (), True),
             ):
-                start = self._invoke(
-                    {
-                        "ROFI_RETV": "1",
-                        "ROFI_DATA": _refresh_data(action=ACTION_RESUME),
-                        "ROFI_INFO": '{"type":"batch"}',
-                    },
-                    store,
-                    preferences=preferences,
-                    state_store=state_store,
+                state, data, preview = self._stored_preview(store, state_store)
+                start = render_snapshot(
+                    store.snapshot,
+                    action=ACTION_RESUME,
+                    batch_state=state,
+                    batch_record=preview,
                 )
-            state = parse_continuation_state(self._data(start)).batch_state
             confirm = _options(_records(start)[1][0])[1]["info"]
             cycled = self._invoke(
                 {
                     "ROFI_RETV": str(ROFI_RETV_CUSTOM_7),
-                    "ROFI_DATA": self._data(start),
+                    "ROFI_DATA": data,
                     "ROFI_INFO": confirm,
                 },
                 store,
@@ -823,7 +1094,7 @@ class BatchPickerTest(unittest.TestCase):
                 replay = self._invoke(
                     {
                         "ROFI_RETV": "1",
-                        "ROFI_DATA": self._data(start),
+                        "ROFI_DATA": data,
                         "ROFI_INFO": confirm,
                     },
                     store,

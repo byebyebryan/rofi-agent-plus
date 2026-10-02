@@ -8,7 +8,10 @@ target to keep the conversation list visible while choosing batch actions.
 Agent Plus `0.9.0` implemented in-place group activation. The operator found
 that requiring Enter before showing group actions left a selection feedback
 gap and approved one shared Resume / Close / New cycle on 2026-10-01.
-Agent Plus `0.10.0` implements that shared cycle. Existing public viewer
+Agent Plus `0.10.0` implemented that shared cycle. Agent Plus `0.10.1`
+retains explicit confirmation and prepares group previews asynchronously,
+with immediate progress and four concurrent read-only viewer checks.
+Existing public viewer
 operations and finite execution guards remain its foundation. The managed fleet
 status records the selected source and deployment evidence.
 
@@ -161,8 +164,16 @@ queries just to move the cursor or cycle an action. Existing discovery
 uncertainty and exclusion reasons remain visible; the cursor highlight stays
 distinct from verified target tint.
 
-Enter on the group with Resume or Close prepares a fresh preview using the
-existing guarded batch preparation. Keep that preview inline: its control becomes an
+Enter on the group with Resume or Close immediately displays **Preparing
+preview…** inline and starts a finite read-only helper. Preparation begins
+only on that Enter, not on opening or automatic provider refresh. Refresh the
+selected scope once, then inspect at most four references concurrently while
+preserving catalog order and exact option guards. Protocol or authority failure
+stops subsequent chunks and prevents confirmation. Existing timed callbacks
+display the completed fixed preview. Enter during preparation only redraws;
+it cannot queue a future confirmation.
+
+Keep that preview inline: its control becomes an
 explicit confirmation for the chosen operation, and the conversation list
 shows exact included targets, already-open/closed states, and exclusions.
 Display frozen targets missing from the current ordinary list too. Only
@@ -190,7 +201,7 @@ processes, and other clients.
 A second Enter on the typed confirmation consumes the fixed private preview
 once and starts the existing finite job. Show its scope, progress, per-target
 results, and completion summary inline with the conversation list. Poll only
-while the finite job or the picker's existing bounded refresh requires it.
+while preparation, the finite job, or the picker's existing bounded refresh requires it.
 Escape before confirmation has no session effects; afterward it hides the
 picker while the confirmed job finishes. One batch runs at a time per endpoint.
 

@@ -60,7 +60,7 @@ ACTION_CLOSE = batch.ACTION_CLOSE
 ACTION_NEW = "new-session-here"
 ACTION_ORDER = (ACTION_RESUME, ACTION_CLOSE, ACTION_NEW)
 BATCH_UI_DATA_PREFIX = "batch-ui:"
-_BATCH_SCREENS = frozenset({"preview", "job"})
+_BATCH_SCREENS = frozenset({"preparing", "preview", "job"})
 _BATCH_ROW_TYPES = frozenset({"batch", "batch-confirm", "batch-target", "batch-job"})
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _DISPLAY_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
@@ -255,6 +255,7 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
         # as ordinary root state so it cannot invoke a hidden operation.
         return None
     allowed = {
+        "preparing": {"version", "screen", "sourceIdentity", "action", "recordId"},
         "preview": {"version", "screen", "sourceIdentity", "action", "recordId"},
         "job": {"version", "screen", "sourceIdentity", "recordId"},
     }[screen]
@@ -272,12 +273,12 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
             return None
     action = payload.get("action")
     record_id = payload.get("recordId")
-    if screen == "preview":
+    if screen in {"preparing", "preview"}:
         if action not in {batch.ACTION_CLOSE, batch.ACTION_RESUME}:
             return None
     elif action is not None:
         return None
-    if screen == "preview":
+    if screen in {"preparing", "preview"}:
         if not isinstance(record_id, str) or not batch._ID.fullmatch(record_id):
             return None
     elif screen == "job":
@@ -1364,7 +1365,7 @@ def render_snapshot(
     batch_job: Mapping[str, object] | None = None,
     batch_notice: str = "",
     batch_initial_control: bool = False,
-    polling_job: bool = False,
+    polling_batch: bool = False,
     initial_open: bool = False,
 ) -> str:
     """Render a snapshot as Rofi script headers and rows."""
@@ -1416,13 +1417,13 @@ def render_snapshot(
     if timeout is not None:
         if timeout:
             if (
-                not polling_job
+                not polling_batch
                 and refresh_deadline is None
                 and error_deadline is None
                 and check_deadline is None
             ):
                 refresh_deadline = time.time() + AUTO_REFRESH_MAX_SECONDS
-            if polling_job:
+            if polling_batch:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
             elif refresh_deadline is not None:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
@@ -2337,6 +2338,14 @@ def _inline_batch_control_row(
     job: Mapping[str, object] | None,
     notice: str,
 ) -> str:
+    if state.screen == "preparing":
+        label = "Preparing preview… · " + _batch_action_label(state.action or batch.ACTION_RESUME)
+        return _batch_record(
+            label,
+            row_type="batch-target",
+            meta="read-only preview preparation",
+            display=label,
+        )
     if state.screen == "preview":
         if _batch_can_confirm(state, record):
             targets = record.get("targets")
@@ -2458,7 +2467,19 @@ def _batch_context_message(
     single_close = operation == batch.ACTION_CLOSE and scope.startswith("Selected conversation ·")
     subject = "Selected conversation" if single_close else "All active sessions"
     lines = [f"{subject} · Scope: {_pango_escape(scope)}"]
-    if state.screen == "preview":
+    if state.screen == "preparing":
+        lines.extend(
+            (
+                _pango_escape(
+                    "Preparing preview… · Checking current sessions and verified viewers"
+                ),
+                _pango_escape(
+                    "Confirm will appear when ready; Enter here does not run the batch "
+                    "· Tab or a page change cancels preparation"
+                ),
+            )
+        )
+    elif state.screen == "preview":
         targets = record.get("targets") if isinstance(record, Mapping) else None
         count = len(targets) if isinstance(targets, list) else 0
         operation_label = (
@@ -2513,17 +2534,20 @@ def _render_batch_inline(
     initial_control: bool = False,
 ) -> str:
     active = continuation_state.active()
-    polling_job = bool(
-        state.screen == "job"
-        and isinstance(job, Mapping)
-        and job.get("status") in {"queued", "running"}
+    polling_batch = bool(
+        state.screen == "preparing"
+        or (
+            state.screen == "job"
+            and isinstance(job, Mapping)
+            and job.get("status") in {"queued", "running"}
+        )
     )
     return render_snapshot(
         snapshot,
         message=notice,
         selected_identity=selected_identity,
         continuation=True,
-        timeout=True if active.has_lifecycle or polling_job else False,
+        timeout=True if active.has_lifecycle or polling_batch else False,
         refresh_deadline=active.refresh_deadline,
         error_deadline=active.error_deadline,
         check_deadline=active.check_deadline,
@@ -2539,7 +2563,7 @@ def _render_batch_inline(
         batch_job=job,
         batch_notice=notice,
         batch_initial_control=initial_control,
-        polling_job=polling_job,
+        polling_batch=polling_batch,
     )
 
 
@@ -2684,6 +2708,43 @@ def _handle_batch_screen(
         keep_filter: bool = False,
         initial_control: bool = False,
     ) -> str:
+        if state_value.screen == "preparing":
+            preparation = batch_store.read_preparation(state_value.record_id or "")
+            if preparation is None or preparation["status"] == "failed":
+                message = (
+                    f"Batch preview failed: {sanitize(preparation['error'])}"
+                    if preparation is not None
+                    else "Preview preparation expired or was cancelled; choose the action again."
+                )
+                return _root_after_batch(
+                    store,
+                    config,
+                    navigation,
+                    continuation_state,
+                    action,
+                    last_used,
+                    source_identity,
+                    notice=message,
+                    active_control=source_identity is None,
+                )
+            if preparation["status"] == "ready":
+                preview_id = str(preparation["previewId"])
+                record = batch_store.read_preview(preview_id)
+                if record is None:
+                    return _root_after_batch(
+                        store,
+                        config,
+                        navigation,
+                        continuation_state,
+                        action,
+                        last_used,
+                        source_identity,
+                        notice="Preview expired; choose the action again.",
+                        active_control=source_identity is None,
+                    )
+                state_value = BatchUIState(
+                    "preview", state_value.source_identity, state_value.action, preview_id
+                )
         if snapshot is None:
             snapshot = _presentation_snapshot(store, config)
         if state_value.screen == "preview" and record is None:
@@ -2706,10 +2767,13 @@ def _handle_batch_screen(
         )
 
     def discard_current_preview() -> str:
-        if state.screen != "preview" or state.record_id is None:
+        if state.screen not in {"preparing", "preview"} or state.record_id is None:
             return ""
         try:
-            batch_store.discard_preview(state.record_id)
+            if state.screen == "preparing":
+                batch_store.discard_preparation(state.record_id)
+            else:
+                batch_store.discard_preview(state.record_id)
         except (batch.BatchError, OSError):
             return "Could not invalidate this preview; it is still available."
         return ""
@@ -2734,7 +2798,7 @@ def _handle_batch_screen(
         )
 
     if retv == ROFI_RETV_CUSTOM_4:
-        if state.screen == "preview":
+        if state.screen in {"preparing", "preview"}:
             failure = discard_current_preview()
             if failure:
                 return render_context(
@@ -2767,7 +2831,7 @@ def _handle_batch_screen(
 
     if retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
         direction = 1 if retv == ROFI_RETV_CUSTOM_7 else -1
-        if state.screen == "preview":
+        if state.screen in {"preparing", "preview"}:
             current_action = action if action in ACTION_ORDER else ACTION_RESUME
             next_action = ACTION_ORDER[
                 (ACTION_ORDER.index(current_action) + direction) % len(ACTION_ORDER)
@@ -2855,6 +2919,10 @@ def _handle_batch_screen(
                 last_used,
                 conversation_identity,
             )
+        if state.screen == "preparing":
+            # Even if the helper just finished, this Enter only displays the
+            # ready preview. A separately selected matching Confirm is required.
+            return render_context(keep_filter=True)
         if selected_row is None:
             record = (
                 batch_store.read_preview(state.record_id or "")
@@ -3183,19 +3251,10 @@ def run_rofi(
                                     initial_control=True,
                                 )
                             else:
-                                preview = batch.build_preview(
-                                    store,
-                                    config,
-                                    _batch_scope(navigation),
-                                    operation,
+                                request_id = batch_state_store.start_preparation(
+                                    operation, _batch_scope(navigation)
                                 )
-                                preview_id = batch_state_store.write_preview(preview)
-                                state = BatchUIState("preview", None, operation, preview_id)
-                                persisted = batch_state_store.read_preview(preview_id)
-                                if persisted is None:
-                                    raise batch.BatchError(
-                                        "Batch preview could not be saved safely"
-                                    )
+                                state = BatchUIState("preparing", None, operation, request_id)
                                 rendered = _render_batch_inline(
                                     snapshot,
                                     continuation_state,
@@ -3203,7 +3262,6 @@ def run_rofi(
                                     action,
                                     last_used,
                                     state,
-                                    record=persisted,
                                     initial_control=True,
                                 )
                         except batch.BatchBusy as exc:

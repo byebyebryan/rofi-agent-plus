@@ -122,8 +122,13 @@ for an idle conversation. It does not refresh or rebind provider sessions.
 Missing, stale, ambiguous, unsupported, or unverified associations are shown
 as exclusions.
 
-On All active, `Resume` or `Close` refreshes the selected page's owner-host
-coverage once, independently of Rofi search. Active and All cover every
+On All active, Enter with `Resume` or `Close` returns an inline Preparing
+preview frame immediately. A finite `_batch-prepare` helper refreshes the
+selected page's owner-host coverage once, independently of Rofi search, and
+checks at most four exact references concurrently. Timed callbacks read its
+private request and display the completed fixed preview; they never confirm
+it. Preparation starts only on Enter, and an early Enter only redraws.
+Active and All cover every
 authoritative host; All reads validated per-host active candidates before the
 flattened list cap. Local and named-host pages cover only their respective
 owner. The preview freezes complete Tmux references, and Close freezes the
@@ -131,9 +136,13 @@ viewer IDs found on this endpoint. Only exact provider identity plus complete
 reference matches receive target badges. Changed references, exclusions, and
 missing targets remain visible without eligible tint. Preview target rows are
 display-only. Changing the action or leaving through a page or conversation
-callback discards only the matching unconfirmed preview. Native Escape/Ctrl+G
-has no script callback; an unconsumed private preview retains its bounded
-expiry.
+callback discards only the matching unconfirmed preview or preparation request.
+A random request ID guards publication under the private state lock; cancelled
+or superseded helpers cannot overwrite a newer preview. Pending preparation
+expires after 120 seconds, checked before each inspection chunk and publication.
+Already-running read-only calls finish under their public command timeout.
+Native Escape/Ctrl+G has no script callback; preparation may finish without
+any viewer effects, and an unconsumed private preview retains its bounded expiry.
 
 Confirm consumes the private preview once and starts one background worker for
 the endpoint. A second request reports the existing job. Resume revalidates

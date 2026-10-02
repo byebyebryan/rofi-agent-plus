@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.10.0` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.10.1` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -95,9 +95,13 @@ selects the control without changing the shared `Resume` / `Close` / `New`
 action. The count is a cache-backed shortcut; previews determine which
 sessions are currently eligible.
 
-On All active, Enter with `Resume` or `Close` refreshes the selected page's
-authoritative host coverage once and prepares a fixed inline preview independent
-of search. Active and All cover every authoritative session-owner host; All can
+On All active, Enter with `Resume` or `Close` immediately shows
+`Preparing preview…` with the conversation list visible. A finite read-only
+helper refreshes the selected page's authoritative host coverage once, checks
+viewers four at a time, and prepares a fixed inline preview independent of
+search. The existing timed callback displays Confirm when it is ready; an
+early Enter never submits the batch. Opening the picker does not start this
+preparation. Active and All cover every authoritative session-owner host; All can
 include rows beyond its ordinary history-list cap. Local covers this machine,
 and a named-host page covers that host. The preview freezes complete tmux
 references and, for Close, verified viewer windows. Exact frozen targets
@@ -105,6 +109,10 @@ receive an operation badge; changed references, exclusions, and other frozen
 targets remain visible without an eligible tint. Target rows are display-only.
 Enter on the explicit Confirm control submits the preview once. Changing the
 shared action discards that preview and requires a new Enter to prepare one.
+Changing the page or action during preparation cancels its request; late
+results cannot replace another preview. Preparation expires after two minutes.
+Native Escape closes the picker without a callback; any unfinished read-only
+helper may finish, but it cannot perform viewer operations or confirm a batch.
 Native Escape/Ctrl+G before Confirm has no session or window effect.
 
 On a selected conversation, `Close` previews only that row's currently

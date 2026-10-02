@@ -67,14 +67,17 @@ def diagnostic_main(argv: Sequence[str] | None = None) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    # The batch worker is deliberately an explicit finite CLI branch. Its
-    # spawner removes every ROFI_* variable, and a native Rofi parent cannot
-    # accidentally route this invocation back through script mode.
-    if argv and argv[0] == "_batch-worker":
+    # Both finite helpers use explicit CLI branches. Their spawner removes
+    # every ROFI_* variable so a native parent cannot route them through Rofi.
+    if argv and argv[0] in {"_batch-worker", "_batch-prepare"}:
         if len(argv) != 2:
-            print("rofi-agent-plus: invalid batch worker invocation", file=sys.stderr)
+            print("rofi-agent-plus: invalid batch helper invocation", file=sys.stderr)
             return 2
-        return batch.worker_main(argv[1])
+        return (
+            batch.preparation_main(argv[1])
+            if argv[0] == "_batch-prepare"
+            else batch.worker_main(argv[1])
+        )
     if "ROFI_RETV" in os.environ:
         prepared = initial_frame(os.environ)
         if prepared is not None:

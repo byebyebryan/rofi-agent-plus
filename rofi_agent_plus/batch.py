@@ -2,8 +2,8 @@
 
 This module owns no terminal, SSH, tmux, or compositor behavior. It builds a
 preview from current Agent observations and calls only the public Tmux Plus
-viewer wrapper. A private one-record state store hands the confirmed target
-list to one short-lived worker process.
+viewer wrapper. Private fixed-name records hand read-only preparation to a
+finite helper and the confirmed target list to one short-lived worker process.
 """
 
 from __future__ import annotations
@@ -19,14 +19,15 @@ import sys
 import tempfile
 import time
 import unicodedata
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import contract_viewers, engine
 from .cache import CacheStore, PresentationContext, cache_root
-from .config import PickerConfig
+from .config import PickerConfig, load_config
 from .contract_backend import StaleMeshError
 from .contract_lifecycle import (
     _PROVIDER_OPTIONS,
@@ -48,8 +49,11 @@ _MAX_RESULTS = _MAX_TARGETS
 _MAX_TEXT = 1024
 _PREVIEW_SECONDS = 60 * 60
 _QUEUED_SECONDS = 120
+_PREPARATION_SECONDS = 120
+_INSPECTION_WORKERS = 4
 _JOB_DIR = "batch-actions"
 _PREVIEW_NAME = "preview.json"
+_PREPARATION_NAME = "preparation.json"
 _JOB_NAME = "job.json"
 _STATE_LOCK_NAME = "state.lock"
 _WORKER_LOCK_NAME = "worker.lock"
@@ -480,6 +484,45 @@ def build_single_close_preview(
     }
 
 
+def _inspect_candidate(
+    backend: object, candidate: Mapping[str, object], revision: object
+) -> contract_viewers.ViewerInspection:
+    raw_option = candidate.get("requiredOption")
+    required_option = (
+        tuple(str(value) for value in raw_option)
+        if isinstance(raw_option, list) and len(raw_option) == 2
+        else None
+    )
+    reference = _reference(
+        candidate.get("reference"),
+        str(candidate["hostId"]),
+        revision if isinstance(revision, str) else None,
+    )
+    return contract_viewers.inspect_viewers(backend, reference, required_option=required_option)
+
+
+def _inspection_futures(
+    executor: ThreadPoolExecutor,
+    backend: object,
+    candidates: Sequence[tuple[dict[str, object], Mapping[str, object]]],
+    revision: object,
+    is_current: Callable[[], bool] | None,
+) -> Iterator[
+    tuple[dict[str, object], Mapping[str, object], Future[contract_viewers.ViewerInspection]]
+]:
+    # Submit one bounded chunk at a time. Results retain catalog order, and a
+    # protocol failure prevents the next chunk from starting. Already-running
+    # checks are read-only and finish under their public command timeout.
+    for start in range(0, len(candidates), _INSPECTION_WORKERS):
+        if is_current is not None and not is_current():
+            raise BatchError("Preview preparation was cancelled or expired")
+        pending = [
+            (candidate, display, executor.submit(_inspect_candidate, backend, candidate, revision))
+            for candidate, display in candidates[start : start + _INSPECTION_WORKERS]
+        ]
+        yield from pending
+
+
 def build_preview(
     store: CacheStore,
     config: PickerConfig,
@@ -487,6 +530,7 @@ def build_preview(
     action: str,
     *,
     context: PresentationContext | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     """Refresh the selected page scope and freeze eligible viewer targets."""
 
@@ -544,8 +588,7 @@ def build_preview(
         )
     targets: list[dict[str, object]] = []
     seen_refs: set[tuple[object, ...]] = set()
-    inspection_stopped = False
-    required_option: tuple[str, str] | None
+    unique_candidates = []
     for candidate, display in candidates:
         reference_payload = candidate.get("reference")
         assert isinstance(reference_payload, Mapping)
@@ -556,71 +599,60 @@ def build_preview(
             )
             continue
         seen_refs.add(key)
-        raw_option = candidate.get("requiredOption")
-        required_option = (
-            tuple(str(value) for value in raw_option)
-            if isinstance(raw_option, list) and len(raw_option) == 2
-            else None
-        )
-        try:
-            reference = _reference(
-                reference_payload,
-                str(candidate["hostId"]),
-                identity.get("meshRevision")
-                if isinstance(identity.get("meshRevision"), str)
-                else None,
-            )
-            inspection = contract_viewers.inspect_viewers(
-                backend,
-                reference,
-                required_option=required_option,
-            )
-        except contract_viewers.ViewerError as error:
-            exclusions.append(_text_target(candidate, display, str(error)))
-            if error.stop_batch:
-                inspection_stopped = True
-                break
-            continue
-        except (LifecycleError, engine.PickerError, OSError) as error:
-            exclusions.append(
-                _text_target(candidate, display, _short(error) or "viewer inspection failed")
-            )
-            continue
-        mode: str
-        if inspection.status not in {"none", "verified"}:
-            exclusions.append(_text_target(candidate, display, _exclusion_reason(inspection)))
-            continue
-        if action == ACTION_CLOSE:
-            if inspection.status == "none":
-                mode = "already_closed"
-            elif not inspection.close_safe:
+        unique_candidates.append((candidate, display))
+    inspection_stopped = False
+    with ThreadPoolExecutor(max_workers=_INSPECTION_WORKERS) as executor:
+        for candidate, display, future in _inspection_futures(
+            executor, backend, unique_candidates, identity.get("meshRevision"), is_current
+        ):
+            try:
+                inspection = future.result()
+            except contract_viewers.ViewerError as error:
+                exclusions.append(_text_target(candidate, display, str(error)))
+                if error.stop_batch:
+                    inspection_stopped = True
+                    break
+                continue
+            except (LifecycleError, engine.PickerError, OSError) as error:
                 exclusions.append(
-                    _text_target(candidate, display, "closing could destroy the tmux session")
+                    _text_target(candidate, display, _short(error) or "viewer inspection failed")
                 )
                 continue
+            mode: str
+            if inspection.status not in {"none", "verified"}:
+                exclusions.append(_text_target(candidate, display, _exclusion_reason(inspection)))
+                continue
+            if action == ACTION_CLOSE:
+                if inspection.status == "none":
+                    mode = "already_closed"
+                elif not inspection.close_safe:
+                    exclusions.append(
+                        _text_target(candidate, display, "closing could destroy the tmux session")
+                    )
+                    continue
+                else:
+                    mode = "close"
+            elif inspection.status == "verified":
+                mode = "already_open"
             else:
-                mode = "close"
-        elif inspection.status == "verified":
-            mode = "already_open"
-        else:
-            mode = "open"
-        frozen = dict(candidate)
-        frozen["mode"] = mode
-        frozen["viewers"] = [
-            {"viewerId": viewer.viewer_id, "windowId": viewer.window_id}
-            for viewer in inspection.viewers
-        ]
-        targets.append(frozen)
-        if len(targets) >= _MAX_TARGETS:
-            exclusions.append(
-                {
-                    "name": "Remaining active sessions",
-                    "provider": "",
-                    "host": "",
-                    "reason": "preview target safety limit reached",
-                }
-            )
-            break
+                mode = "open"
+            frozen = dict(candidate)
+            frozen["mode"] = mode
+            frozen["viewers"] = [
+                {"viewerId": viewer.viewer_id, "windowId": viewer.window_id}
+                for viewer in inspection.viewers
+            ]
+            targets.append(frozen)
+            if len(targets) >= _MAX_TARGETS:
+                exclusions.append(
+                    {
+                        "name": "Remaining active sessions",
+                        "provider": "",
+                        "host": "",
+                        "reason": "preview target safety limit reached",
+                    }
+                )
+                break
     if inspection_stopped:
         exclusions.append(
             {
@@ -668,6 +700,7 @@ class BatchStateStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = Path(root or cache_root()) / _JOB_DIR
         self.preview_path = self.root / _PREVIEW_NAME
+        self.preparation_path = self.root / _PREPARATION_NAME
         self.job_path = self.root / _JOB_NAME
         self.state_lock_path = self.root / _STATE_LOCK_NAME
         self.worker_lock_path = self.root / _WORKER_LOCK_NAME
@@ -787,6 +820,152 @@ class BatchStateStore:
         value = self._read(self.job_path)
         return value if isinstance(value, Mapping) else None
 
+    def _read_preparation_locked(self, request_id: str) -> Mapping[str, object] | None:
+        value = self._read(self.preparation_path)
+        fields = {
+            "version",
+            "requestId",
+            "action",
+            "view",
+            "hostId",
+            "createdAt",
+            "status",
+            "previewId",
+            "error",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != fields
+            or type(value.get("version")) is not int
+            or value["version"] != 1
+            or not _ID.fullmatch(request_id)
+            or value.get("requestId") != request_id
+            or not isinstance(value.get("action"), str)
+            or value.get("action") not in _ACTIONS
+            or not isinstance(value.get("view"), str)
+            or value.get("view") not in {"active", "all", "local", "host"}
+            or (
+                value["view"] == "host"
+                and (
+                    not isinstance(value.get("hostId"), str)
+                    or not _HOST_ID.fullmatch(value["hostId"])
+                )
+            )
+            or (value["view"] != "host" and value.get("hostId") is not None)
+            or not isinstance(value.get("status"), str)
+            or value.get("status") not in {"pending", "ready", "failed"}
+            or type(value.get("createdAt")) is not int
+            or not 0
+            <= int(time.time()) - value["createdAt"]
+            <= (_PREVIEW_SECONDS if value["status"] == "ready" else _PREPARATION_SECONDS)
+            or not isinstance(value.get("error"), str)
+            or len(value["error"]) > _MAX_TEXT
+            or (
+                value["status"] == "ready"
+                and (
+                    not isinstance(value.get("previewId"), str)
+                    or not _ID.fullmatch(value["previewId"])
+                )
+            )
+            or (value["status"] != "ready" and value.get("previewId") is not None)
+        ):
+            return None
+        return value
+
+    def read_preparation(self, request_id: str) -> Mapping[str, object] | None:
+        with self.locked():
+            return self._read_preparation_locked(request_id)
+
+    def start_preparation(self, action: str, scope: Scope, *, spawn: bool = True) -> str:
+        """Start one finite read-only request; a new request supersedes old results."""
+        if (
+            action not in _ACTIONS
+            or scope.view not in {"active", "all", "local", "host"}
+            or (
+                scope.view == "host"
+                and (not isinstance(scope.host_id, str) or not _HOST_ID.fullmatch(scope.host_id))
+            )
+            or (scope.view != "host" and scope.host_id is not None)
+        ):
+            raise BatchError("Invalid preview preparation scope or action")
+        request_id = secrets.token_hex(16)
+        with self.locked():
+            active = self._active_job_locked()
+            if active is not None:
+                raise BatchBusy(str(active.get("jobId", "")))
+            # Re-entering the same pending request does not spawn another helper.
+            old = self._read(self.preparation_path)
+            if isinstance(old, Mapping) and isinstance(old.get("requestId"), str):
+                current = self._read_preparation_locked(old["requestId"])
+                if (
+                    current is not None
+                    and current["status"] == "pending"
+                    and (current["action"], current["view"], current["hostId"])
+                    == (action, scope.view, scope.host_id)
+                ):
+                    return str(current["requestId"])
+            self.preview_path.unlink(missing_ok=True)
+            record = {
+                "version": 1,
+                "requestId": request_id,
+                "action": action,
+                "view": scope.view,
+                "hostId": scope.host_id,
+                "createdAt": int(time.time()),
+                "status": "pending",
+                "previewId": None,
+                "error": "",
+            }
+            self._write(self.preparation_path, record)
+            if spawn:
+                try:
+                    _spawn_helper("_batch-prepare", request_id)
+                except OSError as error:
+                    record.update(status="failed", error="Could not start preview preparation")
+                    self._write(self.preparation_path, record)
+                    raise BatchError("Could not start preview preparation") from error
+        return request_id
+
+    def finish_preparation(self, request_id: str, payload: Mapping[str, object]) -> bool:
+        """Publish only if this exact unexpired request still owns the preview."""
+        with self.locked():
+            current = self._read_preparation_locked(request_id)
+            if current is None or current["status"] != "pending":
+                return False
+            if self._active_job_locked() is not None:
+                return False
+            preview_id = secrets.token_hex(16)
+            preview = dict(payload)
+            preview.update(version=1, previewId=preview_id, createdAt=int(time.time()))
+            if preview.get("action") != current["action"] or not _valid_preview_record(
+                preview, preview_id
+            ):
+                raise BatchError("Batch preview could not be saved safely")
+            self._write(self.preview_path, preview)
+            record = dict(current)
+            record.update(status="ready", previewId=preview_id)
+            self._write(self.preparation_path, record)
+            return True
+
+    def fail_preparation(self, request_id: str, error: object) -> None:
+        with self.locked():
+            current = self._read_preparation_locked(request_id)
+            if current is None or current["status"] != "pending":
+                return
+            record = dict(current)
+            record.update(status="failed", error=_short(error) or "Preview preparation failed")
+            self._write(self.preparation_path, record)
+
+    def discard_preparation(self, request_id: str) -> None:
+        with self.locked():
+            raw = self._read(self.preparation_path)
+            if not isinstance(raw, Mapping) or raw.get("requestId") != request_id:
+                return
+            preview = self._read_preview()
+            if preview is not None and preview.get("previewId") == raw.get("previewId"):
+                self.preview_path.unlink(missing_ok=True)
+            self.preparation_path.unlink(missing_ok=True)
+
     def write_preview(self, payload: Mapping[str, object]) -> str:
         targets = payload.get("targets")
         exclusions = payload.get("exclusions")
@@ -803,6 +982,7 @@ class BatchStateStore:
             current = self._active_job_locked()
             if current is not None:
                 raise BatchBusy(str(current.get("jobId", "")))
+            self.preparation_path.unlink(missing_ok=True)
             self._write(self.preview_path, record)
         return preview_id
 
@@ -931,6 +1111,7 @@ class BatchStateStore:
                 "stopReason": "",
             }
             self._write(self.job_path, job)
+            self.preparation_path.unlink(missing_ok=True)
             try:
                 self.preview_path.unlink()
             except FileNotFoundError:
@@ -975,13 +1156,17 @@ class BatchStateStore:
 
 
 def _spawn_worker(job_id: str) -> None:
-    if not _ID.fullmatch(job_id):
+    _spawn_helper("_batch-worker", job_id)
+
+
+def _spawn_helper(branch: str, record_id: str) -> None:
+    if branch not in {"_batch-worker", "_batch-prepare"} or not _ID.fullmatch(record_id):
         raise BatchError("Invalid batch job identifier")
     entrypoint = Path(__file__).resolve().parents[1] / "bin" / "rofi-agent-plus"
     command = (
-        [sys.executable, str(entrypoint), "_batch-worker", job_id]
+        [sys.executable, str(entrypoint), branch, record_id]
         if entrypoint.is_file()
-        else [sys.executable, "-m", "rofi_agent_plus", "_batch-worker", job_id]
+        else [sys.executable, "-m", "rofi_agent_plus", branch, record_id]
     )
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ROFI_")}
     subprocess.Popen(
@@ -993,6 +1178,39 @@ def _spawn_worker(job_id: str) -> None:
         start_new_session=True,
         env=environment,
     )
+
+
+def preparation_main(
+    request_id: str,
+    *,
+    store: BatchStateStore | None = None,
+    cache_store: CacheStore | None = None,
+) -> int:
+    """Finite read-only preparation; only explicit Confirm can submit a job."""
+    if not _ID.fullmatch(request_id):
+        return 2
+    store = store or BatchStateStore()
+    try:
+        request = store.read_preparation(request_id)
+        if request is None or request["status"] != "pending":
+            return 0
+
+        def is_current() -> bool:
+            current = store.read_preparation(request_id)
+            return current is not None and current["status"] == "pending"
+
+        preview = build_preview(
+            cache_store or CacheStore(),
+            load_config(),
+            Scope(str(request["view"]), request["hostId"]),
+            str(request["action"]),
+            is_current=is_current,
+        )
+        store.finish_preparation(request_id, preview)
+        return 0
+    except Exception as error:  # noqa: BLE001 - finite preparation boundary
+        store.fail_preparation(request_id, error)
+        return 1
 
 
 def _valid_target(
