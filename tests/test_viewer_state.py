@@ -247,6 +247,49 @@ class ViewerStateTest(unittest.TestCase):
         self.store.snapshot_path.chmod(0o600)
         self.assertIsNone(self.store.current(self.scope))
 
+    def test_partial_marker_is_strict_and_legacy_private_records_remain_valid(self) -> None:
+        complete = viewers.observations_from_inventory(inventory(), self.scope)
+        self.assertFalse(complete["partial"])
+        legacy = {key: value for key, value in complete.items() if key != "partial"}
+        self.assertTrue(viewers._valid_record(legacy))
+        for value in (None, 0, 1, "true"):
+            with self.subTest(partial=value):
+                self.assertFalse(viewers._valid_record({**complete, "partial": value}))
+
+        unknown = inventory()
+        unknown["hosts"][0]["sessions"][0]["localViewer"] = {"state": "unknown"}
+        self.assertTrue(viewers.observations_from_inventory(unknown, self.scope)["partial"])
+        unavailable = inventory()
+        unavailable["hosts"].append({"hostId": "gamma", "status": "unavailable", "sessions": []})
+        self.assertTrue(viewers.observations_from_inventory(unavailable, self.scope)["partial"])
+
+    def test_overlay_marks_partial_failed_and_expired_viewer_readiness(self) -> None:
+        self.assertTrue(self.store.ingest(inventory(), self.scope))
+        known = self.store.decorate(snapshot(), self.scope)
+        self.assertFalse(known["_viewerFailed"])
+        self.assertFalse(known["_viewerPartial"])
+
+        unknown_inventory = inventory()
+        unknown_inventory["hosts"][0]["sessions"][0]["localViewer"] = {"state": "unknown"}
+        self.assertTrue(self.store.ingest(unknown_inventory, self.scope))
+        partial = self.store.decorate(snapshot(), self.scope)
+        self.assertTrue(partial["_viewerPartial"])
+        self.assertEqual("unknown", partial["sessions"][0]["localViewer"]["state"])
+
+        failure_store = viewers.ViewerStateStore(Path(self.temporary.name) / "failed")
+        failure_store.request(self.scope, lambda _identifier: [], spawn=False)
+        request = failure_store.pending(self.scope)
+        self.assertTrue(
+            failure_store.publish(request["requestId"], self.scope, error="refresh_failed")
+        )
+        failed = failure_store.decorate(snapshot(), self.scope)
+        self.assertTrue(failed["_viewerFailed"])
+        self.assertFalse(failed["_viewerPartial"])
+
+        expired = self.store.decorate(snapshot(), self.scope, now=11_000)
+        self.assertIsNone(expired["_viewerObservedAt"])
+        self.assertEqual("unknown", expired["sessions"][0]["localViewer"]["state"])
+
     def test_new_normal_scope_supersedes_old_helper_and_failures_respect_newer_requests(
         self,
     ) -> None:

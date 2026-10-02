@@ -8,9 +8,9 @@ This plan covers a global Active page and remembered picker context. It
 supersedes the earlier Active-only toggle proposal. Version `0.6.5` is the
 preceding picker with host pages and no remembered context.
 
-The proposed [picker UI rework](agent-plus-picker-ui-rework-plan.md) adds an
+The [picker UI rework](agent-plus-picker-ui-rework-plan.md), implemented in `0.12.0`, adds an
 Open subset beside Active and updates state styling and Open batch scope.
-Its navigation is a follow-up design, not the implemented page ring below.
+The page ring below records the original `0.7.0` behavior.
 
 ## Intended interaction
 

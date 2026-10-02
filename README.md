@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.11.3` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.12.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -53,16 +53,17 @@ page and successfully used conversation. Each launch starts with an empty
 search and `Resume` as its action. Up and Down move through rows. `Tab`
 cycles the shared action through `Resume`, `Close`, and `New`; `Shift+Tab`
 cycles in reverse, with wraparound. The action applies to the highlighted
-conversation or to the leading `All active sessions (N)` control.
+conversation or to the leading `All active sessions (N)` control, named
+`All open sessions (N)` on Open.
 The prompt shows the page; the persistent message below the filter shows
 `Enter:` with all three actions and highlights the selected one. The
-hint also shows `Tab: Cycle actions` and `Alt+A: Select All active`. The first
-conversation remains the default selection when one exists; the All active
+hint also shows `Tab: Cycle` and `Alt+A: All`. The first
+conversation remains the default selection when one exists; the group
 row is selected on an empty page. `Alt+A` clears search and selects that row.
-On All active, `Resume` or `Close` prepares an inline fixed preview, while
+On the group, `Resume` or `Close` prepares an inline fixed preview, while
 `New` asks you to select a conversation. Enter on a conversation runs the
 selected action. Left
-and Right cycle `Active`, `All`, `Local`, and the remote hosts in stable Host
+and Right cycle `Active`, `Open`, `All`, `Local`, and the remote hosts in stable Host
 Mesh order.
 Escape and `Ctrl+G` use Rofi's
 native cancel path and always close. View changes preserve the filter and reset
@@ -76,7 +77,7 @@ The Rofi callback boundary fails closed: configuration, model, and callback
 errors become bounded notices. Left and Right read only the cached snapshot;
 they do not prepare Host Mesh or provider clients. Empty or unavailable hosts
 remain in the view ring as non-actionable status rows, and a local-only Mesh
-collapses the redundant `All` view into `Local`, leaving `Active` and `Local`.
+collapses the redundant `All` view into `Local`, leaving `Active`, `Open`, and `Local`.
 
 `Active` shows conversations with observed running provider processes across
 all hosts, including providers waiting for input. It uses the same activity
@@ -86,7 +87,23 @@ page's recent-session cap, so older observed running conversations remain
 visible. Search a host or provider name to narrow this page. Switching pages
 does not trigger discovery; `Alt+R` refreshes as usual.
 
+`Open` is the subset of Active with a fresh confirmed `Open` or qualified
+`Open?` window on this machine, regardless of which host owns the conversation.
+Unknown or expired viewer evidence stays out of Open while current running
+activity remains in Active. Both pages use uncapped per-host rows, stay
+navigable when empty, and can be remembered between launches. Inactive agents
+whose terminals remain open stay in All/Local/host history views.
+
 ## Batch and window actions
+
+On Open, the leading row is `All open sessions (N)`. Close prepares the fresh
+Open subset and retains the same verified-handle guards and explicit second
+Enter confirmation. Dark or viewer-unknown sessions cannot enter this batch.
+Open? display evidence does not supply a close handle. Resume on this group
+reports `All open · No windows to open` and creates no job or bulk focus;
+Resume on a single conversation still focuses its window. Use Active to
+resume missing windows when switching machines. Frozen target/exclusion cards
+remain visible during confirmation and progress even after windows leave Open.
 
 The leading `All active sessions (N)` control shows the current page's cached
 active or waiting count. Its count uses uncapped per-host rows; the ordinary
@@ -161,6 +178,10 @@ show `Inactive · Open`; waiting launches retain `Waiting`. `Inactive?` and
 `Waiting?` use the same tight suffix when viewer presence is unknown. These
 labels and search terms come from Tmux Plus's bulk `inventory --with-viewers`
 observations.
+Short state labels have dark neutral fills for Active/Waiting, soft green for
+Open, and muted green for Open?. Inactive remains unfilled. Selection,
+observation warnings, and blue frozen-target title tint keep their separate
+meanings; retained or failed activity evidence receives no positive state fill.
 They contain no operation handles: an Open? window may still be excluded by
 the stricter Resume/Close preview guards. A tmux session or visible window by
 itself does not establish provider activity. Rows with current provider and supporting evidence are ordinary; while an automatic
@@ -349,10 +370,10 @@ The [batch session actions plan](docs/agent-plus-batch-session-actions-plan.md)
 records the Close/Resume safeguards and release boundaries; Kill all remains
 outside the current action set.
 
-The proposed [picker UI rework](docs/agent-plus-picker-ui-rework-plan.md)
+The [picker UI rework](docs/agent-plus-picker-ui-rework-plan.md)
 records compact state styling, an Open subset beside Active, and a group
-scope limited to open sessions. It is a design for review, not deployed
-picker behavior.
+scope limited to open sessions. Source, installed, and native acceptance are
+tracked separately in the managed status ledger.
 
 The [session client exploration](docs/agent-plus-session-client-exploration.md)
 and its linked feasibility studies record possible future presentation work.

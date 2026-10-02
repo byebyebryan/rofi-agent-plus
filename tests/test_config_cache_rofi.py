@@ -42,6 +42,8 @@ from rofi_agent_plus.rofi import (
     ROFI_RETV_SELECTED,
     ROW_SEPARATOR,
     VIEW_ACTIVE,
+    VIEW_OPEN,
+    BatchUIState,
     NavigationState,
     _action_data,
     _action_message,
@@ -150,6 +152,14 @@ class ViewPreferenceStoreTest(unittest.TestCase):
             self.assertEqual(
                 ["view.json"], sorted(path.name for path in store.path.parent.iterdir())
             )
+
+    def test_open_page_preference_round_trips_with_one_shared_last_used_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ViewPreferenceStore(temporary)
+            preference = ViewPreference("open", None, ("workstation", "codex", THREAD_ID))
+
+            self.assertTrue(store.save(preference))
+            self.assertEqual(preference, store.load())
 
     def test_malformed_or_unsupported_records_use_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -322,7 +332,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.11.3", engine.VERSION)
+        self.assertEqual("0.12.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -1376,6 +1386,310 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertTrue(all("info" in options for _, options in parsed))
         self.assertIn("Agents › Active", output)
 
+    def test_open_scope_uses_uncapped_deduplicated_current_active_rows(self) -> None:
+        opened_local = session(
+            name="open local",
+            host="workstation",
+            hostId="workstation",
+            recencyAt=300,
+            active=True,
+            activityState="active",
+            sourceObservation="current",
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
+        opened_remote = session(
+            identifier="00000000-0000-0000-0000-000000000002",
+            name="open remote",
+            host="alpha",
+            hostId="alpha",
+            recencyAt=200,
+            active=True,
+            activityState="waiting",
+            sourceObservation="current",
+            localViewer={"state": "open", "confidence": "matched"},
+        )
+        inactive_open = session(
+            identifier="00000000-0000-0000-0000-000000000003",
+            name="inactive open",
+            host="alpha",
+            hostId="alpha",
+            recencyAt=190,
+            active=False,
+            activityState="idle",
+            sourceObservation="current",
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
+        retained_open = session(
+            identifier="00000000-0000-0000-0000-000000000004",
+            name="retained open",
+            host="alpha",
+            hostId="alpha",
+            recencyAt=180,
+            active=True,
+            sourceObservation="retained",
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
+        stale_open = session(
+            identifier="00000000-0000-0000-0000-000000000005",
+            name="stale open",
+            host="alpha",
+            hostId="alpha",
+            recencyAt=170,
+            active=True,
+            sourceObservation="current",
+            tmuxStale=True,
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
+        unknown_open = session(
+            identifier="00000000-0000-0000-0000-000000000006",
+            name="unknown open",
+            host="alpha",
+            hostId="alpha",
+            recencyAt=160,
+            active=True,
+            sourceObservation="current",
+            localViewer={"state": "unknown"},
+        )
+        snapshot = {
+            # The flattened All list is capped before the remote active row.
+            "sessions": [opened_local],
+            "hostCatalog": [
+                {"hostId": "workstation", "display": "Workstation", "local": True},
+                {"hostId": "alpha", "display": "Alpha", "local": False},
+            ],
+            "hosts": {
+                "workstation": {"sessions": [opened_local, dict(opened_local)], "errors": []},
+                "alpha": {
+                    "sessions": [
+                        opened_remote,
+                        inactive_open,
+                        retained_open,
+                        stale_open,
+                        unknown_open,
+                    ],
+                    "errors": [],
+                },
+            },
+            "errors": [],
+            "_viewerWatch": True,
+            "_viewerObservedAt": 300,
+        }
+
+        output = render_snapshot(
+            snapshot,
+            navigation=NavigationState(VIEW_OPEN),
+            selected_identity=("alpha", "codex", unknown_open["id"]),
+        )
+        headers, rows = parse_rendered_records(output)
+        parsed = [parse_row_options(row) for row in rows]
+        self.assertIn("All open sessions (2)", output)
+        self.assertIn("all open sessions", output)
+        leaves = [item for item in parsed if "icon" in item[1]]
+        self.assertEqual(
+            ["open local", "open remote"], [item[0].split("  ·  ")[0] for item in leaves]
+        )
+        self.assertEqual(1, sum(item[0].startswith("open local") for item in leaves))
+        self.assertIn("open", leaves[0][1]["meta"].lower())
+        self.assertIn("Agents › Open", output)
+        self.assertIn("\x00new-selection\x1f1", headers)
+
+    def test_open_empty_states_distinguish_checking_none_expiry_and_failure(self) -> None:
+        cases = (
+            (None, True, "Checking windows…", False),
+            (
+                {"sessions": [], "_viewerWatch": True, "_viewerPending": True},
+                False,
+                "Checking windows…",
+                False,
+            ),
+            (
+                {"sessions": [], "_viewerWatch": True, "_viewerObservedAt": 300},
+                False,
+                "No open sessions observed",
+                False,
+            ),
+            (
+                {"sessions": [], "_viewerWatch": True, "_viewerObservedAt": None},
+                False,
+                "Windows unknown",
+                True,
+            ),
+            (
+                {
+                    "sessions": [],
+                    "_viewerWatch": True,
+                    "_viewerObservedAt": 300,
+                    "_viewerFailed": True,
+                },
+                False,
+                "Windows unknown",
+                True,
+            ),
+            (
+                {
+                    "sessions": [],
+                    "_viewerWatch": True,
+                    "_viewerObservedAt": 300,
+                    "_viewerPartial": True,
+                },
+                False,
+                "Windows unknown",
+                True,
+            ),
+        )
+        for snapshot, checking, expected, urgent in cases:
+            with self.subTest(expected=expected, observed=snapshot):
+                output = render_snapshot(
+                    snapshot,
+                    navigation=NavigationState(VIEW_OPEN),
+                    checking=checking,
+                )
+                _, rows = parse_rendered_records(output)
+                visible, options = parse_row_options(rows[-1])
+                self.assertTrue(visible.startswith(expected))
+                self.assertEqual("true", options.get("nonselectable"))
+                self.assertEqual(urgent, options.get("urgent") == "true")
+
+    def test_open_batch_control_uses_open_context_and_renders_job_exclusions(self) -> None:
+        record_id = "a" * 32
+        open_context = {"endpointHostId": "workstation", "desktop": "d" * 64}
+        state = BatchUIState("preview", None, ACTION_RESUME, record_id)
+        preview = {
+            "action": ACTION_RESUME,
+            "previewId": record_id,
+            "scope": "Open",
+            "targets": [],
+            "exclusions": [],
+            "openContext": open_context,
+        }
+        output = render_snapshot(
+            {"sessions": []},
+            batch_state=state,
+            batch_record=preview,
+        )
+        _, rows = parse_rendered_records(output)
+        visible, _ = parse_row_options(rows[0])
+        self.assertEqual("All open · No windows to open", visible)
+
+        job_state = BatchUIState("job", None, ACTION_RESUME, record_id)
+        job = {
+            "status": "completed",
+            "scope": "Open",
+            "targets": [],
+            "results": [],
+            "openContext": open_context,
+            "exclusions": [
+                {
+                    "name": "Viewer unavailable",
+                    "provider": "Codex",
+                    "host": "Alpha",
+                    "reason": "unknown",
+                }
+            ],
+        }
+        output = render_snapshot(
+            {"sessions": []},
+            batch_state=job_state,
+            batch_job=job,
+        )
+        _, rows = parse_rendered_records(output)
+        self.assertTrue(any("Excluded · Viewer unavailable" in row for row in rows))
+
+    def test_open_frozen_target_keeps_display_only_evidence_after_membership_loss(self) -> None:
+        tmux = {
+            "hostId": "workstation",
+            "meshRevision": None,
+            "serverGeneration": "tmux-v1:one",
+            "sessionId": "$7",
+            "createdAt": 30,
+        }
+        row = session(
+            name="Frozen conversation",
+            host="workstation",
+            hostId="workstation",
+            active=True,
+            activityState="active",
+            sourceObservation="current",
+            tmux=tmux,
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
+        target = {
+            "hostId": "workstation",
+            "host": "Workstation",
+            "kind": "codex",
+            "id": row["id"],
+            "name": row["name"],
+            "reference": dict(tmux),
+            "mode": "open",
+        }
+        record_id = "b" * 32
+        record = {
+            "action": ACTION_RESUME,
+            "previewId": record_id,
+            "scope": "Open",
+            "targets": [target],
+            "exclusions": [],
+            "openContext": {"endpointHostId": "workstation", "desktop": "d" * 64},
+        }
+        state = BatchUIState("preview", None, ACTION_RESUME, record_id)
+        base = {
+            "sessions": [row],
+            "hostCatalog": [{"hostId": "workstation", "display": "Workstation", "local": True}],
+            "hosts": {"workstation": {"sessions": [row], "errors": []}},
+            "errors": [],
+            "_viewerWatch": True,
+            "_viewerObservedAt": 300,
+        }
+
+        member_frame = render_snapshot(
+            base,
+            navigation=NavigationState(VIEW_OPEN),
+            batch_state=state,
+            batch_record=record,
+        )
+        _, member_rows = parse_rendered_records(member_frame)
+        _, member_options = parse_row_options(member_rows[1])
+        self.assertIn('<span foreground="#42a5f5">', member_options["display"])
+
+        closed_row = {**row, "localViewer": {"state": "none"}}
+        closed_snapshot = {
+            **base,
+            "sessions": [closed_row],
+            "hosts": {"workstation": {"sessions": [closed_row], "errors": []}},
+        }
+        closed_frame = render_snapshot(
+            closed_snapshot,
+            navigation=NavigationState(VIEW_OPEN),
+            batch_state=state,
+            batch_record=record,
+        )
+        _, closed_rows = parse_rendered_records(closed_frame)
+        card = next(row for row in closed_rows if row.startswith("Frozen target"))
+        card_text, card_options = parse_row_options(card)
+        self.assertIn("no longer in Open membership", card_text)
+        self.assertIn(
+            '<span foreground="#42a5f5">Frozen conversation</span>', card_options["display"]
+        )
+        self.assertEqual("true", card_options["nonselectable"])
+
+        changed_row = {**closed_row, "tmux": {**tmux, "sessionId": "$8"}}
+        changed_snapshot = {
+            **closed_snapshot,
+            "sessions": [changed_row],
+            "hosts": {"workstation": {"sessions": [changed_row], "errors": []}},
+        }
+        changed_frame = render_snapshot(
+            changed_snapshot,
+            navigation=NavigationState(VIEW_OPEN),
+            batch_state=state,
+            batch_record=record,
+        )
+        _, changed_rows = parse_rendered_records(changed_frame)
+        changed_card = next(row for row in changed_rows if row.startswith("Frozen target"))
+        changed_text, changed_options = parse_row_options(changed_card)
+        self.assertIn("current tmux association differs", changed_text)
+        self.assertNotIn('<span foreground="#42a5f5">', changed_options["display"])
+
     def test_active_scope_excludes_failed_activity_and_failed_refresh_evidence(self) -> None:
         healthy = session(
             "claude",
@@ -1470,7 +1784,7 @@ class RofiProtocolTest(unittest.TestCase):
         local_headers, _ = parse_rendered_records(local_output)
         self.assertIn("\x00new-selection\x1f2", local_headers)
 
-    def test_active_and_local_remain_the_local_only_page_ring(self) -> None:
+    def test_active_open_and_local_page_ring_without_remotes(self) -> None:
         store = mock.Mock(spec=CacheStore)
         store.load.return_value = {
             "sessions": [],
@@ -1480,8 +1794,10 @@ class RofiProtocolTest(unittest.TestCase):
         }
         for state, retv, expected in (
             (NavigationState("local"), ROFI_RETV_CUSTOM_2, "Active"),
-            (NavigationState(VIEW_ACTIVE), ROFI_RETV_CUSTOM_2, "Local"),
-            (NavigationState("local"), ROFI_RETV_CUSTOM_3, "Active"),
+            (NavigationState(VIEW_OPEN), ROFI_RETV_CUSTOM_2, "Local"),
+            (NavigationState(VIEW_ACTIVE), ROFI_RETV_CUSTOM_2, "Open"),
+            (NavigationState("local"), ROFI_RETV_CUSTOM_3, "Open"),
+            (NavigationState(VIEW_OPEN), ROFI_RETV_CUSTOM_3, "Active"),
             (NavigationState(VIEW_ACTIVE), ROFI_RETV_CUSTOM_3, "Local"),
         ):
             with self.subTest(state=state, retv=retv):
@@ -1517,6 +1833,7 @@ class RofiProtocolTest(unittest.TestCase):
         states = (
             NavigationState(),
             NavigationState(VIEW_ACTIVE),
+            NavigationState(VIEW_OPEN),
             NavigationState("local"),
             NavigationState("host", "alpha"),
             NavigationState("host", "unsafe host › label"),
@@ -2165,11 +2482,13 @@ class RofiProtocolTest(unittest.TestCase):
         store.load.return_value = snapshot
         for retv, state, expected in (
             (ROFI_RETV_CUSTOM_2, NavigationState(), "Local"),
+            (ROFI_RETV_CUSTOM_2, NavigationState(VIEW_OPEN), "All"),
+            (ROFI_RETV_CUSTOM_2, NavigationState(VIEW_ACTIVE), "Open"),
             (ROFI_RETV_CUSTOM_2, NavigationState("local"), "Alpha"),
             (ROFI_RETV_CUSTOM_2, NavigationState("host", "alpha"), "Beta"),
             (ROFI_RETV_CUSTOM_2, NavigationState("host", "beta"), "Active"),
-            (ROFI_RETV_CUSTOM_2, NavigationState(VIEW_ACTIVE), "All"),
-            (ROFI_RETV_CUSTOM_3, NavigationState(), "Active"),
+            (ROFI_RETV_CUSTOM_3, NavigationState(), "Open"),
+            (ROFI_RETV_CUSTOM_3, NavigationState(VIEW_OPEN), "Active"),
             (ROFI_RETV_CUSTOM_3, NavigationState(VIEW_ACTIVE), "Beta"),
             (ROFI_RETV_CUSTOM_3, NavigationState("host", "beta"), "Alpha"),
             (ROFI_RETV_CUSTOM_3, NavigationState("host", "alpha"), "Local"),

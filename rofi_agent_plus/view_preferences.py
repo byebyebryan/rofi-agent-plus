@@ -77,7 +77,7 @@ def _preference_json(preference: ViewPreference) -> dict[str, object] | None:
             return None
         page["hostId"] = preference.page_host_id
     elif (
-        preference.page_kind not in {"active", "all", "local"}
+        preference.page_kind not in {"active", "open", "all", "local"}
         or preference.page_host_id is not None
     ):
         return None
@@ -105,7 +105,7 @@ def _parse_preference(value: object) -> ViewPreference | None:
         if set(page) != {"kind", "hostId"} or not _valid_host_id(page.get("hostId")):
             return None
         host_id = page["hostId"]
-    elif kind in {"active", "all", "local"}:
+    elif kind in {"active", "open", "all", "local"}:
         if set(page) != {"kind"}:
             return None
         host_id = None

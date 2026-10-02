@@ -2,9 +2,10 @@
 
 Date: 2026-10-02
 
-Status: proposed design, awaiting review before implementation. This is the
-Rofi picker layout and styling pass. Agent Plus `0.11.3` remains the deployed
-baseline; the navigation and colors below are planned behavior.
+Status: approved on 2026-10-02 and implemented in Agent Plus `0.12.0` with
+worker-goal-loop. This is the Rofi picker layout and styling pass, following
+the `0.11.3` baseline. Deployment and native visual acceptance are recorded
+separately in the [managed suite status ledger](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md).
 
 The existing [navigation](agent-plus-picker-navigation-plan.md),
 [batch actions](agent-plus-batch-session-actions-plan.md), and
@@ -70,7 +71,7 @@ remain quieter context. Add a small background tint behind the short state
 label so the running and open cases can be scanned quickly. Keep the state
 text readable and searchable; color is an additional hint.
 
-| State label | Proposed treatment |
+| State label | Implemented treatment |
 | --- | --- |
 | Inactive | Muted text, no state fill |
 | Active / Active? | Dark neutral fill with readable light text |

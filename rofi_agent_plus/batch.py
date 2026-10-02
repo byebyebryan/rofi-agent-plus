@@ -1272,7 +1272,11 @@ class BatchStateStore:
                 "createdAt": now,
                 "updatedAt": now,
                 "stopReason": "",
-                **({"openContext": dict(open_context)} if open_context is not None else {}),
+                **(
+                    {"openContext": dict(open_context), "exclusions": preview["exclusions"]}
+                    if open_context is not None
+                    else {}
+                ),
             }
             self._write(self.job_path, job)
             self.preparation_path.unlink(missing_ok=True)
@@ -1493,11 +1497,15 @@ def _valid_job_record(value: object, job_id: str) -> bool:
         "updatedAt",
         "stopReason",
     }
-    if not isinstance(value, Mapping) or set(value) - {"openContext"} != fields:
+    if not isinstance(value, Mapping) or set(value) - {"openContext", "exclusions"} != fields:
         return False
     if "openContext" in value and (
-        not _valid_open_context(value["openContext"]) or value.get("action") != ACTION_CLOSE
+        not _valid_open_context(value["openContext"])
+        or value.get("action") != ACTION_CLOSE
+        or not _valid_exclusions(value.get("exclusions"))
     ):
+        return False
+    if "exclusions" in value and "openContext" not in value:
         return False
     backend = value.get("backend")
     if (
@@ -1577,7 +1585,13 @@ def _valid_preview_record(value: object, preview_id: str) -> bool:
         _valid_target(target, str(value["action"]), identity) for target in value["targets"]
     ):
         return False
-    for exclusion in value["exclusions"]:
+    return _valid_exclusions(value["exclusions"])
+
+
+def _valid_exclusions(value: object) -> bool:
+    if not isinstance(value, list) or len(value) > _MAX_TARGETS:
+        return False
+    for exclusion in value:
         if (
             not isinstance(exclusion, Mapping)
             or set(exclusion) != {"name", "provider", "host", "reason"}

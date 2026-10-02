@@ -196,6 +196,7 @@ def observations_from_inventory(
         raise ViewerStateError("Tmux viewer inventory hosts are invalid")
     rows: list[dict[str, object]] = []
     seen: set[tuple[str, str, str, int]] = set()
+    partial = False
     for host in hosts:
         if not isinstance(host, Mapping):
             raise ViewerStateError("Tmux viewer inventory host is invalid")
@@ -205,6 +206,7 @@ def observations_from_inventory(
         if host.get("status") != "ok":
             if sessions:
                 raise ViewerStateError("Tmux unavailable host has viewer sessions")
+            partial = True
             continue
         for session in sessions:
             key = reference_key(session)
@@ -217,6 +219,8 @@ def observations_from_inventory(
                 if raw is not None
                 else {"state": "unknown", "reason": "observation_missing"}
             )
+            if viewer["state"] == "unknown":
+                partial = True
             rows.append(
                 {
                     "sessionRef": dict(
@@ -234,6 +238,7 @@ def observations_from_inventory(
         "scope": dict(scope),
         "observedAt": endpoint["observedAt"],
         "rows": rows,
+        "partial": partial,
     }
 
 
@@ -245,6 +250,7 @@ def _valid_record(record: object) -> bool:
         or record.get("version") != 1
         or not _valid_scope(record.get("scope"))
         or not _integer(record.get("observedAt"))
+        or ("partial" in record and type(record.get("partial")) is not bool)
     ):
         return False
     rows = record.get("rows")
@@ -544,4 +550,17 @@ class ViewerStateStore:
         result["_viewerObservedAt"] = record.get("observedAt") if record is not None else None
         result["_viewerRefreshAt"] = _refresh_at(record) if record is not None else None
         result["_viewerPending"] = self.pending(scope, now=now) is not None
+        result["_viewerFailed"] = bool(record is not None and record.get("error"))
+        result["_viewerPartial"] = bool(
+            record is not None
+            and (
+                record.get("partial") is True
+                or any(
+                    isinstance(row, Mapping)
+                    and isinstance(row.get("viewer"), Mapping)
+                    and row["viewer"].get("state") == "unknown"
+                    for row in record.get("rows", [])
+                )
+            )
+        )
         return result

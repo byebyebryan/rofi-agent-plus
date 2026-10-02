@@ -435,9 +435,9 @@ The implemented Rofi interaction contract is:
 
 - Up and Down navigate rows;
 - Tab and Shift+Tab cycle `Resume`, `Close`, and `New`;
-- Left and Right switch `Active`, `All`, `Local`, and stable remote host pages;
-- Enter applies the displayed action to a selected conversation or typed All active;
-- Alt+A clears search and selects All active;
+- Left and Right switch `Active`, `Open`, `All`, `Local`, and stable remote host pages;
+- Enter applies the displayed action to a conversation or the typed page group;
+- Alt+A clears search and selects All active, or All open on Open;
 - Escape closes through Rofi's native cancel path; and
 - Ctrl+G closes unconditionally through Rofi's native cancel path.
 
@@ -446,6 +446,13 @@ selection errors render bounded diagnostics without turning a callback failure
 into a process crash. The retained custom-6 callback migration guard returns
 immediately without rendering or loading the model; normal Escape and Ctrl+G
 are native Rofi cancellation paths and are not assigned to a script callback.
+
+Open is a fresh endpoint-local viewer subset of Active, including qualified
+Open? observations; inactive agents with remaining terminals stay in history.
+The Open group cannot widen to dark or unknown-viewer sessions. Close keeps
+strict verified viewer handles and freezes its Open context; group Resume is
+no work. State labels are display hints, not operation authority. The
+[UI rework plan](agent-plus-picker-ui-rework-plan.md) records these semantics.
 
 ## Clean product rename
 

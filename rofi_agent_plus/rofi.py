@@ -93,7 +93,8 @@ VIEW_ALL = "all"
 VIEW_LOCAL = "local"
 VIEW_HOST = "host"
 VIEW_ACTIVE = "active"
-_VIEWS = frozenset({VIEW_ACTIVE, VIEW_ALL, VIEW_LOCAL, VIEW_HOST})
+VIEW_OPEN = "open"
+_VIEWS = frozenset({VIEW_ACTIVE, VIEW_OPEN, VIEW_ALL, VIEW_LOCAL, VIEW_HOST})
 SessionIdentity = tuple[str, str, str]
 
 
@@ -117,9 +118,10 @@ def _contract_text(value: object, *, required: bool = True) -> bool:
 class NavigationState:
     """One flat scope in the immutable Host Mesh presentation catalog.
 
-    ``active``, ``all``, and ``local`` are typed scopes.  ``host`` carries an
-    authoritative Host Mesh id rather than a display label.  Continuation
-    data is untrusted, so malformed values normalize to the safe mixed scope.
+    ``active``, ``open``, ``all``, and ``local`` are typed scopes.  ``host``
+    carries an authoritative Host Mesh id rather than a display label.
+    Continuation data is untrusted, so malformed values normalize to the safe
+    mixed scope.
     """
 
     view: str = VIEW_ALL
@@ -532,7 +534,7 @@ def _canonical_navigation(
 ) -> NavigationState:
     """Normalize a continuation scope against its immutable catalog."""
 
-    if navigation.view == VIEW_ACTIVE:
+    if navigation.view in {VIEW_ACTIVE, VIEW_OPEN}:
         return navigation
     catalog = _host_catalog(snapshot)
     if not catalog:
@@ -556,23 +558,28 @@ def _canonical_navigation(
 
 
 def _scope_ring(snapshot: Mapping[str, Any] | None) -> list[NavigationState]:
-    """Build the stable Active/All/Local/remote ring from Host Mesh order."""
+    """Build the stable Active/Open/All/Local/remote ring from Host Mesh order."""
 
     catalog = _host_catalog(snapshot)
     if not catalog:
-        return [NavigationState(VIEW_ACTIVE), NavigationState()]
+        return [NavigationState(VIEW_ACTIVE), NavigationState(VIEW_OPEN), NavigationState()]
     local = next((item for item in catalog if item["local"]), None)
     remotes = [item for item in catalog if not item["local"]]
     if not remotes:
         return (
-            [NavigationState(VIEW_ACTIVE), NavigationState(VIEW_LOCAL)]
+            [NavigationState(VIEW_ACTIVE), NavigationState(VIEW_OPEN), NavigationState(VIEW_LOCAL)]
             if local is not None
-            else [NavigationState(VIEW_ACTIVE), NavigationState()]
+            else [NavigationState(VIEW_ACTIVE), NavigationState(VIEW_OPEN), NavigationState()]
         )
     ring = (
-        [NavigationState(VIEW_ACTIVE), NavigationState(), NavigationState(VIEW_LOCAL)]
+        [
+            NavigationState(VIEW_ACTIVE),
+            NavigationState(VIEW_OPEN),
+            NavigationState(),
+            NavigationState(VIEW_LOCAL),
+        ]
         if local is not None
-        else [NavigationState(VIEW_ACTIVE), NavigationState()]
+        else [NavigationState(VIEW_ACTIVE), NavigationState(VIEW_OPEN), NavigationState()]
     )
     ring.extend(NavigationState(VIEW_HOST, str(item["hostId"])) for item in remotes)
     return ring
@@ -601,6 +608,58 @@ def _active_sessions(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]
     return sorted(active, key=_session_sort_key)
 
 
+def _open_sessions(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Return active per-host rows with a current positive local viewer fact."""
+
+    if not (
+        isinstance(snapshot, Mapping)
+        and snapshot.get("_viewerWatch") is True
+        and type(snapshot.get("_viewerObservedAt")) is int
+    ):
+        return []
+    opened: list[dict[str, Any]] = []
+    for row in _active_sessions(snapshot):
+        if (
+            row.get("sourceObservation") != "current"
+            or row.get("tmuxStale") is True
+            or row.get("tmuxAmbiguous") is True
+        ):
+            continue
+        viewer = row.get("localViewer")
+        if (
+            isinstance(viewer, Mapping)
+            and viewer.get("state") == "open"
+            and viewer.get("confidence") in {"confirmed", "matched"}
+        ):
+            opened.append(row)
+    return opened
+
+
+def _open_empty_status(snapshot: Mapping[str, Any] | None, *, checking: bool) -> str:
+    """Describe an empty Open page without treating unknown inventory as closed."""
+
+    if _refresh_outcome(snapshot) in {"failed", "partial"}:
+        return "Windows unknown"
+    if isinstance(snapshot, Mapping):
+        observed = type(snapshot.get("_viewerObservedAt")) is int
+        failed = snapshot.get("_viewerFailed") is True
+        partial = snapshot.get("_viewerPartial") is True
+        if observed:
+            active_rows = _active_sessions(snapshot)
+            if any(
+                not isinstance(row.get("localViewer"), Mapping)
+                or row["localViewer"].get("state") == "unknown"
+                for row in active_rows
+            ):
+                return "Windows unknown"
+            return "Windows unknown" if failed or partial else "No open sessions observed"
+        if checking or snapshot.get("_viewerPending") is True:
+            return "Checking windows…"
+    elif checking:
+        return "Checking windows…"
+    return "Windows unknown"
+
+
 def _group_sessions(
     snapshot: Mapping[str, Any] | None,
     navigation: NavigationState,
@@ -612,6 +671,8 @@ def _group_sessions(
     failed activity evidence must not receive the membership accent.
     """
 
+    if navigation.view == VIEW_OPEN:
+        return _open_sessions(snapshot)
     catalog = _host_catalog(snapshot)
     if navigation.view in {VIEW_ACTIVE, VIEW_ALL}:
         wanted_hosts = {str(item["hostId"]).casefold() for item in catalog}
@@ -684,6 +745,8 @@ def _sessions_for_navigation(
 
     if navigation.view == VIEW_ACTIVE:
         return _active_sessions(snapshot)
+    if navigation.view == VIEW_OPEN:
+        return _open_sessions(snapshot)
     host_id = _scope_host_id(snapshot, navigation)
     if host_id is None:
         rows = sessions
@@ -704,6 +767,8 @@ def _sessions_for_navigation(
 def _breadcrumb(navigation: NavigationState, snapshot: Mapping[str, Any] | None = None) -> str:
     if navigation.view == VIEW_ACTIVE:
         label = "Active"
+    elif navigation.view == VIEW_OPEN:
+        label = "Open"
     elif navigation.view == VIEW_ALL:
         label = "All"
     elif navigation.view == VIEW_LOCAL:
@@ -838,7 +903,7 @@ def _parse_navigation_state(value: object) -> NavigationState:
         if view == VIEW_HOST:
             host_id = payload.get("hostId")
             return NavigationState(view, host_id if isinstance(host_id, str) else None)
-        if view in {VIEW_ACTIVE, VIEW_ALL, VIEW_LOCAL} and "hostId" not in payload:
+        if view in {VIEW_ACTIVE, VIEW_OPEN, VIEW_ALL, VIEW_LOCAL} and "hostId" not in payload:
             return NavigationState(view)
         return NavigationState()
     return NavigationState()
@@ -1561,15 +1626,17 @@ def render_snapshot(
         headers.append(_protocol("new-selection", 0))
     elif keep_selection and (initial_open or preserve or selected_identity is not None):
         # A missing remembered/current selection falls back to the first real
-        # conversation, or to All active when the page is empty.
+        # conversation, or to the current page's group row when it is empty.
         headers.append(_protocol("new-selection", first_conversation))
     if inline_batch:
+        open_scope = _batch_open_scope(navigation, batch_record, batch_job)
         rendered_rows.append(
             _inline_batch_control_row(
                 batch_state,
                 batch_record,
                 batch_job,
                 batch_notice,
+                open_scope=open_scope,
             )
         )
         target_membership, unmatched_targets = _inline_target_presentation(
@@ -1577,13 +1644,17 @@ def render_snapshot(
             batch_state,
             batch_record,
             batch_job,
+            snapshot=snapshot,
+            open_scope=open_scope,
         )
     else:
         active_count = len(_group_sessions(snapshot, navigation))
-        root_label = f"All active sessions ({active_count})"
+        is_open_page = navigation.view == VIEW_OPEN
+        subject = "All open" if is_open_page else "All active"
+        root_label = f"{subject} sessions ({active_count})"
         control_options = [
             ("info", json.dumps({"type": "batch"}, separators=(",", ":"))),
-            ("meta", "all active sessions"),
+            ("meta", f"{subject.lower()} sessions"),
             ("display", _pango_escape(root_label)),
         ]
         if checking and (snapshot is None or snapshot.get("generatedAt") == 0):
@@ -1646,19 +1717,23 @@ def render_snapshot(
         rendered_rows.append(_row_text(session, now, snapshot=snapshot) + _row_options(options))
         emitted += 1
 
-    for card in unmatched_targets:
+    for card, display_markup in unmatched_targets:
         rendered_rows.append(
             _batch_record(
                 card,
                 row_type="batch-target",
                 meta=card,
-                display=card,
+                display=display_markup or card,
                 nonselectable=True,
+                display_markup=display_markup is not None,
             )
         )
 
-    if inline_batch and batch_state.screen == "preview" and batch_record is not None:
-        exclusions = batch_record.get("exclusions")
+    if inline_batch and batch_state.screen in {"preview", "job"}:
+        evidence_record = batch_record if batch_state.screen == "preview" else batch_job
+        exclusions = (
+            evidence_record.get("exclusions") if isinstance(evidence_record, Mapping) else None
+        )
         if isinstance(exclusions, list):
             for item in exclusions:
                 if not isinstance(item, Mapping):
@@ -1682,7 +1757,9 @@ def render_snapshot(
 
     if emitted == 0:
         scope_host = _scope_host_id(snapshot, navigation)
-        if navigation.view == VIEW_ACTIVE:
+        if navigation.view == VIEW_OPEN:
+            status = _open_empty_status(snapshot, checking=checking)
+        elif navigation.view == VIEW_ACTIVE:
             status = "No active sessions observed · Left/Right: change page"
         elif scope_host is not None:
             status = "No agent sessions on " + _breadcrumb(navigation, snapshot).removeprefix(
@@ -1691,15 +1768,19 @@ def render_snapshot(
         else:
             status = "No agent sessions found"
         if notice_message:
-            if navigation.view == VIEW_ACTIVE:
+            if navigation.view in {VIEW_ACTIVE, VIEW_OPEN}:
                 status += " · " + notice_message
             else:
                 status = "No sessions · " + notice_message
         empty_options: list[tuple[str, object]] = [("nonselectable", "true")]
         refresh_outcome = _refresh_outcome(snapshot)
         empty_urgent = (
-            snapshot is None
+            (
+                snapshot is None
+                and not (navigation.view == VIEW_OPEN and status.startswith("Checking windows"))
+            )
             or refresh_outcome in {"failed", "partial"}
+            or (navigation.view == VIEW_OPEN and status.startswith("Windows unknown"))
             or (not checking and bool(notice_message))
         )
         if empty_urgent:
@@ -1824,7 +1905,7 @@ def _cycled_scope(
 def _navigation_from_preference(preference: ViewPreference) -> NavigationState:
     if preference.page_kind == VIEW_HOST:
         return NavigationState(VIEW_HOST, preference.page_host_id)
-    if preference.page_kind in {VIEW_ACTIVE, VIEW_ALL, VIEW_LOCAL}:
+    if preference.page_kind in {VIEW_ACTIVE, VIEW_OPEN, VIEW_ALL, VIEW_LOCAL}:
         return NavigationState(preference.page_kind)
     return NavigationState()
 
@@ -2425,13 +2506,14 @@ def _batch_record(
     action: str | None = None,
     record_id: str | None = None,
     nonselectable: bool = False,
+    display_markup: bool = False,
 ) -> str:
     options: list[tuple[str, object]] = [
         ("info", _batch_row_info(row_type, action, record_id)),
         ("meta", meta),
     ]
     if display is not None:
-        options.append(("display", _pango_escape(display)))
+        options.append(("display", display if display_markup else _pango_escape(display)))
     if nonselectable:
         options.append(("nonselectable", "true"))
     return _pango_escape(text) + _row_options(options)
@@ -2450,14 +2532,30 @@ def _batch_can_confirm(
     )
 
 
+def _batch_open_scope(
+    navigation: NavigationState,
+    record: Mapping[str, object] | None,
+    job: Mapping[str, object] | None,
+) -> bool:
+    if navigation.view == VIEW_OPEN:
+        return True
+    return any(
+        isinstance(value, Mapping) and isinstance(value.get("openContext"), Mapping)
+        for value in (record, job)
+    )
+
+
 def _inline_batch_control_row(
     state: BatchUIState,
     record: Mapping[str, object] | None,
     job: Mapping[str, object] | None,
     notice: str,
+    *,
+    open_scope: bool = False,
 ) -> str:
+    group_subject = "All open" if open_scope else "All active"
     if notice.startswith("Batch view failed safely:"):
-        subject = "Selected" if state.source_identity is not None else "All active"
+        subject = "Selected" if state.source_identity is not None else group_subject
         label = f"{subject} · Error"
         return _batch_record(
             label,
@@ -2467,7 +2565,7 @@ def _inline_batch_control_row(
             nonselectable=True,
         )
     if state.screen == "preparing":
-        label = "All active · Preparing…"
+        label = f"{group_subject} · Preparing…"
         return _batch_record(
             label,
             row_type="batch-target",
@@ -2483,7 +2581,7 @@ def _inline_batch_control_row(
                 and isinstance(scope, str)
                 and scope.startswith("Selected conversation ·")
             )
-            subject = "Selected" if single_close else "All active"
+            subject = "Selected" if single_close else group_subject
             operation = _action_label(state.action or batch.ACTION_RESUME)
             label = f"{subject} · Confirm {operation} ({count})"
             if notice:
@@ -2499,14 +2597,25 @@ def _inline_batch_control_row(
                 meta="confirm fixed batch targets",
                 display=label,
             )
-        subject = "Selected" if state.source_identity is not None else "All active"
+        subject = "Selected" if state.source_identity is not None else group_subject
+        targets = record.get("targets") if isinstance(record, Mapping) else None
         label = (
             f"{subject} · Preview expired"
             if record is None
             else f"{subject} · Preview failed"
             if record.get("stopReason")
+            else f"{subject} · No windows to open"
+            if open_scope
+            and state.action == batch.ACTION_RESUME
+            and isinstance(targets, list)
+            and not targets
+            else f"{subject} · No windows to close"
+            if open_scope
+            and state.action == batch.ACTION_CLOSE
+            and isinstance(targets, list)
+            and not targets
             else f"{subject} · No windows to {'open' if state.action == batch.ACTION_RESUME else 'close'}"
-            if record.get("targets")
+            if targets
             else f"{subject} · No targets"
         )
         return _batch_record(
@@ -2518,7 +2627,7 @@ def _inline_batch_control_row(
         )
     status = sanitize(job.get("status") or "unavailable") if job else "unavailable"
     scope = str(job.get("scope") or "") if job else ""
-    subject = "Selected" if scope.startswith("Selected conversation ·") else "All active"
+    subject = "Selected" if scope.startswith("Selected conversation ·") else group_subject
     targets = job.get("targets") if job else None
     results = job.get("results") if job else None
     total = len(targets) if isinstance(targets, list) else 0
@@ -2552,7 +2661,10 @@ def _inline_target_presentation(
     state: BatchUIState,
     record: Mapping[str, Any] | None,
     job: Mapping[str, Any] | None,
-) -> tuple[set[SessionIdentity], list[str]]:
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+    open_scope: bool = False,
+) -> tuple[set[SessionIdentity], list[tuple[str, str | None]]]:
     membership: set[SessionIdentity] = set()
     targets: object = None
     action = state.action or batch.ACTION_RESUME
@@ -2567,7 +2679,25 @@ def _inline_target_presentation(
         if isinstance(raw_results, list):
             results = raw_results
     target_rows = targets if isinstance(targets, list) else []
-    missing: list[str] = []
+    evidence_rows: list[dict[str, Any]] = []
+    seen_evidence: set[SessionIdentity] = set()
+    for host in _host_catalog(snapshot):
+        host_id = str(host["hostId"])
+        host_record = _host_record(snapshot, host_id)
+        raw_rows = host_record.get("sessions") if isinstance(host_record, Mapping) else None
+        if not isinstance(raw_rows, list):
+            continue
+        for row in _valid_sessions({"sessions": raw_rows}):
+            identity = _session_identity(row)
+            if (
+                identity is None
+                or identity in seen_evidence
+                or _session_host(row).casefold() != host_id.casefold()
+            ):
+                continue
+            seen_evidence.add(identity)
+            evidence_rows.append(row)
+    missing: list[tuple[str, str | None]] = []
     for index, target in enumerate(target_rows):
         if not isinstance(target, Mapping):
             continue
@@ -2581,13 +2711,41 @@ def _inline_target_presentation(
                     membership.add(identity)
             continue
         identity = _target_identity_key(target)
-        if any(_session_identity(row) == identity for row in rows):
+        current_identity_rows = [
+            row
+            for row in evidence_rows
+            if _session_identity(row) == identity
+            and row.get("sourceObservation") == "current"
+            and row.get("tmuxStale") is not True
+            and row.get("tmuxAmbiguous") is not True
+        ]
+        if open_scope and any(
+            _target_matches_session(target, row) for row in current_identity_rows
+        ):
+            card = _frozen_target_card(target, action, result)
+            card += " · no longer in Open membership; exact tmux association retained"
+            escaped = _pango_escape(card)
+            name = sanitize(target.get("name") or target.get("id") or "Agent")
+            escaped_name = _pango_escape(name)
+            prefix = "Frozen target · " + escaped_name
+            display = escaped.replace(
+                prefix,
+                'Frozen target · <span foreground="#42a5f5">' + escaped_name + "</span>",
+                1,
+            )
+            missing.append((card, display))
+        elif open_scope and current_identity_rows:
             card = _frozen_target_card(target, action, result)
             card += " · current tmux association differs; no row was marked"
+            missing.append((card, None))
+        elif any(_session_identity(row) == identity for row in rows):
+            card = _frozen_target_card(target, action, result)
+            card += " · current tmux association differs; no row was marked"
+            missing.append((card, None))
         else:
             card = _frozen_target_card(target, action, result)
             card += " · target is not in the current conversation rows"
-        missing.append(card)
+            missing.append((card, None))
     return membership, missing
 
 
@@ -3293,7 +3451,7 @@ def run_rofi(
                     elif action == ACTION_NEW:
                         rendered = emit_error(
                             snapshot,
-                            "Select a conversation to create a new session.",
+                            "Select a conversation",
                             selected_identity=None,
                             preserve=True,
                             continuation=True,

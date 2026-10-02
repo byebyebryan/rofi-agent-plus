@@ -1,8 +1,8 @@
 # Agent Plus batch session actions design and implementation plan
 
-The proposed [picker UI rework](agent-plus-picker-ui-rework-plan.md) retains
+The [picker UI rework](agent-plus-picker-ui-rework-plan.md), implemented in `0.12.0`, retains
 this fixed-preview model and adds a distinct Open group scope. The behavior
-below remains the current All active implementation.
+below records the All active implementation that remains on the other pages.
 
 Date: 2026-10-01
 

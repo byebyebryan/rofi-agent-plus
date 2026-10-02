@@ -210,7 +210,14 @@ class OpenBatchTest(unittest.TestCase):
         local = _row("local", "codex", LOCAL_ID, "$1", 1)
         # Match the actual provider shape: owner identity is on the outer row.
         local["tmux"].pop("hostId")
-        dark = _row("local", "codex", REMOTE_ID, "$2", 2)
+        dark = _row(
+            "local",
+            "codex",
+            REMOTE_ID,
+            "$2",
+            2,
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
         remote = _row("remote", "claude", REMOTE_ID, "$3", 3)
         return OpenStore(
             _snapshot([local, dark], [remote]),
@@ -839,6 +846,148 @@ class BatchWorkerTest(unittest.TestCase):
 
 
 class BatchPickerTest(unittest.TestCase):
+    def test_open_resume_preparation_is_no_work_and_keeps_shared_action_bar(self) -> None:
+        row = _row(
+            "local",
+            "codex",
+            LOCAL_ID,
+            "$1",
+            1,
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
+        snapshot = _snapshot([row], [])
+        snapshot.update(_viewerWatch=True, _viewerObservedAt=int(time.time() * 1000))
+        store = OpenStore(snapshot, {})
+        navigation = NavigationState("open")
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch("rofi_agent_plus.batch.viewer_state.desktop_context", return_value="d" * 64),
+            mock.patch("rofi_agent_plus.batch._spawn_helper"),
+            mock.patch("rofi_agent_plus.batch.contract_viewers.inspect_viewers") as inspect,
+        ):
+            state_store = batch.BatchStateStore(Path(temporary))
+            output = self._invoke(
+                {
+                    "ROFI_RETV": "1",
+                    "ROFI_DATA": _refresh_data(navigation=navigation),
+                    "ROFI_INFO": '{"type":"batch"}',
+                },
+                store,
+                state_store=state_store,
+            )
+            pending_data = self._data(output)
+            pending = parse_continuation_state(pending_data).batch_state
+            self.assertEqual("preparing", pending.screen)
+            self.assertIn("All open · Preparing…", output)
+            with mock.patch("rofi_agent_plus.batch.load_config", return_value=PickerConfig()):
+                self.assertEqual(
+                    0,
+                    batch.preparation_main(
+                        pending.record_id,
+                        store=state_store,
+                        cache_store=store,
+                    ),
+                )
+            ready = self._invoke(
+                {
+                    "ROFI_RETV": str(ROFI_RETV_CUSTOM_19),
+                    "ROFI_DATA": pending_data,
+                    "ROFI_INFO": '{"type":"batch"}',
+                },
+                store,
+                state_store=state_store,
+            )
+            ready_state = parse_continuation_state(self._data(ready)).batch_state
+            self.assertIn("All open · No windows to open", ready)
+            self.assertEqual(self._message(output), self._message(ready))
+            self.assertEqual([], store.refresh_calls)
+            inspect.assert_not_called()
+            with mock.patch("rofi_agent_plus.batch._spawn_worker") as spawn:
+                self._invoke(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": self._data(ready),
+                        "ROFI_INFO": json.dumps(
+                            {
+                                "type": "batch-confirm",
+                                "action": ACTION_RESUME,
+                                "recordId": ready_state.record_id,
+                            }
+                        ),
+                    },
+                    store,
+                    state_store=state_store,
+                )
+            spawn.assert_not_called()
+            self.assertIsNone(state_store.current_job())
+
+    def test_open_close_keeps_frozen_target_and_exclusion_after_membership_loss(self) -> None:
+        row = _row(
+            "local",
+            "codex",
+            LOCAL_ID,
+            "$1",
+            1,
+            name="frozen target",
+            localViewer={"state": "open", "confidence": "confirmed"},
+        )
+        snapshot = _snapshot([row], [])
+        snapshot.update(_viewerWatch=True, _viewerObservedAt=int(time.time() * 1000))
+        store = OpenStore(snapshot, {("local", "$1"): row["localViewer"]})
+        inspection = contract_viewers.ViewerInspection(
+            "verified",
+            (contract_viewers.Viewer("viewer-1", 71),),
+            True,
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch("rofi_agent_plus.batch.viewer_state.desktop_context", return_value="d" * 64),
+            mock.patch(
+                "rofi_agent_plus.batch.contract_viewers.inspect_viewers", return_value=inspection
+            ),
+        ):
+            state_store = batch.BatchStateStore(Path(temporary))
+            preview = batch.build_preview(store, PickerConfig(), batch.Scope("open"), ACTION_CLOSE)
+            preview["exclusions"] = [
+                {
+                    "name": "unverified legacy",
+                    "provider": "claude",
+                    "host": "Snap",
+                    "reason": "viewer association is unverified",
+                }
+            ]
+            preview_id = state_store.write_preview(preview)
+            preview = state_store.read_preview(preview_id)
+            row["localViewer"] = {"state": "none"}
+            rendered = render_snapshot(
+                snapshot,
+                navigation=NavigationState("open"),
+                action=ACTION_CLOSE,
+                batch_state=BatchUIState("preview", None, ACTION_CLOSE, preview_id),
+                batch_record=preview,
+                continuation=True,
+            )
+            self.assertIn("All open · Confirm Close (1)", rendered)
+            _, rows = _records(rendered)
+            target = next(item for item in rows if "frozen target" in item)
+            target_options = _options(target)[1]
+            self.assertEqual("true", target_options["nonselectable"])
+            self.assertIn('foreground="#42a5f5"', target_options["display"])
+            self.assertIn("Excluded · unverified legacy", rendered)
+            job_id, _ = state_store.consume_and_submit(preview_id, spawn=False)
+            job = state_store.current_job(job_id)
+            self.assertEqual(preview["exclusions"], job["exclusions"])
+            progress = render_snapshot(
+                snapshot,
+                navigation=NavigationState("open"),
+                action=ACTION_CLOSE,
+                batch_state=BatchUIState("job", None, ACTION_CLOSE, job_id),
+                batch_job=job,
+                continuation=True,
+            )
+            self.assertIn("frozen target", progress)
+            self.assertIn("Excluded · unverified legacy", progress)
+
     def _invoke(
         self,
         environ: dict[str, str],
@@ -1053,7 +1202,7 @@ class BatchPickerTest(unittest.TestCase):
                     preferences=preferences,
                     state_store=state_store,
                 )
-            self.assertIn("Select a conversation to create a new session.", warning)
+            self.assertIn("Select a conversation", warning)
             self.assertIn("[New]</span>", warning)
             self.assertIn("\x00new-selection\x1f0", warning)
             self.assertNotIn("batch-ui:", warning)
@@ -1065,7 +1214,7 @@ class BatchPickerTest(unittest.TestCase):
 
             expired = _refresh_data(
                 error_deadline=time.time() - 1,
-                error_message="Select a conversation to create a new session.",
+                error_message="Select a conversation",
                 action=ACTION_NEW,
             )
             refreshed = self._invoke(
