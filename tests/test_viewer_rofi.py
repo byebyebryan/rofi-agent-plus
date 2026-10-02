@@ -124,7 +124,7 @@ class ViewerRofiTest(unittest.TestCase):
             (True, "active", {"state": "open", "confidence": "confirmed"}, "Open"),
             (True, "active", {"state": "open", "confidence": "matched"}, "Open?"),
             (False, "idle", {"state": "open", "confidence": "matched"}, "Inactive · Open?"),
-            (True, "active", {"state": "unknown"}, "Active · ?"),
+            (True, "active", {"state": "unknown"}, "Active?"),
             (True, "waiting", {"state": "open", "confidence": "confirmed"}, "Waiting · Open"),
             (False, "unknown", {"state": "none"}, "Activity unknown"),
         ]
@@ -157,7 +157,7 @@ class ViewerRofiTest(unittest.TestCase):
             initial = self.callback(0)
             spawn.assert_called_once()
             self.assertEqual("_viewer-refresh", spawn.call_args.args[0][-2])
-            self.assertIn("Active · ?", initial)
+            self.assertIn("Active?", initial)
             self.assertIsNone(rofi._parse_continuation_state(self.data(initial)).refresh_deadline)
             self.publish()
             next_frame = self.callback(
@@ -200,7 +200,7 @@ class ViewerRofiTest(unittest.TestCase):
         self.millis.return_value = 110_000
         with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
             expired = self.callback(rofi.ROFI_RETV_CUSTOM_7)
-            self.assertIn("Active · ?", expired)
+            self.assertIn("Active?", expired)
             spawn.assert_not_called()
             timed = self.callback(rofi.ROFI_RETV_CUSTOM_19, ROFI_DATA=self.data(expired))
             self.callback(rofi.ROFI_RETV_CUSTOM_19, ROFI_DATA=self.data(timed))
@@ -231,7 +231,7 @@ class ViewerRofiTest(unittest.TestCase):
                         ROFI_INFO=rofi.selection_payload(self.row),
                     )
                     self.assertIn("Open", frame)
-                    self.assertNotIn("Active · ?", frame)
+                    self.assertNotIn("Active?", frame)
                     self.assertEqual(message, self.header(frame, "message"))
                     self.assertIn("\x00new-selection\x1f1", frame)
                     self.assertIn("\x00keep-filter\x1ftrue", frame)
@@ -250,7 +250,7 @@ class ViewerRofiTest(unittest.TestCase):
                     ROFI_INFO=rofi.selection_payload(self.row),
                 )
                 self.assertIn("Open", frame)
-                self.assertNotIn("Active · ?", frame)
+                self.assertNotIn("Active?", frame)
                 self.assertEqual(message, self.header(frame, "message"))
                 self.assertEqual(cycle + 1, spawn.call_count)
         self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
@@ -258,7 +258,7 @@ class ViewerRofiTest(unittest.TestCase):
     def test_early_helper_does_not_extend_expiry_or_retain_open_after_failure(self):
         self.publish()
         with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
-            for now, label in ((107, "Open"), (109, "Open"), (110, "Active · ?")):
+            for now, label in ((107, "Open"), (109, "Open"), (110, "Active?")):
                 self.clock.return_value = now
                 self.millis.return_value = now * 1000
                 frame = self.callback(rofi.ROFI_RETV_CUSTOM_19)
@@ -270,7 +270,7 @@ class ViewerRofiTest(unittest.TestCase):
                 viewers.publish(pending["requestId"], self.scope, error="fixture_failure")
             )
             frame = self.callback(rofi.ROFI_RETV_CUSTOM_19)
-            self.assertIn("Active · ?", frame)
+            self.assertIn("Active?", frame)
             self.assertIn("delay: 10;", self.header(frame, "theme"))
             spawn.assert_called_once()
         self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
@@ -286,7 +286,7 @@ class ViewerRofiTest(unittest.TestCase):
                 self.clock.return_value = now
                 self.millis.return_value = now * 1000
                 frame = self.callback(rofi.ROFI_RETV_CUSTOM_19, ROFI_DATA=self.data(frame))
-                self.assertIn("Active · ?", frame)
+                self.assertIn("Active?", frame)
                 spawn.assert_not_called()
             self.clock.return_value = 110
             self.millis.return_value = 110_000

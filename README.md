@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.11.2` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.11.3` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -155,10 +155,12 @@ from visible text.  Session recency and activity state are independent from
 observation confidence. `Active` means a current activity probe matched a live
 provider process to that session ID; `Inactive` means the probe found no matching
 process. `Open` adds confirmed viewer presence on this machine, including a
-session owned by another host; `Open?` is a qualified legacy match. `Active · ?`
+session owned by another host; `Open?` is a qualified legacy match. `Active?`
 means viewer presence is unavailable or expired. An exited provider can still
-show `Inactive · Open`; waiting launches retain `Waiting`. These labels and
-search terms come from Tmux Plus's bulk `inventory --with-viewers` observations.
+show `Inactive · Open`; waiting launches retain `Waiting`. `Inactive?` and
+`Waiting?` use the same tight suffix when viewer presence is unknown. These
+labels and search terms come from Tmux Plus's bulk `inventory --with-viewers`
+observations.
 They contain no operation handles: an Open? window may still be excluded by
 the stricter Resume/Close preview guards. A tmux session or visible window by
 itself does not establish provider activity. Rows with current provider and supporting evidence are ordinary; while an automatic

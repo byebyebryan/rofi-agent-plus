@@ -63,10 +63,10 @@ Agent Plus uses this display mapping:
 | Current and running | No viewer | Active |
 | Current and running | Confirmed viewer | Open |
 | Current and running | Plausible legacy match | Open? |
-| Current and running | Unknown, failed, or expired | Active · ? |
+| Current and running | Unknown, failed, or expired | Active? |
 | Current and inactive | Confirmed or plausible viewer | Inactive · Open or Open? |
-| Current and inactive | Unknown, failed, or expired | Inactive · ? |
-| Waiting for deferred launch | Any viewer result | Keep Waiting and append Open, Open?, or ? when applicable |
+| Current and inactive | Unknown, failed, or expired | Inactive? |
+| Waiting for deferred launch | Any viewer result | Waiting, Waiting · Open/Open?, or Waiting? |
 | Provider activity unavailable or retained after failure | Any viewer result | Preserve the existing unknown or last-known indication; do not assert Inactive |
 
 The inactive-but-open case can occur when an agent exits while its terminal

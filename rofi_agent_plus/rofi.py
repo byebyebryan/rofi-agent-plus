@@ -916,10 +916,10 @@ def _activity_label(
     known_none = state == "none"
     activity = session.get("activityState")
     if activity == "waiting":
-        return "Waiting" + (" · " + opened if opened else "" if known_none else " · ?")
+        return "Waiting" + (" · " + opened if opened else "" if known_none else "?")
     if session.get("active"):
-        return opened or ("Active" if known_none else "Active · ?")
-    return "Inactive" + (" · " + opened if opened else "" if known_none else " · ?")
+        return opened or ("Active" if known_none else "Active?")
+    return "Inactive" + (" · " + opened if opened else "" if known_none else "?")
 
 
 def _refresh_outcome(snapshot: Mapping[str, Any] | None) -> str | None:
