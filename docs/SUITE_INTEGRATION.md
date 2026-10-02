@@ -137,7 +137,13 @@ owner. The preview freezes complete Tmux references, and Close freezes the
 viewer IDs found on this endpoint. Only exact provider identity plus complete
 reference matches receive a colored title without changing conversation text.
 The ready control reads `All active · Confirm Resume (N)` or
-`All active · Confirm Close (N)`; it carries the exact typed preview ID.
+`All active · Confirm Close (N)`; it carries the exact typed preview ID. The
+count, colored titles, and confirmed job include only `open` or `close` targets.
+Already open/closed viewers are observations, not operations; a preview with
+no remaining work cannot be confirmed or submitted, including through a stale
+control. Its row reads `All active · No windows to open` or `close`. Resume
+does not focus already open viewers. If a viewer closes after preparation,
+prepare a new preview to include it.
 Changed references, exclusions, and
 missing targets remain visible without eligible tint. Preview target rows are
 display-only. Changing the action or leaving through a page or conversation

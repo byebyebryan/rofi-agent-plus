@@ -77,6 +77,20 @@ class Scope:
     host_id: str | None = None
 
 
+def operation_targets(record: Mapping[str, object] | None) -> list[Mapping[str, object]]:
+    """Keep only work needed when the fixed preview was prepared."""
+    if record is None:
+        return []
+    action = record.get("action")
+    mode = "open" if action == ACTION_RESUME else "close" if action == ACTION_CLOSE else None
+    targets = record.get("targets")
+    if mode is None or not isinstance(targets, list):
+        return []
+    return [
+        target for target in targets if isinstance(target, Mapping) and target.get("mode") == mode
+    ]
+
+
 def _short(value: object, limit: int = _MAX_TEXT) -> str:
     text = str(value) if value is not None else ""
     text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in text)
@@ -1093,6 +1107,9 @@ class BatchStateStore:
                 or not _valid_preview_record(preview, preview_id)
             ):
                 raise BatchError("Batch preview has expired or is not confirmable")
+            targets = operation_targets(preview)
+            if not targets:
+                raise BatchError("Batch preview has no windows to open or close")
             job_id = secrets.token_hex(16)
             now = int(time.time())
             job: dict[str, object] = {
@@ -1103,7 +1120,7 @@ class BatchStateStore:
                 "action": preview["action"],
                 "backend": dict(preview["backend"]),
                 "scope": _short(preview.get("scope")),
-                "targets": list(preview["targets"]),
+                "targets": targets,
                 "results": [],
                 "counts": {"done": 0, "already": 0, "skipped": 0, "failed": 0},
                 "createdAt": now,

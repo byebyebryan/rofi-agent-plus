@@ -2297,13 +2297,11 @@ def _batch_can_confirm(
     state: BatchUIState,
     record: Mapping[str, Any] | None,
 ) -> bool:
-    targets = record.get("targets") if isinstance(record, Mapping) else None
     return bool(
         record is not None
         and record.get("previewId") == state.record_id
         and record.get("action") == state.action
-        and isinstance(targets, list)
-        and targets
+        and batch.operation_targets(record)
         and not record.get("stopReason")
     )
 
@@ -2334,8 +2332,7 @@ def _inline_batch_control_row(
         )
     if state.screen == "preview":
         if _batch_can_confirm(state, record):
-            targets = record.get("targets")
-            count = len(targets) if isinstance(targets, list) else 0
+            count = len(batch.operation_targets(record))
             scope = record.get("scope")
             single_close = (
                 state.action == batch.ACTION_CLOSE
@@ -2364,6 +2361,8 @@ def _inline_batch_control_row(
             if record is None
             else f"{subject} · Preview failed"
             if record.get("stopReason")
+            else f"{subject} · No windows to {'open' if state.action == batch.ACTION_RESUME else 'close'}"
+            if record.get("targets")
             else f"{subject} · No targets"
         )
         return _batch_record(
@@ -2415,7 +2414,7 @@ def _inline_target_presentation(
     action = state.action or batch.ACTION_RESUME
     results: list[object] = []
     if state.screen == "preview" and isinstance(record, Mapping):
-        targets = record.get("targets")
+        targets = batch.operation_targets(record)
         action = str(record.get("action") or action)
     elif state.screen == "job" and isinstance(job, Mapping):
         targets = job.get("targets")

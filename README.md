@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.10.2` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.10.3` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -107,7 +107,12 @@ early Enter never submits the batch. Opening the picker does not start this
 preparation. Active and All cover every authoritative session-owner host; All can
 include rows beyond its ordinary history-list cap. Local covers this machine,
 and a named-host page covers that host. The preview freezes complete tmux
-references and, for Close, verified viewer windows. Exact frozen targets
+references and, for Close, verified viewer windows. The confirmation count,
+colored titles, and submitted job include only windows that need opening or
+closing. Already open or closed viewers remain untouched; when no work is
+needed, the control reads `All active · No windows to open` or `close` and
+cannot submit a job. A window closed after a Resume preview requires a new
+preview to include it. Exact frozen operation targets
 receive a colored title without added instruction text; changed references, exclusions, and other frozen
 targets remain visible without an eligible tint. Target rows are display-only.
 Enter on the explicit Confirm control submits the preview once. Changing the

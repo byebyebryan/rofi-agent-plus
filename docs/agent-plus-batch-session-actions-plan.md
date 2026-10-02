@@ -14,6 +14,9 @@ with immediate progress and four concurrent read-only viewer checks.
 Agent Plus `0.10.2` keeps the action bar visible throughout and confines short
 preparation/confirmation/progress text to the control row. Verified targets
 use title color without added conversation text.
+Agent Plus `0.10.3` counts, colors, and submits only windows that need opening
+or closing. Already open/closed observations cannot submit an empty job or
+focus an existing window; changed viewer state requires a new preview.
 Existing public viewer
 operations and finite execution guards remain its foundation. The managed fleet
 status records the selected source and deployment evidence.
@@ -95,7 +98,8 @@ owning host. Close also shows the number of verified windows here; Resume
 distinguishes already open from missing viewers. Show exclusions with short
 reasons, such as no tmux association, ambiguous association, stale observation,
 unreachable host, or unsupported viewer. A zero-target preview performs no
-operation.
+operation. Already open/closed observations also perform no operation: only
+missing Resume viewers or present Close viewers enter the confirmed job.
 
 Confirmation authorizes only that frozen list. Immediately revalidate the
 relevant session or viewer before each operation. A disappeared, replaced, or

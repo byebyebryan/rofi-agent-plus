@@ -402,8 +402,8 @@ class BatchWorkerTest(unittest.TestCase):
                         "host": "Snap",
                         "reference": _reference("remote", "$9", 9),
                         "requiredOption": None,
-                        "mode": "already_closed",
-                        "viewers": [],
+                        "mode": "close",
+                        "viewers": [{"viewerId": "viewer-1", "windowId": 71}],
                     }
                 ],
                 "exclusions": [],
@@ -420,8 +420,68 @@ class BatchWorkerTest(unittest.TestCase):
                 state.consume_and_submit(preview_id, spawn=False)
             self.assertEqual(job_id, state.current_job(job_id)["jobId"])
 
-            self.assertEqual(0, batch.worker_main(job_id, store=state))
+            with mock.patch(
+                "rofi_agent_plus.batch._run_job_target",
+                return_value=("already", "viewer disappeared", False),
+            ):
+                self.assertEqual(0, batch.worker_main(job_id, store=state))
             self.assertEqual("complete", state.current_job(job_id)["status"])
+
+    def test_confirmation_omits_already_satisfied_viewers_and_rejects_no_work(self) -> None:
+        for action in (batch.ACTION_RESUME, batch.ACTION_CLOSE):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
+                state = batch.BatchStateStore(Path(temporary))
+                target = {
+                    "hostId": "local",
+                    "kind": "codex",
+                    "id": LOCAL_ID,
+                    "name": "already satisfied",
+                    "host": "Workstation",
+                    "reference": _reference("local", "$1", 1),
+                    "requiredOption": None,
+                    "mode": "already_open" if action == batch.ACTION_RESUME else "already_closed",
+                    "viewers": (
+                        [{"viewerId": "viewer-1", "windowId": 71}]
+                        if action == batch.ACTION_RESUME
+                        else []
+                    ),
+                }
+                preview = {
+                    "action": action,
+                    "backend": dict(BACKEND_IDENTITY),
+                    "scope": "Local",
+                    "targets": [target],
+                    "exclusions": [],
+                }
+                preview_id = state.write_preview(preview)
+                with mock.patch("rofi_agent_plus.batch._spawn_worker") as spawn:
+                    with self.assertRaises(batch.BatchError):
+                        state.consume_and_submit(preview_id)
+                    spawn.assert_not_called()
+                self.assertIsNone(state.current_job())
+                self.assertIsNotNone(state.read_preview(preview_id))
+
+                operation = {
+                    **target,
+                    "id": REMOTE_ID,
+                    "reference": _reference("local", "$2", 2),
+                    "mode": "open" if action == batch.ACTION_RESUME else "close",
+                    "viewers": (
+                        []
+                        if action == batch.ACTION_RESUME
+                        else [{"viewerId": "viewer-2", "windowId": 72}]
+                    ),
+                }
+                preview_id = state.write_preview({**preview, "targets": [target, operation]})
+                job_id, queued = state.consume_and_submit(preview_id, spawn=False)
+                self.assertEqual([operation], queued["targets"])
+                with mock.patch(
+                    "rofi_agent_plus.batch._run_job_target",
+                    return_value=("done", "operation completed", False),
+                ) as run_target:
+                    self.assertEqual(0, batch.worker_main(job_id, store=state))
+                run_target.assert_called_once()
+                self.assertEqual(operation, run_target.call_args.args[3])
 
     def test_discard_preview_only_removes_the_matching_current_preview(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -938,6 +998,81 @@ class BatchPickerTest(unittest.TestCase):
                 self.assertEqual("queued", state_store.current_job()["status"])
                 self.assertEqual(action_bar, self._message(queued))
                 worker.assert_called_once()
+
+    def test_preview_counts_and_colors_only_work_and_rejects_noop_confirmation(self) -> None:
+        already = _row("local", "codex", LOCAL_ID, "$1", 1, name="already satisfied")
+        work = _row("local", "claude", REMOTE_ID, "$2", 2, name="needs operation")
+        verified = contract_viewers.ViewerInspection(
+            "verified", (contract_viewers.Viewer("viewer-1", 71),), True
+        )
+        absent = contract_viewers.ViewerInspection("none", (), True)
+        for action in (ACTION_RESUME, ACTION_CLOSE):
+            for mixed in (False, True):
+                with (
+                    self.subTest(action=action, mixed=mixed),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    store = FakeStore(_snapshot([already, work] if mixed else [already], []))
+                    state_store = batch.BatchStateStore(Path(temporary))
+
+                    def inspect(
+                        _backend: object,
+                        reference: object,
+                        resume: bool = action == ACTION_RESUME,
+                        **_kwargs: object,
+                    ) -> object:
+                        is_already = reference.session_id == "$1"
+                        return verified if is_already == resume else absent
+
+                    with mock.patch(
+                        "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+                        side_effect=inspect,
+                    ):
+                        state, data, record = self._stored_preview(store, state_store, action)
+                    output = self._invoke(
+                        {"ROFI_RETV": str(ROFI_RETV_CUSTOM_19), "ROFI_DATA": data},
+                        store,
+                        state_store=state_store,
+                    )
+                    _, rows = _records(output)
+                    _, control = _options(rows[0])
+                    conversation_options = {
+                        info["id"]: options
+                        for row in rows
+                        if (options := _options(row)[1]).get("info", "").startswith("{")
+                        and (info := json.loads(options["info"])).get("id")
+                    }
+                    self.assertNotIn("foreground=", conversation_options[LOCAL_ID]["display"])
+                    self.assertEqual(
+                        self._message(render_snapshot(store.snapshot, action=action)),
+                        self._message(output),
+                    )
+                    if mixed:
+                        self.assertIn(f"All active · Confirm {action.title()} (1)", output)
+                        self.assertIn("foreground=", conversation_options[REMOTE_ID]["display"])
+                    else:
+                        verb = "open" if action == ACTION_RESUME else "close"
+                        self.assertIn(f"All active · No windows to {verb}", output)
+                        self.assertNotEqual("batch-confirm", json.loads(control["info"])["type"])
+                        self.assertEqual("true", control["nonselectable"])
+                    # A stale/forged Confirm must obey the same operation filter.
+                    confirm = json.dumps(
+                        {"type": "batch-confirm", "action": action, "recordId": state.record_id}
+                    )
+                    with mock.patch("rofi_agent_plus.batch._spawn_worker") as spawn:
+                        self._invoke(
+                            {"ROFI_RETV": "1", "ROFI_DATA": data, "ROFI_INFO": confirm},
+                            store,
+                            state_store=state_store,
+                        )
+                    if mixed:
+                        spawn.assert_called_once()
+                        self.assertEqual(
+                            [record["targets"][1]], state_store.current_job()["targets"]
+                        )
+                    else:
+                        spawn.assert_not_called()
+                        self.assertIsNone(state_store.current_job())
 
     def test_single_idle_close_freezes_only_exact_viewer_and_confirms_once(self) -> None:
         selected = _row("local", "codex", LOCAL_ID, "$1", 1, active=False, activityState="idle")
