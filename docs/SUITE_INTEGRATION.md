@@ -122,8 +122,10 @@ for an idle conversation. It does not refresh or rebind provider sessions.
 Missing, stale, ambiguous, unsupported, or unverified associations are shown
 as exclusions.
 
-On All active, Enter with `Resume` or `Close` returns an inline Preparing
-preview frame immediately. A finite `_batch-prepare` helper refreshes the
+On All active, Enter with `Resume` or `Close` immediately changes the control
+label to `All active · Preparing…`. The shared Resume / Close / New action
+bar remains unchanged during preparation, confirmation, and job progress;
+selection movement requires no redraw. A finite `_batch-prepare` helper refreshes the
 selected page's owner-host coverage once, independently of Rofi search, and
 checks at most four exact references concurrently. Timed callbacks read its
 private request and display the completed fixed preview; they never confirm
@@ -133,7 +135,10 @@ authoritative host; All reads validated per-host active candidates before the
 flattened list cap. Local and named-host pages cover only their respective
 owner. The preview freezes complete Tmux references, and Close freezes the
 viewer IDs found on this endpoint. Only exact provider identity plus complete
-reference matches receive target badges. Changed references, exclusions, and
+reference matches receive a colored title without changing conversation text.
+The ready control reads `All active · Confirm Resume (N)` or
+`All active · Confirm Close (N)`; it carries the exact typed preview ID.
+Changed references, exclusions, and
 missing targets remain visible without eligible tint. Preview target rows are
 display-only. Changing the action or leaving through a page or conversation
 callback discards only the matching unconfirmed preview or preparation request.

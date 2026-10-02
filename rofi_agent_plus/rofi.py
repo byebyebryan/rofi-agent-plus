@@ -990,7 +990,7 @@ def _row_display(
     *,
     snapshot: Mapping[str, Any] | None = None,
     refresh_active: bool = False,
-    batch_badge: str | None = None,
+    batch_target: bool = False,
 ) -> str:
     """Return the two-line Pango presentation for one session row."""
 
@@ -1011,16 +1011,11 @@ def _row_display(
     secondary_markup = [_pango_escape(part) for part in secondary_parts]
     if status:
         secondary_markup.append(_pango_escape(status))
-    if batch_badge:
-        secondary_markup.append(
-            f'<span foreground="#42a5f5" weight="bold">{_pango_escape(batch_badge)}</span>'
-        )
     secondary = "  ·  ".join(secondary_markup)
-    return (
-        f"<b>{_pango_escape(name)}</b>"
-        f'{ROW_SEPARATOR}<span size="smaller" alpha="75%">'
-        f"{secondary}</span>"
-    )
+    title = _pango_escape(name)
+    if batch_target:
+        title = f'<span foreground="#42a5f5">{title}</span>'
+    return f'<b>{title}</b>{ROW_SEPARATOR}<span size="smaller" alpha="75%">{secondary}</span>'
 
 
 def _batch_reference_key(value: Mapping[str, Any]) -> tuple[object, ...] | None:
@@ -1402,17 +1397,7 @@ def render_snapshot(
     if not notice_message and isinstance(snapshot, Mapping) and not clear_message:
         notice_message = summarize_errors(snapshot.get("errors", []))
     inline_batch = batch_state is not None
-    if inline_batch:
-        effective_message = _batch_context_message(
-            snapshot,
-            navigation,
-            batch_state,
-            batch_record,
-            batch_job,
-            batch_notice or notice_message,
-        )
-    else:
-        effective_message = _action_message(action, notice_message)
+    effective_message = _action_message(action, "" if inline_batch else notice_message)
     headers.append(_protocol("message", effective_message))
     if timeout is not None:
         if timeout:
@@ -1496,15 +1481,13 @@ def render_snapshot(
     if inline_batch:
         rendered_rows.append(
             _inline_batch_control_row(
-                snapshot,
-                navigation,
                 batch_state,
                 batch_record,
                 batch_job,
                 batch_notice,
             )
         )
-        target_badges, _target_results, unmatched_targets = _inline_target_presentation(
+        target_membership, unmatched_targets = _inline_target_presentation(
             rows,
             batch_state,
             batch_record,
@@ -1523,12 +1506,11 @@ def render_snapshot(
                 )
             )
         )
-        target_badges, unmatched_targets = {}, []
+        target_membership, unmatched_targets = set(), []
     for session in rows:
         kind = str(session.get("kind") or "")
         info = selection_payload(session)
         identity = _session_identity(session)
-        badge = target_badges.get(identity) if identity is not None else None
         search_metadata = " ".join(
             (
                 *(
@@ -1559,7 +1541,7 @@ def render_snapshot(
                     now,
                     snapshot=snapshot,
                     refresh_active=checking,
-                    batch_badge=badge,
+                    batch_target=identity in target_membership,
                 ),
             ),
         ]
@@ -2251,10 +2233,6 @@ def _batch_scope(navigation: NavigationState) -> batch.Scope:
 _BATCH_ACTION_ORDER = (batch.ACTION_RESUME, batch.ACTION_CLOSE)
 
 
-def _batch_action_label(action: str) -> str:
-    return "Resume all" if action == batch.ACTION_RESUME else "Close all windows"
-
-
 def _batch_row_info(
     row_type: str,
     action: str | None = None,
@@ -2331,15 +2309,23 @@ def _batch_can_confirm(
 
 
 def _inline_batch_control_row(
-    snapshot: Mapping[str, Any] | None,
-    navigation: NavigationState,
     state: BatchUIState,
     record: Mapping[str, object] | None,
     job: Mapping[str, object] | None,
     notice: str,
 ) -> str:
+    if notice.startswith("Batch view failed safely:"):
+        subject = "Selected" if state.source_identity is not None else "All active"
+        label = f"{subject} · Error"
+        return _batch_record(
+            label,
+            row_type="batch-target",
+            meta="batch view error",
+            display=label,
+            nonselectable=True,
+        )
     if state.screen == "preparing":
-        label = "Preparing preview… · " + _batch_action_label(state.action or batch.ACTION_RESUME)
+        label = "All active · Preparing…"
         return _batch_record(
             label,
             row_type="batch-target",
@@ -2356,12 +2342,14 @@ def _inline_batch_control_row(
                 and isinstance(scope, str)
                 and scope.startswith("Selected conversation ·")
             )
-            operation = (
-                "Close selected conversation"
-                if single_close
-                else _batch_action_label(state.action or batch.ACTION_RESUME)
-            )
-            label = f"Confirm {operation} · {count} fixed target{'s' if count != 1 else ''}"
+            subject = "Selected" if single_close else "All active"
+            operation = _action_label(state.action or batch.ACTION_RESUME)
+            label = f"{subject} · Confirm {operation} ({count})"
+            if notice:
+                short_notice = sanitize(notice)
+                if len(short_notice) > 40:
+                    short_notice = short_notice[:39] + "…"
+                label += " · " + short_notice
             return _batch_record(
                 label,
                 row_type="batch-confirm",
@@ -2370,14 +2358,14 @@ def _inline_batch_control_row(
                 meta="confirm fixed batch targets",
                 display=label,
             )
-        stop_reason = sanitize(record.get("stopReason") or "") if record else ""
+        subject = "Selected" if state.source_identity is not None else "All active"
         label = (
-            "Preview stopped · " + stop_reason
-            if stop_reason
-            else "No eligible targets · nothing to confirm"
+            f"{subject} · Preview expired"
+            if record is None
+            else f"{subject} · Preview failed"
+            if record.get("stopReason")
+            else f"{subject} · No targets"
         )
-        if notice:
-            label += " · " + sanitize(notice)
         return _batch_record(
             label,
             row_type="batch-target",
@@ -2386,7 +2374,27 @@ def _inline_batch_control_row(
             nonselectable=True,
         )
     status = sanitize(job.get("status") or "unavailable") if job else "unavailable"
-    label = f"Batch {status} · {batch.job_summary(job or {})}"
+    scope = str(job.get("scope") or "") if job else ""
+    subject = "Selected" if scope.startswith("Selected conversation ·") else "All active"
+    targets = job.get("targets") if job else None
+    results = job.get("results") if job else None
+    total = len(targets) if isinstance(targets, list) else 0
+    processed = len(results) if isinstance(results, list) else 0
+    if status == "running":
+        operation = _action_label(str(job.get("action") or batch.ACTION_RESUME))
+        progress = f"{operation} {processed}/{total}"
+    elif status == "complete":
+        progress = f"Done ({total})"
+    elif status == "failed":
+        progress = f"Failed ({processed}/{total})"
+    else:
+        progress = status.title()
+    label = f"{subject} · {progress}"
+    counts = job.get("counts") if job else None
+    if isinstance(counts, Mapping):
+        for key in ("skipped", "failed"):
+            if counts.get(key):
+                label += f" · {counts[key]} {key}"
     return _batch_record(
         label,
         row_type="batch-job",
@@ -2401,8 +2409,8 @@ def _inline_target_presentation(
     state: BatchUIState,
     record: Mapping[str, Any] | None,
     job: Mapping[str, Any] | None,
-) -> tuple[dict[SessionIdentity, str], list[Mapping[str, Any]], list[str]]:
-    badges: dict[SessionIdentity, str] = {}
+) -> tuple[set[SessionIdentity], list[str]]:
+    membership: set[SessionIdentity] = set()
     targets: object = None
     action = state.action or batch.ACTION_RESUME
     results: list[object] = []
@@ -2424,11 +2432,10 @@ def _inline_target_presentation(
         result = raw_result if isinstance(raw_result, Mapping) else None
         matched = [row for row in rows if _target_matches_session(target, row)]
         if matched:
-            badge = _batch_target_badge(target, action, result)
             for row in matched:
                 identity = _session_identity(row)
                 if identity is not None:
-                    badges[identity] = badge
+                    membership.add(identity)
             continue
         identity = _target_identity_key(target)
         if any(_session_identity(row) == identity for row in rows):
@@ -2438,84 +2445,7 @@ def _inline_target_presentation(
             card = _frozen_target_card(target, action, result)
             card += " · target is not in the current conversation rows"
         missing.append(card)
-    return badges, results, missing
-
-
-def _batch_context_message(
-    snapshot: Mapping[str, Any] | None,
-    navigation: NavigationState,
-    state: BatchUIState,
-    record: Mapping[str, object] | None,
-    job: Mapping[str, object] | None,
-    notice: str,
-) -> str:
-    catalog = _host_catalog(snapshot)
-    scope = (
-        sanitize(record.get("scope") or batch.scope_label(catalog, _batch_scope(navigation)))
-        if state.screen == "preview" and isinstance(record, Mapping)
-        else sanitize(job.get("scope") or batch.scope_label(catalog, _batch_scope(navigation)))
-        if state.screen == "job" and isinstance(job, Mapping)
-        else batch.scope_label(catalog, _batch_scope(navigation))
-    )
-    operation = (
-        str(record.get("action") or state.action or batch.ACTION_RESUME)
-        if state.screen == "preview" and isinstance(record, Mapping)
-        else str(job.get("action") or batch.ACTION_RESUME)
-        if state.screen == "job" and isinstance(job, Mapping)
-        else state.action or batch.ACTION_RESUME
-    )
-    single_close = operation == batch.ACTION_CLOSE and scope.startswith("Selected conversation ·")
-    subject = "Selected conversation" if single_close else "All active sessions"
-    lines = [f"{subject} · Scope: {_pango_escape(scope)}"]
-    if state.screen == "preparing":
-        lines.extend(
-            (
-                _pango_escape(
-                    "Preparing preview… · Checking current sessions and verified viewers"
-                ),
-                _pango_escape(
-                    "Confirm will appear when ready; Enter here does not run the batch "
-                    "· Tab or a page change cancels preparation"
-                ),
-            )
-        )
-    elif state.screen == "preview":
-        targets = record.get("targets") if isinstance(record, Mapping) else None
-        count = len(targets) if isinstance(targets, list) else 0
-        operation_label = (
-            "Close selected conversation" if single_close else _batch_action_label(operation)
-        )
-        lines.extend(
-            (
-                _pango_escape(
-                    f"Preview: {operation_label} · "
-                    f"{count} fixed eligible target{'s' if count != 1 else ''}"
-                    " · Search does not change the frozen list"
-                ),
-                _pango_escape(
-                    "Only Confirm runs this exact preview; Tab/Shift+Tab discards it and "
-                    "changes the shared action · Alt+A selects All active"
-                ),
-            )
-        )
-    else:
-        status = (
-            sanitize(job.get("status") or "unavailable")
-            if isinstance(job, Mapping)
-            else "unavailable"
-        )
-        lines.extend(
-            (
-                _pango_escape(f"Batch {status} · {batch.job_summary(job or {})}"),
-                _pango_escape(
-                    "The confirmed job keeps running if Escape closes this view "
-                    "· Alt+A selects All active"
-                ),
-            )
-        )
-    if notice:
-        lines.append(_pango_escape(sanitize(notice)))
-    return "\u2028".join(lines)
+    return membership, missing
 
 
 def _render_batch_inline(
@@ -2813,7 +2743,6 @@ def _handle_batch_screen(
                 action,
                 last_used,
                 None,
-                notice="Preview discarded; the fixed target list was not changed.",
                 active_control=True,
             )
         # Alt+A from a confirmed job hides its status while the finite worker
@@ -2852,14 +2781,13 @@ def _handle_batch_screen(
                 next_action,
                 last_used,
                 source_identity,
-                notice=f"Preview discarded; {_action_label(next_action)} is selected.",
                 active_control=source_identity is None,
             )
         job = batch_store.current_job(state.record_id)
         return render_context(
             job=job,
             keep_filter=True,
-            notice="The confirmed action is fixed until the job finishes.",
+            notice="Action is fixed",
         )
 
     if retv == ROFI_RETV_CUSTOM_19:
@@ -2891,7 +2819,7 @@ def _handle_batch_screen(
     if retv == ROFI_RETV_CUSTOM_1:
         return render_context(
             keep_filter=True,
-            notice="The preview or confirmed job stays fixed while you are viewing it.",
+            notice="Preview is fixed",
         )
 
     if retv in {2, 3}:
@@ -2956,7 +2884,7 @@ def _handle_batch_screen(
                         )
                     return render_context(
                         record=record,
-                        notice="Confirmation is stale or does not match the frozen preview.",
+                        notice="Preview changed",
                     )
                 try:
                     job_id, queued = batch_store.consume_and_submit(state.record_id or "")
@@ -2979,11 +2907,9 @@ def _handle_batch_screen(
             if row_type == "batch-target":
                 return render_context(
                     record=record,
-                    notice="Target and exclusion rows are display only.",
+                    notice="Select Confirm",
                 )
-            return render_context(
-                record=record, notice="Only the matching Confirm row can submit this preview."
-            )
+            return render_context(record=record, notice="Select Confirm")
 
         if state.screen == "job":
             job = batch_store.current_job(state.record_id)

@@ -609,6 +609,11 @@ class BatchPickerTest(unittest.TestCase):
             value.split("\x1f", 1)[1] for value in headers if value.startswith("\x00data\x1f")
         )
 
+    @staticmethod
+    def _message(output: str) -> str:
+        headers, _ = _records(output)
+        return next(value for value in headers if value.startswith("\x00message\x1f"))
+
     def _stored_preview(
         self,
         store: FakeStore,
@@ -857,7 +862,9 @@ class BatchPickerTest(unittest.TestCase):
                 state = parse_continuation_state(pending_data).batch_state
                 self.assertEqual("preparing", state.screen)
                 self.assertIsNone(state.source_identity)
-                self.assertIn("Preparing preview…", output)
+                action_bar = self._message(render_snapshot(store.snapshot, action=action))
+                self.assertEqual(action_bar, self._message(output))
+                self.assertIn("All active · Preparing…", output)
                 self.assertIn('action: "kb-custom-19"', output)
                 self.assertIn(LOCAL_ID, output)
                 self.assertIn("\x00new-selection\x1f0", output)
@@ -878,7 +885,8 @@ class BatchPickerTest(unittest.TestCase):
                     preferences=preferences,
                     state_store=state_store,
                 )
-                self.assertIn("Preparing preview…", early_enter)
+                self.assertIn("All active · Preparing…", early_enter)
+                self.assertEqual(action_bar, self._message(early_enter))
                 self.assertIsNone(state_store.current_job())
 
                 with (
@@ -912,8 +920,8 @@ class BatchPickerTest(unittest.TestCase):
                 self.assertEqual(1, len(record["targets"]))
                 expected_mode = "close" if action == ACTION_CLOSE else "open"
                 self.assertEqual(expected_mode, record["targets"][0]["mode"])
-                self.assertIn("All active sessions · Scope:", ready)
-                self.assertIn("fixed target", ready)
+                self.assertIn(f"All active · Confirm {action.title()} (1)", ready)
+                self.assertEqual(action_bar, self._message(ready))
                 self.assertEqual(1, len(store.refresh_calls))
                 inspect.assert_called_once()
                 preferences.save.assert_not_called()
@@ -921,13 +929,14 @@ class BatchPickerTest(unittest.TestCase):
                 _, ready_rows = _records(ready)
                 _, confirm = _options(ready_rows[0])
                 with mock.patch("rofi_agent_plus.batch._spawn_worker") as worker:
-                    self._invoke(
+                    queued = self._invoke(
                         {"ROFI_RETV": "1", "ROFI_DATA": preview_data, "ROFI_INFO": confirm["info"]},
                         store,
                         preferences=preferences,
                         state_store=state_store,
                     )
                 self.assertEqual("queued", state_store.current_job()["status"])
+                self.assertEqual(action_bar, self._message(queued))
                 worker.assert_called_once()
 
     def test_single_idle_close_freezes_only_exact_viewer_and_confirms_once(self) -> None:
@@ -974,10 +983,7 @@ class BatchPickerTest(unittest.TestCase):
                 self.assertEqual("close", target["mode"])
                 self.assertEqual([{"viewerId": "viewer-1", "windowId": 7}], target["viewers"])
                 self.assertTrue(preview["scope"].startswith("Selected conversation ·"))
-                self.assertIn("Selected conversation · Scope:", preview_output)
-                self.assertIn(
-                    "Confirm Close selected conversation · 1 fixed target", preview_output
-                )
+                self.assertIn("Selected · Confirm Close (1)", preview_output)
                 inspect.assert_called_once()
                 inspected_reference = inspect.call_args.args[1]
                 self.assertEqual("$1", inspected_reference.session_id)
@@ -1003,7 +1009,7 @@ class BatchPickerTest(unittest.TestCase):
                     job = state_store.current_job()
                     self.assertEqual(ACTION_CLOSE, job["action"])
                     self.assertEqual(1, len(job["targets"]))
-                    self.assertIn("Selected conversation · Scope:", job_output)
+                    self.assertIn("Selected · Queued", job_output)
 
                     replay = self._invoke(
                         {
@@ -1016,7 +1022,7 @@ class BatchPickerTest(unittest.TestCase):
                         state_store=state_store,
                     )
                     spawn.assert_called_once()
-                    self.assertIn("Batch queued", replay)
+                    self.assertIn("Selected · Queued", replay)
                 fast_open.assert_not_called()
                 open_session.assert_not_called()
                 create.assert_not_called()
@@ -1102,7 +1108,7 @@ class BatchPickerTest(unittest.TestCase):
                     state_store=state_store,
                 )
                 spawn.assert_not_called()
-            self.assertIn("Confirmation is stale", replay)
+            self.assertIn("Preview expired", replay)
             self.assertIsNone(state_store.active_job())
             preferences.save.assert_not_called()
 
@@ -1233,7 +1239,7 @@ class BatchPickerTest(unittest.TestCase):
             and json.loads(_options(row)[1]["info"]).get("type") != "batch"
         }
         self.assertIn(
-            '<span foreground="#42a5f5" weight="bold">Will open existing session</span>',
+            '<span foreground="#42a5f5">included</span>',
             by_id[LOCAL_ID]["display"],
         )
         self.assertNotIn("foreground=", by_id[REMOTE_ID]["display"])

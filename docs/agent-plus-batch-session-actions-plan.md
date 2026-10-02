@@ -11,6 +11,9 @@ gap and approved one shared Resume / Close / New cycle on 2026-10-01.
 Agent Plus `0.10.0` implemented that shared cycle. Agent Plus `0.10.1`
 retains explicit confirmation and prepares group previews asynchronously,
 with immediate progress and four concurrent read-only viewer checks.
+Agent Plus `0.10.2` keeps the action bar visible throughout and confines short
+preparation/confirmation/progress text to the control row. Verified targets
+use title color without added conversation text.
 Existing public viewer
 operations and finite execution guards remain its foundation. The managed fleet
 status records the selected source and deployment evidence.
@@ -164,8 +167,11 @@ queries just to move the cursor or cycle an action. Existing discovery
 uncertainty and exclusion reasons remain visible; the cursor highlight stays
 distinct from verified target tint.
 
-Enter on the group with Resume or Close immediately displays **Preparing
-preview…** inline and starts a finite read-only helper. Preparation begins
+Enter on the group with Resume or Close immediately changes its row to
+**All active · Preparing…** and starts a finite read-only helper. The shared
+Resume / Close / New action bar stays visible and unchanged during preparation,
+confirmation, and job progress, even when the cursor moves to a conversation.
+Remove batch instruction paragraphs from the message area. Preparation begins
 only on that Enter, not on opening or automatic provider refresh. Refresh the
 selected scope once, then inspect at most four references concurrently while
 preserving catalog order and exact option guards. Protocol or authority failure
@@ -173,9 +179,9 @@ stops subsequent chunks and prevents confirmation. Existing timed callbacks
 display the completed fixed preview. Enter during preparation only redraws;
 it cannot queue a future confirmation.
 
-Keep that preview inline: its control becomes an
-explicit confirmation for the chosen operation, and the conversation list
-shows exact included targets, already-open/closed states, and exclusions.
+Keep that preview inline: its control becomes **All active · Confirm Resume
+(N)** or **All active · Confirm Close (N)**. The conversation list shows
+exact included targets through title color and keeps exclusions visible.
 Display frozen targets missing from the current ordinary list too. Only
 verified exact targets receive the operation membership tint. An operation
 change or page/context change invalidates the displayed confirmation; any
@@ -199,8 +205,9 @@ active sessions. Freeze the exact viewer handles and preserve tmux, provider
 processes, and other clients.
 
 A second Enter on the typed confirmation consumes the fixed private preview
-once and starts the existing finite job. Show its scope, progress, per-target
-results, and completion summary inline with the conversation list. Poll only
+once and starts the existing finite job. Keep the page scope in the prompt;
+show concise progress and skipped/failed counts in the control row with the
+conversation list visible. Per-target records stay in the private job. Poll only
 while preparation, the finite job, or the picker's existing bounded refresh requires it.
 Escape before confirmation has no session effects; afterward it hides the
 picker while the confirmed job finishes. One batch runs at a time per endpoint.
