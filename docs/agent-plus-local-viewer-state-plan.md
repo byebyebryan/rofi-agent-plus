@@ -8,6 +8,10 @@ The operator approved the recommended Open? wording, both-picker scope,
 bulk inventory enrichment, and retained action guards. Implementation and
 deployment acceptance are recorded separately from this design approval.
 
+The proposed [picker UI rework](agent-plus-picker-ui-rework-plan.md) uses this
+foundation for shaded state labels and an Open page in Agent Plus. Those
+presentation changes remain a follow-up proposal.
+
 The pickers should distinguish a running session with a viewer on the current
 machine from a running session without one. Tmux Plus owns detection and its
 public result. Agent Plus combines that result with provider activity. Both

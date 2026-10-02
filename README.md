@@ -349,6 +349,11 @@ The [batch session actions plan](docs/agent-plus-batch-session-actions-plan.md)
 records the Close/Resume safeguards and release boundaries; Kill all remains
 outside the current action set.
 
+The proposed [picker UI rework](docs/agent-plus-picker-ui-rework-plan.md)
+records compact state styling, an Open subset beside Active, and a group
+scope limited to open sessions. It is a design for review, not deployed
+picker behavior.
+
 The [session client exploration](docs/agent-plus-session-client-exploration.md)
 and its linked feasibility studies record possible future presentation work.
 They do not change the current picker or its public contracts.
