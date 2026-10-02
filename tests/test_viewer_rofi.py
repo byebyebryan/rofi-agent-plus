@@ -12,7 +12,7 @@ from unittest import mock
 from rofi_agent_plus import rofi
 from rofi_agent_plus.cache import CacheStore, PresentationContext
 from rofi_agent_plus.config import PickerConfig
-from rofi_agent_plus.contract_backend import ContractBackend, parse_mesh
+from rofi_agent_plus.contract_backend import ContractBackend, _tmux_reference, parse_mesh
 from rofi_agent_plus.view_preferences import ViewPreference, ViewPreferenceStore
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contract"
@@ -46,12 +46,8 @@ class ViewerRofiTest(unittest.TestCase):
             "contractMode": True,
             "backend": self.backend.identity,
             "tmuxProviderOptionVerified": True,
-            "tmux": {
-                key: reference[key]
-                for key in ("hostId", "serverGeneration", "sessionId", "createdAt")
-            },
+            "tmux": _tmux_reference(reference, self.backend.mesh.revision),
         }
-        self.row["tmux"]["meshRevision"] = self.backend.mesh.revision
         stages = {
             stage: {"outcome": "ok", "lastAttemptAt": 100, "lastSuccessAt": 100}
             for stage in ("codex", "claude", "opencode", "activity", "tmux")
@@ -255,7 +251,14 @@ class ViewerRofiTest(unittest.TestCase):
             "kind": "codex",
             "id": self.row["id"],
             "name": self.row["name"],
-            "reference": self.row["tmux"],
+            "reference": {
+                "hostId": self.row["hostId"],
+                "meshRevision": self.backend.mesh.revision,
+                **{
+                    key: self.row["tmux"][key]
+                    for key in ("serverGeneration", "sessionId", "createdAt")
+                },
+            },
             "requiredOption": ["@codex_thread_id", self.row["id"]],
             "mode": "open",
             "viewers": [],

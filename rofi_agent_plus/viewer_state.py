@@ -488,7 +488,14 @@ class ViewerStateStore:
                 return row
             result = dict(row)
             reference = row.get("tmux")
-            key = reference_key(reference)
+            # Provider rows carry owner identity outside their subordinate
+            # tmux record, just as the existing action path does.
+            key = (
+                reference_key({**reference, "hostId": row.get("hostId")})
+                if isinstance(reference, Mapping)
+                and reference.get("hostId", row.get("hostId")) == row.get("hostId")
+                else None
+            )
             backend = scope.get("backend")
             valid = (
                 key is not None

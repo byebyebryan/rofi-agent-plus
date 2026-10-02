@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from rofi_agent_plus import viewer_state as viewers
+from rofi_agent_plus.contract_backend import _tmux_reference
 
 BACKEND = {
     "kind": "contract",
@@ -51,7 +52,7 @@ def snapshot() -> dict[str, object]:
         "id": "conversation",
         "active": True,
         "sourceObservation": "current",
-        "tmux": {**REFERENCE, "meshRevision": BACKEND["meshRevision"]},
+        "tmux": _tmux_reference(REFERENCE, BACKEND["meshRevision"]),
     }
     return {
         "backend": dict(BACKEND),
@@ -90,6 +91,27 @@ class ViewerStateTest(unittest.TestCase):
             decorated["hosts"]["beta"]["sessions"][0]["localViewer"],
         )
         self.assertTrue(decorated["_viewerWatch"])
+
+    def test_outer_owner_is_part_of_full_join_and_conflicting_nested_owner_is_rejected(self):
+        self.store.ingest(inventory(), self.scope)
+        source = snapshot()
+        self.assertNotIn("hostId", source["sessions"][0]["tmux"])
+        self.assertEqual(
+            "open", self.store.decorate(source, self.scope)["sessions"][0]["localViewer"]["state"]
+        )
+        for owner in ("gamma", None, ""):
+            with self.subTest(owner=owner):
+                changed = snapshot()
+                changed["sessions"][0]["hostId"] = owner
+                self.assertEqual(
+                    "unknown",
+                    self.store.decorate(changed, self.scope)["sessions"][0]["localViewer"]["state"],
+                )
+        source["sessions"][0]["tmux"]["hostId"] = "gamma"
+        self.assertEqual(
+            "association_unknown",
+            self.store.decorate(source, self.scope)["sessions"][0]["localViewer"]["reason"],
+        )
 
     def test_full_reference_context_and_freshness_gate_positive_state(self) -> None:
         self.store.ingest(inventory(), self.scope)
