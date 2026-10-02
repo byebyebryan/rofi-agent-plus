@@ -67,6 +67,15 @@ def diagnostic_main(argv: Sequence[str] | None = None) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    if argv and argv[0] == "_viewer-refresh":
+        if len(argv) != 2:
+            print("rofi-agent-plus: invalid viewer helper invocation", file=sys.stderr)
+            return 2
+        try:
+            CacheStore().refresh_viewers(load_config(), argv[1])
+            return 0
+        except (ConfigError, engine.PickerError, OSError):
+            return 1
     # Both finite helpers use explicit CLI branches. Their spawner removes
     # every ROFI_* variable so a native parent cannot route them through Rofi.
     if argv and argv[0] in {"_batch-worker", "_batch-prepare"}:

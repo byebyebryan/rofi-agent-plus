@@ -440,6 +440,22 @@ class ViewerStateStore:
     def ingest(self, inventory: Mapping[str, object], scope: Mapping[str, object]) -> bool:
         """Take a normal bulk refresh without replacing a newer observation/request."""
         record = observations_from_inventory(inventory, scope)
+        return self._ingest_record(record)
+
+    def ingest_failure(self, scope: Mapping[str, object], observed_at: int) -> bool:
+        if not _valid_scope(scope) or not _integer(observed_at):
+            return False
+        return self._ingest_record(
+            {
+                "version": 1,
+                "scope": dict(scope),
+                "observedAt": observed_at,
+                "rows": [],
+                "error": "refresh_failed",
+            }
+        )
+
+    def _ingest_record(self, record: Mapping[str, object]) -> bool:
         with self._locked():
             previous = self._read(self.snapshot_path)
             request = self.pending()
@@ -450,7 +466,9 @@ class ViewerStateStore:
             ) or (request is not None and request["requestedAt"] > record["observedAt"]):
                 return False
             self._write(self.snapshot_path, record)
-            if request is not None and request.get("scope") == dict(scope):
+            if request is not None:
+                # This normal observation is newer than the request, even
+                # when authority/desktop changed while its helper was running.
                 self.request_path.unlink(missing_ok=True)
             return True
 

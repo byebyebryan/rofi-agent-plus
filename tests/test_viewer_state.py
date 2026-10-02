@@ -144,6 +144,7 @@ class ViewerStateTest(unittest.TestCase):
     def test_request_is_deduplicated_and_late_publication_is_rejected(self) -> None:
         def command(identifier: str) -> list[str]:
             return ["fixture", "_viewer-refresh", identifier]
+
         with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
             with mock.patch.dict(os.environ, {"ROFI_RETV": "1", "ROFI_DATA": "private"}):
                 self.assertTrue(self.store.request(self.scope, command))
@@ -223,6 +224,21 @@ class ViewerStateTest(unittest.TestCase):
         self.store.snapshot_path.write_text('{"version":1,"version":1}\n')
         self.store.snapshot_path.chmod(0o600)
         self.assertIsNone(self.store.current(self.scope))
+
+    def test_new_normal_scope_supersedes_old_helper_and_failures_respect_newer_requests(
+        self,
+    ) -> None:
+        self.store.request(self.scope, lambda _identifier: [], spawn=False)
+        old = self.store.pending(self.scope)
+        newer_scope = {**self.scope, "desktop": "c" * 64}
+        self.clock.return_value = 2_000
+        self.assertTrue(self.store.ingest(inventory(observed_at=2_000), newer_scope))
+        self.assertFalse(self.store.publish(old["requestId"], self.scope, error="failed"))
+        self.assertEqual(2_000, self.store.current(newer_scope)["observedAt"])
+        self.assertFalse(self.store.ingest_failure(self.scope, 1_000))
+        self.clock.return_value = 12_000
+        self.store.request(newer_scope, lambda _identifier: [], spawn=False)
+        self.assertFalse(self.store.ingest_failure(newer_scope, 11_999))
 
 
 if __name__ == "__main__":

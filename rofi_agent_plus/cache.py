@@ -16,10 +16,13 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import engine
 from .config import PickerConfig
+
+if TYPE_CHECKING:
+    from .viewer_state import ViewerStateStore
 
 # v4 adds private refresh-observation provenance.  A Host Mesh revision (or
 # the explicit local-only ``null`` identity) remains part of cache validity.
@@ -1055,6 +1058,74 @@ class CacheStore:
         context = context or self.presentation_context(config)
         return {"fingerprint": config.fingerprint, "backend": context.backend}
 
+    def viewer_store(self) -> ViewerStateStore:
+        from .viewer_state import ViewerStateStore
+
+        return ViewerStateStore(self.root / "viewer-state")
+
+    def viewer_scope(
+        self, config: PickerConfig, context: PresentationContext
+    ) -> dict[str, object] | None:
+        from .contract_backend import ContractBackend
+        from .viewer_state import make_scope
+
+        selected = context.selected
+        if not isinstance(selected, ContractBackend) or selected.mesh is None:
+            return None
+        return make_scope(config.fingerprint, context.backend, selected.mesh.local.host_id)
+
+    def refresh_viewers(self, config: PickerConfig, request_id: str) -> bool:
+        """Run the finite viewer helper without touching provider discovery/cache."""
+        from .contract_backend import ContractBackend
+        from .viewer_state import desktop_context, make_scope
+
+        viewers = self.viewer_store()
+        pending = viewers.pending()
+        if pending is None or pending.get("requestId") != request_id:
+            return False
+        expected = pending["scope"]
+        deadline = time.monotonic() + 25.0
+        try:
+            selected, identity = self._select_backend(deadline=deadline)
+            if not isinstance(selected, ContractBackend) or selected.mesh is None:
+                return False
+            scope = make_scope(config.fingerprint, identity, selected.mesh.local.host_id)
+            if scope != expected:
+                return False
+            inventory = selected.viewer_inventory()
+            current, current_identity = self._select_backend(deadline=deadline)
+            if not isinstance(current, ContractBackend) or current.mesh is None:
+                return False
+            current_scope = make_scope(
+                config.fingerprint, current_identity, current.mesh.local.host_id
+            )
+            if current_scope != scope or selected.viewer_inventory_desktop != scope["desktop"]:
+                return False
+            return viewers.publish(request_id, scope, inventory)
+        except (engine.PickerError, OSError, ValueError):
+            if desktop_context() != expected.get("desktop"):
+                return False
+            return viewers.publish(request_id, expected, error="refresh_failed")
+
+    def _ingest_viewers(self, config: PickerConfig, selected: object) -> None:
+        from .contract_backend import ContractBackend
+        from .viewer_state import make_scope
+
+        if not isinstance(selected, ContractBackend) or selected.mesh is None:
+            return
+        try:
+            scope = make_scope(config.fingerprint, selected.identity, selected.mesh.local.host_id)
+            if selected.viewer_inventory_desktop != scope["desktop"]:
+                return
+            viewers = self.viewer_store()
+            if selected.viewer_inventory_result is not None:
+                viewers.ingest(selected.viewer_inventory_result, scope)
+            elif selected.viewer_inventory_started_at is not None:
+                viewers.ingest_failure(scope, selected.viewer_inventory_started_at)
+        except (engine.PickerError, OSError, ValueError):
+            # This optional display cache never makes valid provider facts fail.
+            pass
+
     def age(self, snapshot: Mapping[str, Any] | None, now: float | None = None) -> float:
         if not snapshot:
             return float("inf")
@@ -1325,6 +1396,8 @@ class CacheStore:
                                 _require_complete_contract_transaction(authority_changed)
                             return authority_changed
                     self.write(snapshot)
+                    if uses_selected_backend:
+                        self._ingest_viewers(config, selected_backend)
                     backend = _backend_identity(snapshot.get("backend"))
                     self._last_refresh_scope = (
                         {"fingerprint": config.fingerprint, "backend": backend}

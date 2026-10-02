@@ -1050,8 +1050,10 @@ def _composite_results(
     )
 
 
-def _inventory_args(tmux_command: str, mesh: Mesh) -> list[str]:
+def _inventory_args(tmux_command: str, mesh: Mesh, *, with_viewers: bool = False) -> list[str]:
     argv = [tmux_command, "inventory", "--json", "--panes"]
+    if with_viewers:
+        argv.append("--with-viewers")
     if mesh.revision is not None:
         argv.extend(("--mesh-revision", mesh.revision))
     for host in mesh.hosts:
@@ -1434,6 +1436,9 @@ class ContractBackend:
         self._reported_hints: set[tuple[str, str, str]] = set()
         self._report_flights: dict[tuple[str, str, str], _ReportFlight] = {}
         self._stream_deadline: float | None = None
+        self.viewer_inventory_result: Mapping[str, object] | None = None
+        self.viewer_inventory_desktop: str | None = None
+        self.viewer_inventory_started_at: int | None = None
 
     @property
     def identity(self) -> dict[str, object]:
@@ -1476,6 +1481,56 @@ class ContractBackend:
         if remaining <= 0:
             raise ContractError("contract refresh timed out")
         return remaining
+
+    def _inventory_document(
+        self, mesh: Mesh, deadline: float
+    ) -> tuple[Mapping[str, object], dict[str, dict[str, object]]]:
+        from .viewer_state import desktop_context
+
+        self.viewer_inventory_result = None
+        self.viewer_inventory_desktop = desktop_context()
+        self.viewer_inventory_started_at = self._now_millis()
+        command = self._run(
+            _inventory_args(self.tmux_command, mesh, with_viewers=True),
+            timeout=min(15.0, self._remaining(deadline)),
+            stdout_limit=_MAX_INVENTORY_STDOUT,
+            stderr_limit=_MAX_STDERR,
+        )
+        if command.returncode != 0:
+            _raise_command_failure(
+                command,
+                "Tmux Session inventory",
+                limit=_MAX_INVENTORY_STDOUT,
+                validate_host_id=True,
+            )
+        payload = _json(command, "Tmux Session inventory", limit=_MAX_INVENTORY_STDOUT)
+        rows = _inventory(payload, mesh)
+        return payload, rows
+
+    def _viewer_fields(self, payload: Mapping[str, object]) -> None:
+        from .viewer_state import ViewerStateError, observation
+
+        assert self.mesh is not None
+        endpoint = payload.get("viewerEndpoint")
+        if not isinstance(endpoint, Mapping) or endpoint.get("hostId") != self.mesh.local.host_id:
+            raise ContractError("Tmux viewer inventory endpoint is invalid")
+        _nonnegative(endpoint.get("observedAt"), "viewer observedAt")
+        try:
+            for host in payload["hosts"]:
+                for row in host["sessions"]:
+                    observation(row.get("localViewer"))
+        except ViewerStateError as error:
+            raise ContractError(str(error)) from error
+
+    def viewer_inventory(self) -> Mapping[str, object]:
+        """Read one public bulk inventory without provider discovery or cache writes."""
+        if self.mesh is None:
+            self.prepare()
+        assert self.mesh is not None
+        deadline = min(self._stream_deadline or float("inf"), time.monotonic() + 15.0)
+        payload, _rows = self._inventory_document(self.mesh, deadline)
+        self._viewer_fields(payload)
+        return payload
 
     def _report(
         self,
@@ -2053,23 +2108,17 @@ class ContractBackend:
             return host.host_id, (route, codex, claude, opencode, active)
 
         def inventory_stage() -> dict[str, dict[str, object]]:
-            inventory_command = self._run(
-                _inventory_args(self.tmux_command, mesh),
-                timeout=min(15.0, self._remaining(deadline)),
-                stdout_limit=_MAX_INVENTORY_STDOUT,
-                stderr_limit=_MAX_STDERR,
-            )
-            if inventory_command.returncode != 0:
-                _raise_command_failure(
-                    inventory_command,
-                    "Tmux Session inventory",
-                    limit=_MAX_INVENTORY_STDOUT,
-                    validate_host_id=True,
-                )
-            return _inventory(
-                _json(inventory_command, "Tmux Session inventory", limit=_MAX_INVENTORY_STDOUT),
-                mesh,
-            )
+            payload, rows = self._inventory_document(mesh, deadline)
+            try:
+                self._viewer_fields(payload)
+            except ContractError:
+                # Display enrichment cannot turn valid owner facts into a
+                # provider/tmux discovery failure. The private viewer cache
+                # records uncertainty independently after this transaction.
+                pass
+            else:
+                self.viewer_inventory_result = payload
+            return rows
 
         # Inventory does not depend on provider-native results.  Start it with
         # host probes, while retaining one shared deadline and joining every
