@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.10.3` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.11.0` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -147,15 +147,21 @@ cannot enter the session open or create path.
 
 Rows use a two-line layout: the session title is primary, while a smaller
 secondary line shows the display host, shortened working directory, age, and
-active/idle state.  The provider is represented by a bundled icon; provider
-names and aliases remain in the row's filter text and invisible Rofi metadata,
+Inactive, Active, or Open state. The provider is represented by a bundled icon;
+provider names and aliases remain in the row's filter text and invisible Rofi metadata,
 so searching for `codex`, `claude`, `Claude Code`, or `opencode` still works.
 The complete session identity is carried in Rofi's `info` metadata, not parsed
 from visible text.  Session recency and activity state are independent from
 observation confidence. `Active` means a current activity probe matched a live
-provider process to that session ID; `Idle` means the probe found no matching
-process. A tmux session by itself does not establish provider activity. Rows
-with current provider and supporting evidence are ordinary; while an automatic
+provider process to that session ID; `Inactive` means the probe found no matching
+process. `Open` adds confirmed viewer presence on this machine, including a
+session owned by another host; `Open?` is a qualified legacy match. `Active · ?`
+means viewer presence is unavailable or expired. An exited provider can still
+show `Inactive · Open`; waiting launches retain `Waiting`. These labels and
+search terms come from Tmux Plus's bulk `inventory --with-viewers` observations.
+They contain no operation handles: an Open? window may still be excluded by
+the stricter Resume/Close preview guards. A tmux session or visible window by
+itself does not establish provider activity. Rows with current provider and supporting evidence are ordinary; while an automatic
 stale-cache refresh or explicit `Alt+R` check is running, current rows show
 `Checking` and retained rows show `Rechecking ·
 last seen …`.  After a check, retained provider rows show `Last known · seen
@@ -263,11 +269,11 @@ temporary file, fsync, and atomic replacement. The snapshot fingerprint
 includes the provider session limit. Snapshots also carry contract identity and
 the exact Host Mesh revision (or the explicit local-only `null` revision), so
 data from a changed authority is never rendered as current. A
-discovery-affecting configuration or authority change causes a synchronous
-refresh.
+discovery-affecting configuration or authority change invalidates that snapshot.
 
-On a cache miss, the first invocation refreshes synchronously.  A fresh cache
-renders immediately.  Cache age triggers a check but never, by itself, makes a
+On a cache miss, the picker renders an unknown initial frame and requests a
+finite background refresh. A fresh cache renders immediately. Cache age
+triggers a check but never, by itself, makes a
 row warning or `Last known`.  A stale cache renders immediately with a short
 `Checking sessions…` message and starts at most one detached refresh; explicit
 `Alt+R` starts the same background check even when the cache is fresh.  While
@@ -276,11 +282,23 @@ second.  Rows continue to come from the committed snapshot and publish
 together when the complete authority-scoped transaction is written; there is
 no resident process, push-update channel, or progressive row publication.
 Successful completion shows a bounded `Checked just now` acknowledgement,
-then polling stops and the acknowledgement clears.  A failed, stopped, or
-stalled worker stops polling and shows a visible check failure while leaving
+then provider polling stops and the acknowledgement clears. A failed, stopped, or
+stalled worker shows a visible check failure while leaving
 usable last-known rows in place.  Current refresh/provider errors are shown
 for about three seconds and then cleared automatically; the rows remain
 available throughout.
+
+Viewer observations use a separate private cache in `viewer-state/` with a
+ten-second freshness interval. Initial and timed callbacks may request one
+finite public bulk inventory helper; Tab and page changes only read cached
+observations. Viewer refreshes do not run provider discovery or rewrite provider
+timestamps. The timer continues while the picker is open, including a fresh
+provider cache and local-only mode. Unknown observations follow the same retry
+interval. Full tmux identity, endpoint desktop epoch, and Mesh revision guard
+publication; a late superseded helper cannot overwrite a newer observation.
+The shared action bar and frozen batch target lists, counts, and title tint
+remain unchanged by observation refreshes. Closing the picker leaves no recurring
+poller or daemon.
 
 The private v4 cache accepts a valid v3 snapshot in memory without rewriting it
 on read or causing a cache miss; a later legitimate cache mutation persists

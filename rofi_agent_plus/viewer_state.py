@@ -519,4 +519,6 @@ class ViewerStateStore:
                 for key, host in hosts.items()
             }
         result["_viewerWatch"] = True
+        result["_viewerObservedAt"] = record.get("observedAt") if record is not None else None
+        result["_viewerPending"] = self.pending(scope, now=now) is not None
         return result

@@ -322,7 +322,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.10.3", engine.VERSION)
+        self.assertEqual("0.11.0", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
@@ -906,7 +906,7 @@ class RofiProtocolTest(unittest.TestCase):
         display = options["display"]
         self.assertIn(f"<b>hello world</b>{ROW_SEPARATOR}", display)
         self.assertIn('<span size="smaller" alpha="75%">', display)
-        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  active", display)
+        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  Active · ?", display)
         decoded = json.loads(options["info"])
         self.assertEqual(THREAD_ID, decoded["id"])
 
@@ -949,7 +949,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertNotIn("sourceObservation", options["info"])
         self.assertNotIn("urgent", options)
         self.assertEqual("true", options["active"])
-        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  active", options["display"])
+        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  Active · ?", options["display"])
 
     def test_observation_statuses_distinguish_retained_global_failure_and_activity_only(
         self,
@@ -1166,7 +1166,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertNotIn("Claude Code", display)
         self.assertIn("Claude Code", visible)
         self.assertIn("claude claude-code claude code", meta)
-        self.assertIn("host  ·  /srv/project  ·  0s  ·  waiting", display)
+        self.assertIn("host  ·  /srv/project  ·  0s  ·  Waiting · ?", display)
 
         unsafe_secondary = session(
             kind="claude",

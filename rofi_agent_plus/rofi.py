@@ -26,6 +26,7 @@ from .view_preferences import (
     encode_last_used,
     parse_last_used,
 )
+from .viewer_state import FRESH_SECONDS
 
 ROFI_RETV_SELECTED = 1
 ROFI_RETV_CUSTOM_1 = 10
@@ -877,17 +878,49 @@ def selection_payload(session: Mapping[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _row_text(session: Mapping[str, Any], now: float | None = None) -> str:
+def _row_text(
+    session: Mapping[str, Any],
+    now: float | None = None,
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+) -> str:
     kind = str(session.get("kind") or "")
     provider = PROVIDER_LABELS.get(kind, kind.title() or "Agent")
     name = sanitize(session.get("name") or session.get("id") or "Agent")
     host = sanitize(session.get("host") or session.get("hostId") or "local")
     cwd = _shorten_cwd(session.get("cwd"))
     age = _age(session.get("recencyAt"), now)
-    activity = sanitize(
-        session.get("activityState") or ("active" if session.get("active") else "idle")
-    )
+    activity = _activity_label(session, snapshot=snapshot)
     return f"{name}  ·  {provider}  ·  {host}  ·  {cwd}  ·  {age}  ·  {activity}"
+
+
+def _activity_label(
+    session: Mapping[str, Any], *, snapshot: Mapping[str, Any] | None = None
+) -> str:
+    if (
+        session.get("sourceObservation") == "retained"
+        or session.get("activityState") == "unknown"
+        or _observation_failed(_stage_observation(snapshot, session, "activity"))
+        or _refresh_outcome(snapshot) == "failed"
+    ):
+        return "Activity unknown"
+    viewer = session.get("localViewer")
+    state = viewer.get("state") if isinstance(viewer, Mapping) else "unknown"
+    confidence = viewer.get("confidence") if isinstance(viewer, Mapping) else None
+    opened = (
+        "Open"
+        if state == "open" and confidence == "confirmed"
+        else "Open?"
+        if state == "open" and confidence == "matched"
+        else None
+    )
+    known_none = state == "none"
+    activity = session.get("activityState")
+    if activity == "waiting":
+        return "Waiting" + (" · " + opened if opened else "" if known_none else " · ?")
+    if session.get("active"):
+        return opened or ("Active" if known_none else "Active · ?")
+    return "Inactive" + (" · " + opened if opened else "" if known_none else " · ?")
 
 
 def _refresh_outcome(snapshot: Mapping[str, Any] | None) -> str | None:
@@ -998,9 +1031,7 @@ def _row_display(
     host = sanitize(session.get("host") or session.get("hostId") or "local")
     cwd = _shorten_cwd(session.get("cwd"))
     age = _age(session.get("recencyAt"), now)
-    activity = sanitize(
-        session.get("activityState") or ("active" if session.get("active") else "idle")
-    )
+    activity = _activity_label(session, snapshot=snapshot)
     secondary_parts = [host, cwd, age, activity]
     status, _, _ = _row_observation(
         session,
@@ -1399,10 +1430,14 @@ def render_snapshot(
     inline_batch = batch_state is not None
     effective_message = _action_message(action, "" if inline_batch else notice_message)
     headers.append(_protocol("message", effective_message))
+    watching_viewers = isinstance(snapshot, Mapping) and snapshot.get("_viewerWatch") is True
+    if watching_viewers:
+        timeout = True
     if timeout is not None:
         if timeout:
             if (
                 not polling_batch
+                and not watching_viewers
                 and refresh_deadline is None
                 and error_deadline is None
                 and check_deadline is None
@@ -1418,6 +1453,18 @@ def render_snapshot(
                 timeout_delay = max(1, math.ceil(check_deadline - time.time()))
             else:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
+            if watching_viewers:
+                observed = snapshot.get("_viewerObservedAt")
+                viewer_delay = (
+                    max(1, math.ceil(observed / 1000 + FRESH_SECONDS - time.time()))
+                    if type(observed) is int and snapshot.get("_viewerPending") is not True
+                    else AUTO_REFRESH_POLL_SECONDS
+                )
+                timeout_delay = (
+                    min(timeout_delay, viewer_delay)
+                    if polling_batch or refresh_deadline or error_deadline or check_deadline
+                    else viewer_delay
+                )
         else:
             timeout_delay = 0
         headers.append(_protocol("theme", _timeout_theme(timeout_delay)))
@@ -1496,16 +1543,16 @@ def render_snapshot(
     else:
         active_count = len(_group_sessions(snapshot, navigation))
         root_label = f"All active sessions ({active_count})"
-        rendered_rows.append(
-            root_label
-            + _row_options(
-                (
-                    ("info", json.dumps({"type": "batch"}, separators=(",", ":"))),
-                    ("meta", "all active sessions"),
-                    ("display", _pango_escape(root_label)),
-                )
-            )
-        )
+        control_options = [
+            ("info", json.dumps({"type": "batch"}, separators=(",", ":"))),
+            ("meta", "all active sessions"),
+            ("display", _pango_escape(root_label)),
+        ]
+        if checking and (snapshot is None or snapshot.get("generatedAt") == 0):
+            # No authority exists yet. Keep the loading frame inert so its
+            # sole control cannot become a sticky batch selection on refresh.
+            control_options.append(("nonselectable", "true"))
+        rendered_rows.append(root_label + _row_options(control_options))
         target_membership, unmatched_targets = set(), []
     for session in rows:
         kind = str(session.get("kind") or "")
@@ -1528,6 +1575,7 @@ def render_snapshot(
                 ),
                 PROVIDER_LABELS[kind],
                 PROVIDER_SEARCH_TERMS[kind],
+                _activity_label(session, snapshot=snapshot),
             )
         )
         options: list[tuple[str, object]] = [
@@ -1557,7 +1605,7 @@ def render_snapshot(
             options.append(("active", "true"))
         if row_urgent:
             options.append(("urgent", "true"))
-        rendered_rows.append(_row_text(session, now) + _row_options(options))
+        rendered_rows.append(_row_text(session, now, snapshot=snapshot) + _row_options(options))
         emitted += 1
 
     for card in unmatched_targets:
@@ -1859,9 +1907,61 @@ def _presentation_snapshot(
     boundary.
     """
 
+    snapshot = (
+        store.load_current(config, context)
+        if context is not None
+        else store.load(config.fingerprint)
+    )
+    return _decorate_viewers(store, config, snapshot, context)
+
+
+def _viewer_scope(
+    store: CacheStore,
+    config: PickerConfig,
+    snapshot: Mapping[str, Any] | None,
+    context: PresentationContext | None = None,
+) -> Mapping[str, object] | None:
+    from .viewer_state import make_scope
+
+    if not callable(getattr(store, "viewer_store", None)):
+        return None
     if context is not None:
-        return store.load_current(config, context)
-    return store.load(config.fingerprint)
+        scope = store.viewer_scope(config, context)
+        return scope if isinstance(scope, Mapping) else None
+    if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("backend"), Mapping):
+        return None
+    local = next((host for host in _host_catalog(snapshot) if host.get("local") is True), None)
+    if local is None or snapshot["backend"].get("kind") != "contract":
+        return None
+    return make_scope(config.fingerprint, snapshot["backend"], local["hostId"])
+
+
+def _decorate_viewers(
+    store: CacheStore,
+    config: PickerConfig,
+    snapshot: Mapping[str, Any] | None,
+    context: PresentationContext | None = None,
+) -> Mapping[str, Any] | None:
+    if snapshot is None:
+        return None
+    try:
+        scope = _viewer_scope(store, config, snapshot, context)
+        return store.viewer_store().decorate(snapshot, scope) if scope is not None else snapshot
+    except (engine.PickerError, OSError, ValueError):
+        return snapshot
+
+
+def _request_viewers(
+    store: CacheStore, config: PickerConfig, context: PresentationContext | None
+) -> None:
+    try:
+        scope = _viewer_scope(store, config, None, context)
+        if scope is None or _background_active(store, _refresh_scope(store, config, context)):
+            return
+        command = _background_command()[:-2]
+        store.viewer_store().request(scope, lambda request: [*command, "_viewer-refresh", request])
+    except (engine.PickerError, OSError, ValueError):
+        pass
 
 
 def _refresh_scope(
@@ -1974,11 +2074,17 @@ def _auto_refresh_callback(
 ) -> str:
     """Inspect cache state for the timeout callback without doing discovery."""
 
+    _request_viewers(store, config, context)
+
     rofi_data = environ.get("ROFI_DATA")
     continuation_state = _parse_continuation_state(rofi_data)
     navigation = continuation_state.navigation
     raw_selection = environ.get("ROFI_INFO")
     selected_identity = _parse_selected_identity(raw_selection)
+    if not raw_selection:
+        # An inert cold frame has no native selection yet. Restore the saved
+        # conversation once its finite provider refresh supplies real rows.
+        selected_identity = continuation_state.last_used
     selected_control = _parse_batch_row(raw_selection)
     preserve_batch_control = (
         selected_control is not None and selected_control.get("type") == "batch"
@@ -3067,6 +3173,8 @@ def run_rofi(
 
     batch_state_store = batch_state_store or batch.BatchStateStore()
     if continuation_state.batch_state is not None:
+        if retv == ROFI_RETV_CUSTOM_19:
+            _request_viewers(store, config, _presentation_context(store, config))
         try:
             rendered = _handle_batch_screen(
                 environ,
@@ -3688,9 +3796,48 @@ def run_rofi(
         return 0
     polling = False
     refresh_deadline = None
+    if retv == 0 and snapshot is not None and store.is_fresh(snapshot, config.refresh_seconds):
+        _request_viewers(store, config, context)
+        snapshot = _decorate_viewers(store, config, snapshot, context)
     if snapshot is None:
+        scope = _viewer_scope(store, config, None, context)
+        if scope is not None:
+            # An unknown initial frame is enough while the ordinary finite
+            # provider refresh supplies both session and viewer observations.
+            mesh = context.selected.mesh
+            snapshot = {
+                "backend": dict(context.backend),
+                "generatedAt": 0,
+                "sessions": [],
+                "hosts": {},
+                "errors": [],
+                "hostCatalog": [
+                    {"hostId": host.host_id, "display": host.display, "local": host.local}
+                    for host in mesh.hosts
+                ],
+            }
+            snapshot = _decorate_viewers(store, config, snapshot, context)
+            polling, refresh_deadline = _start_background_refresh(
+                store, _refresh_scope(store, config, context)
+            )
+            print(
+                emit_snapshot(
+                    snapshot,
+                    message="Checking sessions…"
+                    if polling
+                    else "Unable to start background refresh",
+                    timeout=polling,
+                    refresh_deadline=refresh_deadline,
+                    checking=polling,
+                    navigation=navigation,
+                    action=action,
+                ),
+                end="",
+            )
+            return 0
         try:
             snapshot = store.refresh(config, context=context) if context else store.refresh(config)
+            snapshot = _decorate_viewers(store, config, snapshot, context)
         except Exception as exc:  # noqa: BLE001 - initial refresh boundary
             print(
                 emit_error(

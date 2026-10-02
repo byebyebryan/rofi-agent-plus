@@ -2,7 +2,8 @@
 
 Date: 2026-10-02
 
-Status: accepted on 2026-10-02 for implementation with worker-goal-loop.
+Status: implemented for Agent Plus 0.11.0 and Tmux Plus 0.5.0 after acceptance
+on 2026-10-02 with worker-goal-loop.
 The operator approved the recommended Open? wording, both-picker scope,
 bulk inventory enrichment, and retained action guards. Implementation and
 deployment acceptance are recorded separately from this design approval.
@@ -13,7 +14,7 @@ public result. Agent Plus combines that result with provider activity. Both
 pickers use short status text while continuing to manage ordinary tmux sessions
 through explicit user actions.
 
-## Current behavior and evidence
+## Baseline behavior and evidence
 
 The selected baseline is Agent Plus `0.10.3` and Tmux Plus `0.4.0`. Current
 deployment evidence remains in the managed `docs/rofi-plus-status.md`.
@@ -182,19 +183,19 @@ use the public executable through PATH and the managed exact release tuple.
 
 ## Refresh and cache behavior
 
-The first picker frame uses its private presentation cache. It runs no new
-viewer subprocess and no per-row remote request. View changes and Tab remain
-cache-only operations.
+The first picker frame uses its private presentation cache or an unknown initial
+frame. It runs no synchronous viewer scan and no per-row remote request.
+View changes and Tab remain cache-only operations.
 
 Collect viewer observations in ordinary background inventory refreshes. On a
 new picker launch, request a finite background Tmux inventory enrichment when
-viewer data is missing or older than a proposed ten-second freshness window,
+viewer data is missing or older than the ten-second freshness window,
 even if provider history remains fresh. Reuse an in-flight compatible inventory
 refresh rather than starting another. If only viewer data needs updating, use
 the same Tmux bulk command without re-running provider discovery. The helper
 updates viewer observations only for exact references still associated with
-the current provider snapshot. Merge under the cache's lock without replacing
-provider observations or their timestamps from an older helper snapshot.
+the current provider snapshot. Merge under the private viewer cache's lock without
+replacing provider observations or their timestamps from an older helper snapshot.
 
 While the dialog remains open, existing timed callbacks display completion and
 can request a refresh after the same freshness interval. They do not run a
