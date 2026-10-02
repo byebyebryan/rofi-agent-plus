@@ -28,6 +28,8 @@ from .cache import cache_root
 from .wire import WireError, decode_document
 
 FRESH_SECONDS = 10
+# Leave time for the finite helper and the one-second completion callback.
+REFRESH_SECONDS = 7
 REQUEST_SECONDS = 30
 MAX_BYTES = 1024 * 1024
 MAX_ROWS = 128 * 256
@@ -263,6 +265,17 @@ def _valid_record(record: object) -> bool:
     return True
 
 
+def _refresh_at(record: Mapping[str, Any]) -> int:
+    # An all-Unknown observation (including failed helpers) retains the full
+    # retry interval. Known observations renew before their strict expiry.
+    interval = (
+        REFRESH_SECONDS
+        if any(row["viewer"]["state"] != "unknown" for row in record["rows"])
+        else FRESH_SECONDS
+    )
+    return record["observedAt"] + interval * 1000
+
+
 class ViewerStateStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root if root is not None else cache_root() / "viewer-state"
@@ -377,9 +390,11 @@ class ViewerStateStore:
         if not _valid_scope(scope):
             raise ViewerStateError("Viewer observation scope is unavailable")
         with self._locked():
-            if self.current(scope) is not None:
+            now = _millis()
+            record = self.current(scope, now=now)
+            if record is not None and now < _refresh_at(record):
                 return False
-            if self.pending(scope) is not None:
+            if self.pending(scope, now=now) is not None:
                 return True
             request_id = secrets.token_hex(16)
             self._write(
@@ -388,7 +403,7 @@ class ViewerStateStore:
                     "version": 1,
                     "requestId": request_id,
                     "scope": dict(scope),
-                    "requestedAt": _millis(),
+                    "requestedAt": now,
                 },
             )
         if spawn:
@@ -527,5 +542,6 @@ class ViewerStateStore:
             }
         result["_viewerWatch"] = True
         result["_viewerObservedAt"] = record.get("observedAt") if record is not None else None
+        result["_viewerRefreshAt"] = _refresh_at(record) if record is not None else None
         result["_viewerPending"] = self.pending(scope, now=now) is not None
         return result

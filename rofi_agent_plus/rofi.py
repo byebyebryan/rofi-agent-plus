@@ -26,7 +26,6 @@ from .view_preferences import (
     encode_last_used,
     parse_last_used,
 )
-from .viewer_state import FRESH_SECONDS
 
 ROFI_RETV_SELECTED = 1
 ROFI_RETV_CUSTOM_1 = 10
@@ -1454,10 +1453,10 @@ def render_snapshot(
             else:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
             if watching_viewers:
-                observed = snapshot.get("_viewerObservedAt")
+                refresh_at = snapshot.get("_viewerRefreshAt")
                 viewer_delay = (
-                    max(1, math.ceil(observed / 1000 + FRESH_SECONDS - time.time()))
-                    if type(observed) is int and snapshot.get("_viewerPending") is not True
+                    max(1, math.ceil(refresh_at / 1000 - time.time()))
+                    if type(refresh_at) is int and snapshot.get("_viewerPending") is not True
                     else AUTO_REFRESH_POLL_SECONDS
                 )
                 timeout_delay = (

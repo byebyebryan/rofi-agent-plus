@@ -189,7 +189,7 @@ View changes and Tab remain cache-only operations.
 
 Collect viewer observations in ordinary background inventory refreshes. On a
 new picker launch, request a finite background Tmux inventory enrichment when
-viewer data is missing or older than the ten-second freshness window,
+viewer data is missing or due for renewal,
 even if provider history remains fresh. Reuse an in-flight compatible inventory
 refresh rather than starting another. If only viewer data needs updating, use
 the same Tmux bulk command without re-running provider discovery. The helper
@@ -198,9 +198,13 @@ the current provider snapshot. Merge under the private viewer cache's lock witho
 replacing provider observations or their timestamps from an older helper snapshot.
 
 While the dialog remains open, existing timed callbacks display completion and
-can request a refresh after the same freshness interval. They do not run a
-synchronous window scan on cursor movement. These are finite refresh processes
-with existing owner/deadline controls; closing the picker leaves no recurring
+renew known observations after seven seconds, leaving three seconds for the
+finite helper and completion callback before the strict ten-second expiry.
+The still-current observation remains visible while renewal runs. All-Unknown
+and failed observations retry after ten seconds. Slow or failed renewals still
+become Unknown; renewal never extends an old observation's validity. Callbacks
+do not run a synchronous window scan on cursor movement. These are finite
+refresh processes with existing owner/deadline controls; closing the picker leaves no recurring
 poller. A running read-only refresh can finish without viewer effects.
 
 Key private observations by endpoint desktop context, Mesh revision, and the

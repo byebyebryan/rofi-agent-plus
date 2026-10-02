@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.11.1` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.11.2` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -289,13 +289,15 @@ for about three seconds and then cleared automatically; the rows remain
 available throughout.
 
 Viewer observations use a separate private cache in `viewer-state/` with a
-ten-second freshness interval. Initial and timed callbacks may request one
-finite public bulk inventory helper; Tab and page changes only read cached
-observations. Viewer refreshes do not run provider discovery or rewrite provider
+ten-second freshness interval. Known observations renew after seven seconds,
+keeping their current labels while the finite helper runs. Observations still
+expire at ten seconds if the helper is slow. Initial and timed callbacks may
+request one finite public bulk inventory helper; Tab and page changes only read
+cached observations. Viewer refreshes do not run provider discovery or rewrite provider
 timestamps. The timer continues while the picker is open, including a fresh
-provider cache and local-only mode. Unknown observations follow the same retry
-interval. Full tmux identity, endpoint desktop epoch, and Mesh revision guard
-publication; a late superseded helper cannot overwrite a newer observation.
+provider cache and local-only mode. All-Unknown and failed observations retain
+the ten-second retry interval. Full tmux identity, endpoint desktop epoch, and
+Mesh revision guard publication; a late superseded helper cannot overwrite a newer observation.
 The shared action bar and frozen batch target lists, counts, and title tint
 remain unchanged by observation refreshes. Closing the picker leaves no recurring
 poller or daemon.

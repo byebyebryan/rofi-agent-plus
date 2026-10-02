@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -101,7 +102,10 @@ class ViewerRofiTest(unittest.TestCase):
         return self.header(frame, "data")
 
     def publish(self):
-        self.inventory["viewerEndpoint"] = {"hostId": "alpha", "observedAt": 100_000}
+        self.inventory["viewerEndpoint"] = {
+            "hostId": "alpha",
+            "observedAt": self.millis.return_value,
+        }
         self.inventory["hosts"][0]["sessions"][0]["localViewer"] = {
             "state": "open",
             "confidence": "confirmed",
@@ -202,6 +206,92 @@ class ViewerRofiTest(unittest.TestCase):
             self.callback(rofi.ROFI_RETV_CUSTOM_19, ROFI_DATA=self.data(timed))
             spawn.assert_called_once()
         self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
+
+    def test_native_timer_renews_open_across_multiple_helper_cycles(self):
+        self.publish()
+        now = 100.0
+        with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
+            frame = self.callback(0)
+            spawn.assert_not_called()
+            message = self.header(frame, "message")
+            for cycle in range(3):
+                delay = int(re.search(r"delay: (\d+);", self.header(frame, "theme"))[1])
+                self.assertEqual(7, delay)
+                now += delay
+                self.clock.return_value = now
+                self.millis.return_value = int(now * 1000)
+                # The timer starts the helper before expiry. Polling it again
+                # does not spawn another or discard the still-current Open.
+                for elapsed in (0, 1):
+                    self.clock.return_value = now + elapsed
+                    self.millis.return_value = int((now + elapsed) * 1000)
+                    frame = self.callback(
+                        rofi.ROFI_RETV_CUSTOM_19,
+                        ROFI_DATA=self.data(frame),
+                        ROFI_INFO=rofi.selection_payload(self.row),
+                    )
+                    self.assertIn("Open", frame)
+                    self.assertNotIn("Active · ?", frame)
+                    self.assertEqual(message, self.header(frame, "message"))
+                    self.assertIn("\x00new-selection\x1f1", frame)
+                    self.assertIn("\x00keep-filter\x1ftrue", frame)
+                    self.assertIn("delay: 1;", self.header(frame, "theme"))
+                    self.assertEqual(cycle + 1, spawn.call_count)
+                # A real helper can publish between integer-second callbacks.
+                self.clock.return_value = now + 1.75
+                self.millis.return_value = int((now + 1.75) * 1000)
+                self.publish()
+                now += 2
+                self.clock.return_value = now
+                self.millis.return_value = int(now * 1000)
+                frame = self.callback(
+                    rofi.ROFI_RETV_CUSTOM_19,
+                    ROFI_DATA=self.data(frame),
+                    ROFI_INFO=rofi.selection_payload(self.row),
+                )
+                self.assertIn("Open", frame)
+                self.assertNotIn("Active · ?", frame)
+                self.assertEqual(message, self.header(frame, "message"))
+                self.assertEqual(cycle + 1, spawn.call_count)
+        self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
+
+    def test_early_helper_does_not_extend_expiry_or_retain_open_after_failure(self):
+        self.publish()
+        with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
+            for now, label in ((107, "Open"), (109, "Open"), (110, "Active · ?")):
+                self.clock.return_value = now
+                self.millis.return_value = now * 1000
+                frame = self.callback(rofi.ROFI_RETV_CUSTOM_19)
+                self.assertIn(label, frame)
+                spawn.assert_called_once()
+            viewers = self.store.viewer_store()
+            pending = viewers.pending(self.scope)
+            self.assertTrue(
+                viewers.publish(pending["requestId"], self.scope, error="fixture_failure")
+            )
+            frame = self.callback(rofi.ROFI_RETV_CUSTOM_19)
+            self.assertIn("Active · ?", frame)
+            self.assertIn("delay: 10;", self.header(frame, "theme"))
+            spawn.assert_called_once()
+        self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
+
+    def test_all_unknown_inventory_retains_ten_second_retry_cadence(self):
+        self.publish()
+        self.inventory["hosts"][0]["sessions"][0]["localViewer"] = {"state": "unknown"}
+        self.assertTrue(self.store.viewer_store().ingest(self.inventory, self.scope))
+        with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
+            frame = self.callback(0)
+            self.assertIn("delay: 10;", self.header(frame, "theme"))
+            for now in (107, 109):
+                self.clock.return_value = now
+                self.millis.return_value = now * 1000
+                frame = self.callback(rofi.ROFI_RETV_CUSTOM_19, ROFI_DATA=self.data(frame))
+                self.assertIn("Active · ?", frame)
+                spawn.assert_not_called()
+            self.clock.return_value = 110
+            self.millis.return_value = 110_000
+            self.callback(rofi.ROFI_RETV_CUSTOM_19, ROFI_DATA=self.data(frame))
+            spawn.assert_called_once()
 
     def test_failed_observation_has_ten_second_retry_cadence(self):
         self.store.viewer_store().request(self.scope, lambda identifier: [], spawn=False)
