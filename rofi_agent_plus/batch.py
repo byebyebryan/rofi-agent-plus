@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import contract_viewers, engine
+from . import contract_viewers, engine, viewer_state
 from .cache import CacheStore, PresentationContext, cache_root
 from .config import PickerConfig, load_config
 from .contract_backend import StaleMeshError
@@ -43,6 +43,8 @@ _ACTIONS = frozenset({ACTION_CLOSE, ACTION_RESUME})
 _ID = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,255}\Z", re.ASCII)
 _PROVIDERS = frozenset({"codex", "claude", "opencode"})
+_VIEWS = frozenset({"active", "open", "all", "local", "host"})
+_DESKTOP = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _MAX_STATE_BYTES = 16 * 1024 * 1024
 _MAX_TARGETS = 12_000
 _MAX_RESULTS = _MAX_TARGETS
@@ -75,6 +77,40 @@ class BatchBusy(BatchError):
 class Scope:
     view: str
     host_id: str | None = None
+    viewer_desktop: str | None = None
+
+
+def _valid_scope(scope: Scope) -> bool:
+    return (
+        isinstance(scope.view, str)
+        and scope.view in _VIEWS
+        and (
+            isinstance(scope.host_id, str) and bool(_HOST_ID.fullmatch(scope.host_id))
+            if scope.view == "host"
+            else scope.host_id is None
+        )
+        and (
+            scope.viewer_desktop is None
+            or scope.view == "open"
+            and isinstance(scope.viewer_desktop, str)
+            and bool(_DESKTOP.fullmatch(scope.viewer_desktop))
+        )
+    )
+
+
+def _valid_open_context(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"endpointHostId", "desktop"}
+        and isinstance(value.get("endpointHostId"), str)
+        and bool(_HOST_ID.fullmatch(value["endpointHostId"]))
+        and isinstance(value.get("desktop"), str)
+        and bool(_DESKTOP.fullmatch(value["desktop"]))
+    )
+
+
+def _open_endpoint(catalog: Sequence[Mapping[str, object]]) -> str | None:
+    return next((str(host["hostId"]) for host in catalog if host.get("local") is True), None)
 
 
 def operation_targets(record: Mapping[str, object] | None) -> list[Mapping[str, object]]:
@@ -141,7 +177,7 @@ def _valid_catalog(snapshot: object) -> list[dict[str, object]]:
 def _hosts_for_scope(
     catalog: Sequence[Mapping[str, object]], scope: Scope
 ) -> tuple[str, ...] | None:
-    if scope.view in {"active", "all"}:
+    if scope.view in {"active", "open", "all"}:
         return None
     if scope.view == "local":
         local = next((item for item in catalog if item.get("local") is True), None)
@@ -160,6 +196,8 @@ def _hosts_for_scope(
 
 
 def scope_label(catalog: Sequence[Mapping[str, object]], scope: Scope) -> str:
+    if scope.view == "open":
+        return "Open · local viewers across authoritative session-owner hosts"
     if scope.view == "active":
         return "Active · all authoritative session-owner hosts"
     if scope.view == "all":
@@ -254,6 +292,8 @@ def _candidate_rows(
     catalog: Sequence[Mapping[str, object]],
     host_ids: tuple[str, ...] | None,
     identity: Mapping[str, object],
+    *,
+    open_refs: set[tuple[str, str, str, int]] | None = None,
 ) -> tuple[list[tuple[dict[str, object], str]], list[dict[str, str]]]:
     wanted_hosts = {host.casefold() for host in host_ids} if host_ids is not None else None
     candidates: list[tuple[dict[str, object], str]] = []
@@ -284,6 +324,16 @@ def _candidate_rows(
             if not active:
                 continue
             row = dict(raw)
+            if open_refs is not None:
+                raw_ref = row.get("tmux")
+                if (
+                    not isinstance(raw_ref, Mapping)
+                    or raw_ref.get("hostId", row.get("hostId")) != row.get("hostId")
+                    or raw_ref.get("meshRevision") != identity.get("meshRevision")
+                    or viewer_state.reference_key({**raw_ref, "hostId": row.get("hostId")})
+                    not in open_refs
+                ):
+                    continue
             if identity_counts[logical] > 1:
                 if logical not in reported_duplicates:
                     exclusions.append(
@@ -548,12 +598,32 @@ def build_preview(
 ) -> dict[str, object]:
     """Refresh the selected page scope and freeze eligible viewer targets."""
 
-    if action not in _ACTIONS:
-        raise BatchError("Unknown batch action")
+    if action not in _ACTIONS or not _valid_scope(scope):
+        raise BatchError("Unknown batch action or scope")
     context = store.presentation_context(config) if context is None else context
     backend = _backend_for(context)
     identity = _backend_identity(context.backend)
     catalog_before = _valid_catalog(store.load_current(config, context))
+    open_context: dict[str, str] | None = None
+    open_started_at = int(time.time() * 1000)
+    if scope.view == "open":
+        desktop = scope.viewer_desktop or viewer_state.desktop_context()
+        endpoint = _open_endpoint(catalog_before)
+        if endpoint is None or desktop != viewer_state.desktop_context():
+            raise BatchError("Open page endpoint is unavailable or changed")
+        open_context = {"endpointHostId": endpoint, "desktop": desktop}
+        if action == ACTION_RESUME:
+            # Open is already the visible subset. Never turn a display match
+            # or a disappearing window into a launch or bulk-focus operation.
+            return {
+                "action": action,
+                "backend": dict(identity),
+                "scope": scope_label(catalog_before, scope),
+                "openContext": open_context,
+                "targets": [],
+                "exclusions": [],
+                "createdAt": int(time.time()),
+            }
     host_ids = _hosts_for_scope(catalog_before, scope)
     if scope.view in {"local", "host"} and host_ids is None:
         # Without a current catalog this owner scope cannot be expanded from
@@ -587,10 +657,60 @@ def build_preview(
                 }
             ],
             "createdAt": int(time.time()),
+            **({"openContext": open_context} if open_context is not None else {}),
         }
     catalog = _valid_catalog(refreshed)
     scope_text = scope_label(catalog, scope)
-    candidates, exclusions = _candidate_rows(refreshed, catalog, host_ids, identity)
+    open_refs: set[tuple[str, str, str, int]] | None = None
+    if open_context is not None:
+        if (
+            _open_endpoint(catalog) != open_context["endpointHostId"]
+            or viewer_state.desktop_context() != open_context["desktop"]
+        ):
+            raise BatchError("Open page endpoint changed during preparation")
+        open_refs = set()
+        inventory = getattr(backend, "viewer_inventory_result", None)
+        inventory_started = getattr(backend, "viewer_inventory_started_at", None)
+        try:
+            if (
+                not isinstance(inventory, Mapping)
+                or type(inventory_started) is not int
+                or inventory_started < open_started_at
+                or getattr(backend, "viewer_inventory_desktop", None) != open_context["desktop"]
+            ):
+                raise viewer_state.ViewerStateError("Fresh local viewer observations unavailable")
+            viewer_scope = viewer_state.make_scope(
+                config.fingerprint, identity, open_context["endpointHostId"]
+            )
+            observed = viewer_state.observations_from_inventory(inventory, viewer_scope)
+            elapsed = int(time.time() * 1000) - observed["observedAt"]
+            if not 0 <= elapsed <= viewer_state.FRESH_SECONDS * 1000:
+                raise viewer_state.ViewerStateError("Local viewer observations expired")
+            for item in observed["rows"]:
+                viewer = item["viewer"]
+                if viewer.get("state") == "open" and viewer.get("confidence") in {
+                    "confirmed",
+                    "matched",
+                }:
+                    key = viewer_state.reference_key(item["sessionRef"])
+                    if key is not None:
+                        open_refs.add(key)
+        except (viewer_state.ViewerStateError, ValueError, TypeError) as error:
+            return {
+                "action": action,
+                "backend": dict(identity),
+                "scope": scope_text,
+                "openContext": open_context,
+                "targets": [],
+                "exclusions": [
+                    {"name": "Open sessions", "provider": "", "host": "", "reason": _short(error)}
+                ],
+                "createdAt": int(time.time()),
+                "stopReason": "Fresh local viewer observations unavailable",
+            }
+    candidates, exclusions = _candidate_rows(
+        refreshed, catalog, host_ids, identity, open_refs=open_refs
+    )
     if host_ids == ():
         exclusions.append(
             {
@@ -683,7 +803,10 @@ def build_preview(
         "targets": targets,
         "exclusions": exclusions[:_MAX_TARGETS],
         "createdAt": int(time.time()),
+        **({"openContext": open_context} if open_context is not None else {}),
     }
+    if open_context is not None and viewer_state.desktop_context() != open_context["desktop"]:
+        raise BatchError("Open page endpoint changed during preparation")
     if inspection_stopped:
         result["stopReason"] = "viewer protocol or authority failure stopped preview inspection"
     return result
@@ -849,7 +972,7 @@ class BatchStateStore:
         }
         if (
             not isinstance(value, Mapping)
-            or set(value) != fields
+            or set(value) - {"viewerDesktop"} != fields
             or type(value.get("version")) is not int
             or value["version"] != 1
             or not _ID.fullmatch(request_id)
@@ -857,7 +980,15 @@ class BatchStateStore:
             or not isinstance(value.get("action"), str)
             or value.get("action") not in _ACTIONS
             or not isinstance(value.get("view"), str)
-            or value.get("view") not in {"active", "all", "local", "host"}
+            or value.get("view") not in _VIEWS
+            or (
+                value["view"] == "open"
+                and (
+                    not isinstance(value.get("viewerDesktop"), str)
+                    or not _DESKTOP.fullmatch(value["viewerDesktop"])
+                )
+            )
+            or (value["view"] != "open" and "viewerDesktop" in value)
             or (
                 value["view"] == "host"
                 and (
@@ -892,16 +1023,13 @@ class BatchStateStore:
 
     def start_preparation(self, action: str, scope: Scope, *, spawn: bool = True) -> str:
         """Start one finite read-only request; a new request supersedes old results."""
-        if (
-            action not in _ACTIONS
-            or scope.view not in {"active", "all", "local", "host"}
-            or (
-                scope.view == "host"
-                and (not isinstance(scope.host_id, str) or not _HOST_ID.fullmatch(scope.host_id))
-            )
-            or (scope.view != "host" and scope.host_id is not None)
-        ):
+        if action not in _ACTIONS or not _valid_scope(scope):
             raise BatchError("Invalid preview preparation scope or action")
+        desktop = (
+            scope.viewer_desktop or viewer_state.desktop_context() if scope.view == "open" else None
+        )
+        if desktop is not None and desktop != viewer_state.desktop_context():
+            raise BatchError("Open page endpoint changed")
         request_id = secrets.token_hex(16)
         with self.locked():
             active = self._active_job_locked()
@@ -916,6 +1044,7 @@ class BatchStateStore:
                     and current["status"] == "pending"
                     and (current["action"], current["view"], current["hostId"])
                     == (action, scope.view, scope.host_id)
+                    and current.get("viewerDesktop") == desktop
                 ):
                     return str(current["requestId"])
             self.preview_path.unlink(missing_ok=True)
@@ -929,6 +1058,7 @@ class BatchStateStore:
                 "status": "pending",
                 "previewId": None,
                 "error": "",
+                **({"viewerDesktop": desktop} if desktop is not None else {}),
             }
             self._write(self.preparation_path, record)
             if spawn:
@@ -951,6 +1081,16 @@ class BatchStateStore:
             preview_id = secrets.token_hex(16)
             preview = dict(payload)
             preview.update(version=1, previewId=preview_id, createdAt=int(time.time()))
+            if current["view"] == "open":
+                open_context = preview.get("openContext")
+                if (
+                    not _valid_open_context(open_context)
+                    or open_context["desktop"] != current["viewerDesktop"]
+                    or open_context["desktop"] != viewer_state.desktop_context()
+                ):
+                    raise BatchError("Open page endpoint changed during preparation")
+            elif "openContext" in preview:
+                raise BatchError("Batch preview scope changed during preparation")
             if preview.get("action") != current["action"] or not _valid_preview_record(
                 preview, preview_id
             ):
@@ -1110,6 +1250,12 @@ class BatchStateStore:
             targets = operation_targets(preview)
             if not targets:
                 raise BatchError("Batch preview has no windows to open or close")
+            open_context = preview.get("openContext")
+            if (
+                open_context is not None
+                and open_context["desktop"] != viewer_state.desktop_context()
+            ):
+                raise BatchError("Open page endpoint changed; prepare a new preview")
             job_id = secrets.token_hex(16)
             now = int(time.time())
             job: dict[str, object] = {
@@ -1126,6 +1272,7 @@ class BatchStateStore:
                 "createdAt": now,
                 "updatedAt": now,
                 "stopReason": "",
+                **({"openContext": dict(open_context)} if open_context is not None else {}),
             }
             self._write(self.job_path, job)
             self.preparation_path.unlink(missing_ok=True)
@@ -1219,7 +1366,7 @@ def preparation_main(
         preview = build_preview(
             cache_store or CacheStore(),
             load_config(),
-            Scope(str(request["view"]), request["hostId"]),
+            Scope(str(request["view"]), request["hostId"], request.get("viewerDesktop")),
             str(request["action"]),
             is_current=is_current,
         )
@@ -1346,7 +1493,11 @@ def _valid_job_record(value: object, job_id: str) -> bool:
         "updatedAt",
         "stopReason",
     }
-    if not isinstance(value, Mapping) or set(value) != fields:
+    if not isinstance(value, Mapping) or set(value) - {"openContext"} != fields:
+        return False
+    if "openContext" in value and (
+        not _valid_open_context(value["openContext"]) or value.get("action") != ACTION_CLOSE
+    ):
         return False
     backend = value.get("backend")
     if (
@@ -1391,7 +1542,7 @@ def _valid_preview_record(value: object, preview_id: str) -> bool:
         "version",
         "previewId",
     }
-    optional = {"stopReason"}
+    optional = {"stopReason", "openContext"}
     if (
         not isinstance(value, Mapping)
         or not fields.issubset(value)
@@ -1415,6 +1566,12 @@ def _valid_preview_record(value: object, preview_id: str) -> bool:
     try:
         identity = _backend_identity(value["backend"])
     except LifecycleError:
+        return False
+    if "openContext" in value and (
+        not _valid_open_context(value["openContext"])
+        or value["action"] == ACTION_RESUME
+        and value["targets"]
+    ):
         return False
     if not all(
         _valid_target(target, str(value["action"]), identity) for target in value["targets"]
@@ -1564,6 +1721,13 @@ def _run_job_target(
     expected_identity = job.get("backend")
     if action not in _ACTIONS or not isinstance(expected_identity, Mapping):
         return "failed", "batch job has an invalid action or authority", True
+    open_context = job.get("openContext")
+    if open_context is not None and (
+        not _valid_open_context(open_context)
+        or action != ACTION_CLOSE
+        or open_context["desktop"] != viewer_state.desktop_context()
+    ):
+        return "failed", "Open page endpoint or action changed", True
     mode = target.get("mode")
     host_id = target.get("hostId")
     reference_payload = target.get("reference")
@@ -1606,6 +1770,14 @@ def _run_job_target(
                 backend = _backend_for(context)
                 if _backend_identity(context.backend) != dict(expected_identity):
                     return "skipped", "current authority changed", True
+                if open_context is not None:
+                    mesh = getattr(backend, "mesh", None)
+                    local = getattr(mesh, "local", None)
+                    if (
+                        getattr(local, "host_id", None) != open_context["endpointHostId"]
+                        or viewer_state.desktop_context() != open_context["desktop"]
+                    ):
+                        return "skipped", "Open page endpoint changed", True
                 newly_closed = contract_viewers.close_viewer(
                     backend,
                     reference,

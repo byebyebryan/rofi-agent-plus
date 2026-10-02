@@ -9,9 +9,10 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from rofi_agent_plus import batch, contract_viewers
+from rofi_agent_plus import batch, contract_viewers, viewer_state
 from rofi_agent_plus.cache import PresentationContext
 from rofi_agent_plus.config import PickerConfig
 from rofi_agent_plus.rofi import (
@@ -79,6 +80,47 @@ class FakeStore:
 
     def background_active(self, **_kwargs: object) -> bool:
         return False
+
+
+class OpenStore(FakeStore):
+    """Expose the parsed inventory produced by this exact refresh."""
+
+    def __init__(self, snapshot: dict[str, object], observations: dict[tuple[str, str], object]):
+        super().__init__(snapshot)
+        self.observations = observations
+        self.inventory_age = 0
+        self.fresh_inventory = True
+        self.context.selected.mesh = SimpleNamespace(local=SimpleNamespace(host_id="local"))
+
+    def refresh(self, config: PickerConfig, **kwargs: object) -> dict[str, object]:
+        result = super().refresh(config, **kwargs)
+        now = int(time.time() * 1000)
+        backend = self.context.selected
+        backend.viewer_inventory_started_at = now if self.fresh_inventory else now - 20_000
+        backend.viewer_inventory_desktop = viewer_state.desktop_context()
+        backend.viewer_inventory_result = {
+            "schemaVersion": 1,
+            "meshRevision": REVISION,
+            "viewerEndpoint": {"hostId": "local", "observedAt": now - self.inventory_age},
+            "hosts": [
+                {
+                    "hostId": host,
+                    "status": "ok",
+                    "sessions": [
+                        {
+                            **row["tmux"],
+                            "hostId": row["hostId"],
+                            "localViewer": self.observations.get(
+                                (host, row["tmux"]["sessionId"]), {"state": "none"}
+                            ),
+                        }
+                        for row in record["sessions"]
+                    ],
+                }
+                for host, record in result["hosts"].items()
+            ],
+        }
+        return result
 
 
 def _reference(host_id: str, session_id: str, created_at: int) -> dict[str, object]:
@@ -154,6 +196,160 @@ def _options(row: str) -> tuple[str, dict[str, str]]:
         raise AssertionError("row has no Rofi options")
     fields = encoded.split("\x1f")
     return visible, dict(zip(fields[::2], fields[1::2], strict=True))
+
+
+class OpenBatchTest(unittest.TestCase):
+    def setUp(self) -> None:
+        patch = mock.patch(
+            "rofi_agent_plus.batch.viewer_state.desktop_context", return_value="d" * 64
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _store(self) -> OpenStore:
+        local = _row("local", "codex", LOCAL_ID, "$1", 1)
+        # Match the actual provider shape: owner identity is on the outer row.
+        local["tmux"].pop("hostId")
+        dark = _row("local", "codex", REMOTE_ID, "$2", 2)
+        remote = _row("remote", "claude", REMOTE_ID, "$3", 3)
+        return OpenStore(
+            _snapshot([local, dark], [remote]),
+            {
+                ("local", "$1"): {"state": "open", "confidence": "confirmed"},
+                ("remote", "$3"): {"state": "open", "confidence": "matched"},
+            },
+        )
+
+    def _close_preview(self, store: OpenStore) -> dict[str, object]:
+        verified = contract_viewers.ViewerInspection(
+            "verified", (contract_viewers.Viewer("viewer-1", 71),), True
+        )
+        with mock.patch(
+            "rofi_agent_plus.batch.contract_viewers.inspect_viewers", return_value=verified
+        ):
+            return batch.build_preview(store, PickerConfig(), batch.Scope("open"), ACTION_CLOSE)
+
+    def test_open_close_uses_fresh_subset_and_keeps_strict_legacy_exclusion(self) -> None:
+        store = self._store()
+        calls: list[str] = []
+
+        def inspect(_backend: object, reference: object, **_kwargs: object) -> object:
+            calls.append(reference.session_id)
+            if reference.host_id == "remote":
+                return contract_viewers.ViewerInspection("unverified", (), False)
+            return contract_viewers.ViewerInspection(
+                "verified", (contract_viewers.Viewer("viewer-1", 71),), True
+            )
+
+        with mock.patch(
+            "rofi_agent_plus.batch.contract_viewers.inspect_viewers", side_effect=inspect
+        ):
+            preview = batch.build_preview(store, PickerConfig(), batch.Scope("open"), ACTION_CLOSE)
+        self.assertEqual(["$1", "$3"], calls)
+        self.assertEqual([LOCAL_ID], [target["id"] for target in preview["targets"]])
+        self.assertEqual("claude-remote", preview["exclusions"][0]["name"])
+        self.assertEqual("local", preview["openContext"]["endpointHostId"])
+        self.assertIsNone(store.refresh_calls[0]["host_ids"])
+
+    def test_open_resume_never_discovers_inspects_or_submits(self) -> None:
+        store = self._store()
+        with mock.patch("rofi_agent_plus.batch.contract_viewers.inspect_viewers") as inspect:
+            preview = batch.build_preview(store, PickerConfig(), batch.Scope("open"), ACTION_RESUME)
+        self.assertEqual([], store.refresh_calls)
+        inspect.assert_not_called()
+        self.assertEqual([], preview["targets"])
+        with tempfile.TemporaryDirectory() as temporary:
+            state = batch.BatchStateStore(Path(temporary))
+            preview_id = state.write_preview(preview)
+            self.assertIsNotNone(state.read_preview(preview_id))
+            with self.assertRaises(batch.BatchError):
+                state.consume_and_submit(preview_id, spawn=False)
+            self.assertFalse(state.job_path.exists())
+
+    def test_expired_or_previous_inventory_cannot_fall_back_to_active(self) -> None:
+        for age, fresh in ((10_001, True), (0, False)):
+            with self.subTest(age=age, fresh=fresh):
+                store = self._store()
+                store.inventory_age, store.fresh_inventory = age, fresh
+                with mock.patch(
+                    "rofi_agent_plus.batch.contract_viewers.inspect_viewers"
+                ) as inspect:
+                    preview = batch.build_preview(
+                        store, PickerConfig(), batch.Scope("open"), ACTION_CLOSE
+                    )
+                self.assertEqual([], preview["targets"])
+                self.assertTrue(preview["stopReason"])
+                inspect.assert_not_called()
+
+    def test_open_filter_does_not_hide_duplicate_provider_identity(self) -> None:
+        store = self._store()
+        store.snapshot["hosts"]["local"]["sessions"][1]["id"] = LOCAL_ID
+        with mock.patch(
+            "rofi_agent_plus.batch.contract_viewers.inspect_viewers",
+            return_value=contract_viewers.ViewerInspection(
+                "verified", (contract_viewers.Viewer("viewer-remote", 72),), True
+            ),
+        ) as inspect:
+            preview = batch.build_preview(store, PickerConfig(), batch.Scope("open"), ACTION_CLOSE)
+        self.assertEqual([REMOTE_ID], [target["id"] for target in preview["targets"]])
+        self.assertEqual(
+            "duplicate provider rows are ambiguous", preview["exclusions"][0]["reason"]
+        )
+        # Only the remote candidate survives; the apparently open local row
+        # must remain ambiguous even though its duplicate has no window.
+        self.assertEqual(1, inspect.call_count)
+        self.assertEqual("remote", inspect.call_args.args[1].host_id)
+
+    def test_open_preparation_is_bound_to_its_desktop_and_scope(self) -> None:
+        preview = self._close_preview(self._store())
+        with tempfile.TemporaryDirectory() as temporary:
+            state = batch.BatchStateStore(Path(temporary))
+            request = state.start_preparation(ACTION_CLOSE, batch.Scope("open"), spawn=False)
+            self.assertEqual(
+                request, state.start_preparation(ACTION_CLOSE, batch.Scope("open"), spawn=False)
+            )
+            self.assertEqual("d" * 64, state.read_preparation(request)["viewerDesktop"])
+            with mock.patch(
+                "rofi_agent_plus.batch.viewer_state.desktop_context", return_value="e" * 64
+            ):
+                with self.assertRaises(batch.BatchError):
+                    state.finish_preparation(request, preview)
+                new_request = state.start_preparation(
+                    ACTION_CLOSE, batch.Scope("open"), spawn=False
+                )
+            self.assertNotEqual(request, new_request)
+            self.assertFalse(state.finish_preparation(request, preview))
+            all_request = state.start_preparation(ACTION_CLOSE, batch.Scope("all"), spawn=False)
+            with self.assertRaises(batch.BatchError):
+                state.finish_preparation(all_request, preview)
+
+    def test_open_confirmation_and_worker_reject_endpoint_changes(self) -> None:
+        store = self._store()
+        preview = self._close_preview(store)
+        with tempfile.TemporaryDirectory() as temporary:
+            state = batch.BatchStateStore(Path(temporary))
+            preview_id = state.write_preview(preview)
+            with mock.patch(
+                "rofi_agent_plus.batch.viewer_state.desktop_context", return_value="e" * 64
+            ):
+                with self.assertRaises(batch.BatchError):
+                    state.consume_and_submit(preview_id, spawn=False)
+            self.assertFalse(state.job_path.exists())
+            _, job = state.consume_and_submit(preview_id, spawn=False)
+            with mock.patch("rofi_agent_plus.batch.contract_viewers.close_viewer") as close:
+                with mock.patch(
+                    "rofi_agent_plus.batch.viewer_state.desktop_context", return_value="e" * 64
+                ):
+                    self.assertTrue(
+                        batch._run_job_target(store, PickerConfig(), dict(job), job["targets"][0])[
+                            2
+                        ]
+                    )
+                store.context.selected.mesh.local.host_id = "other"
+                self.assertTrue(
+                    batch._run_job_target(store, PickerConfig(), dict(job), job["targets"][0])[2]
+                )
+                close.assert_not_called()
 
 
 class BatchPreparationTest(unittest.TestCase):
@@ -1042,14 +1238,19 @@ class BatchPickerTest(unittest.TestCase):
                         if (options := _options(row)[1]).get("info", "").startswith("{")
                         and (info := json.loads(options["info"])).get("id")
                     }
-                    self.assertNotIn("foreground=", conversation_options[LOCAL_ID]["display"])
+                    self.assertNotIn(
+                        "foreground=", conversation_options[LOCAL_ID]["display"].split("\n", 1)[0]
+                    )
                     self.assertEqual(
                         self._message(render_snapshot(store.snapshot, action=action)),
                         self._message(output),
                     )
                     if mixed:
                         self.assertIn(f"All active · Confirm {action.title()} (1)", output)
-                        self.assertIn("foreground=", conversation_options[REMOTE_ID]["display"])
+                        self.assertIn(
+                            "foreground=",
+                            conversation_options[REMOTE_ID]["display"].split("\n", 1)[0],
+                        )
                     else:
                         verb = "open" if action == ACTION_RESUME else "close"
                         self.assertIn(f"All active · No windows to {verb}", output)
@@ -1328,7 +1529,7 @@ class BatchPickerTest(unittest.TestCase):
         session_row = next(row for row in rows if row.startswith("codex-local"))
         _, options = _options(session_row)
         self.assertNotIn("Will open existing session", options["display"])
-        self.assertNotIn("foreground=", options["display"])
+        self.assertNotIn("foreground=", options["display"].split("\n", 1)[0])
 
     def test_inline_preview_marks_only_exact_targets_and_shows_exclusions(self) -> None:
         included = _row("local", "codex", LOCAL_ID, "$1", 1, name="included")
@@ -1377,7 +1578,7 @@ class BatchPickerTest(unittest.TestCase):
             '<span foreground="#42a5f5">included</span>',
             by_id[LOCAL_ID]["display"],
         )
-        self.assertNotIn("foreground=", by_id[REMOTE_ID]["display"])
+        self.assertNotIn("foreground=", by_id[REMOTE_ID]["display"].split("\n", 1)[0])
         exclusion = next(row for row in rows if row.startswith("Excluded · excluded"))
         self.assertIn("viewer association is ambiguous", _options(exclusion)[1]["display"])
 
