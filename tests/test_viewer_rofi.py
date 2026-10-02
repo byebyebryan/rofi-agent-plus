@@ -152,6 +152,83 @@ class ViewerRofiTest(unittest.TestCase):
             ),
         )
 
+    def test_composite_labels_shade_each_observed_fact(self):
+        waiting_open = {
+            **self.row,
+            "activityState": "waiting",
+            "localViewer": {"state": "open", "confidence": "confirmed"},
+        }
+        waiting_open_question = {
+            **waiting_open,
+            "localViewer": {"state": "open", "confidence": "matched"},
+        }
+        inactive_open_question = {
+            **waiting_open_question,
+            "active": False,
+            "activityState": "idle",
+        }
+
+        waiting_markup = rofi._row_display(waiting_open)
+        self.assertEqual("Waiting · Open", rofi._activity_label(waiting_open))
+        self.assertIn(
+            'foreground="#d3d7dd" background="#343a40" alpha="92%" '
+            'background_alpha="58%">\u00a0Waiting\u00a0</span> · '
+            '<span foreground="#bdecc9" background="#214633" alpha="100%" '
+            'background_alpha="86%">\u00a0Open\u00a0</span>',
+            waiting_markup,
+        )
+
+        waiting_question_markup = rofi._row_display(waiting_open_question)
+        self.assertEqual("Waiting · Open?", rofi._activity_label(waiting_open_question))
+        self.assertIn(
+            'background_alpha="58%">\u00a0Waiting\u00a0</span> · '
+            '<span foreground="#a5c2ac" background="#30453a" alpha="90%" '
+            'background_alpha="66%">\u00a0Open?\u00a0</span>',
+            waiting_question_markup,
+        )
+
+        inactive_markup = rofi._row_display(inactive_open_question)
+        self.assertEqual("Inactive · Open?", rofi._activity_label(inactive_open_question))
+        self.assertIn(
+            'Inactive · <span foreground="#a5c2ac"',
+            inactive_markup,
+        )
+
+    def test_failed_or_retained_activity_has_no_positive_state_fill(self):
+        current_open = {
+            **self.row,
+            "localViewer": {"state": "open", "confidence": "confirmed"},
+        }
+        activity_observations = {
+            **self.snapshot["hosts"]["alpha"]["observations"],
+            "activity": {"outcome": "failed"},
+        }
+        failed_host = {
+            **self.snapshot["hosts"]["alpha"],
+            "sessions": [current_open],
+            "observations": activity_observations,
+        }
+        activity_failed = {
+            **self.snapshot,
+            "sessions": [current_open],
+            "hosts": {"alpha": failed_host},
+        }
+        globally_failed = {
+            **activity_failed,
+            "lastRefresh": {"outcome": "failed"},
+        }
+        retained = {**current_open, "sourceObservation": "retained"}
+
+        for row, snapshot in (
+            (current_open, activity_failed),
+            (current_open, globally_failed),
+            (retained, None),
+        ):
+            with self.subTest(source=row.get("sourceObservation"), snapshot=snapshot is not None):
+                rendered = rofi._row_display(row, snapshot=snapshot)
+                self.assertIn("Activity unknown", rendered)
+                self.assertNotIn("background=", rendered)
+
     def test_cached_initial_and_timed_completion_keep_action_selection_and_provider_time(self):
         with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
             initial = self.callback(0)
@@ -365,6 +442,8 @@ class ViewerRofiTest(unittest.TestCase):
 
         def frame():
             snapshot = rofi._presentation_snapshot(self.store, self.config, self.context)
+            snapshot["sessions"][0]["tmuxStale"] = True
+            snapshot["hosts"]["alpha"]["sessions"][0]["tmuxStale"] = True
             return rofi._render_batch_inline(
                 snapshot,
                 rofi.ContinuationState(),
@@ -381,6 +460,8 @@ class ViewerRofiTest(unittest.TestCase):
         for value in (before, after):
             self.assertIn("Confirm Resume (1)", value)
             self.assertIn('<span foreground="#42a5f5">Viewer state</span>', value)
+            self.assertIn("Details limited", value)
+            self.assertIn("\x1furgent\x1ftrue", value)
         self.assertEqual(self.header(before, "message"), self.header(after, "message"))
         self.assertEqual(original, json.dumps(record, sort_keys=True))
         self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())

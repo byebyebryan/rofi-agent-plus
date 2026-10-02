@@ -83,6 +83,11 @@ FALLBACK_ICON_PATH = Path(__file__).resolve().parent / "assets" / "providers" / 
 ROW_SEPARATOR = "\n"
 ROFI_RECORD_SEPARATOR = "\t"
 ROFI_DELIMITER_VALUE = r"\t"
+_ACTIVITY_LABEL_STYLES = {
+    "neutral": ("#d3d7dd", "#343a40", "92%", "58%"),
+    "open": ("#bdecc9", "#214633", "100%", "86%"),
+    "open-qualified": ("#a5c2ac", "#30453a", "90%", "66%"),
+}
 _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
 VIEW_ALL = "all"
 VIEW_LOCAL = "local"
@@ -734,7 +739,7 @@ def _action_hint(action: str) -> str:
         if candidate == action:
             label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
         labels.append(label)
-    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions  │  Alt+A: Select All active"
+    return f"Enter: {' · '.join(labels)}  │  Tab: Cycle  │  Alt+A: All"
 
 
 def _action_message(action: str, notice: str) -> str:
@@ -893,33 +898,67 @@ def _row_text(
     return f"{name}  ·  {provider}  ·  {host}  ·  {cwd}  ·  {age}  ·  {activity}"
 
 
-def _activity_label(
+def _activity_parts(
     session: Mapping[str, Any], *, snapshot: Mapping[str, Any] | None = None
-) -> str:
+) -> tuple[tuple[str, str | None], ...]:
+    """Return plain activity label fragments and their semantic treatments."""
+
     if (
         session.get("sourceObservation") == "retained"
         or session.get("activityState") == "unknown"
         or _observation_failed(_stage_observation(snapshot, session, "activity"))
         or _refresh_outcome(snapshot) == "failed"
     ):
-        return "Activity unknown"
+        return (("Activity unknown", None),)
     viewer = session.get("localViewer")
     state = viewer.get("state") if isinstance(viewer, Mapping) else "unknown"
     confidence = viewer.get("confidence") if isinstance(viewer, Mapping) else None
     opened = (
-        "Open"
+        ("Open", "open")
         if state == "open" and confidence == "confirmed"
-        else "Open?"
+        else ("Open?", "open-qualified")
         if state == "open" and confidence == "matched"
         else None
     )
     known_none = state == "none"
     activity = session.get("activityState")
     if activity == "waiting":
-        return "Waiting" + (" · " + opened if opened else "" if known_none else "?")
+        if opened:
+            return (("Waiting", "neutral"), (" · ", None), opened)
+        return (("Waiting" if known_none else "Waiting?", "neutral"),)
     if session.get("active"):
-        return opened or ("Active" if known_none else "Active?")
-    return "Inactive" + (" · " + opened if opened else "" if known_none else "?")
+        return (opened,) if opened else (("Active" if known_none else "Active?", "neutral"),)
+    if opened:
+        return (("Inactive", None), (" · ", None), opened)
+    return (("Inactive" if known_none else "Inactive?", None),)
+
+
+def _activity_label(
+    session: Mapping[str, Any], *, snapshot: Mapping[str, Any] | None = None
+) -> str:
+    return "".join(label for label, _style in _activity_parts(session, snapshot=snapshot))
+
+
+def _activity_markup(
+    session: Mapping[str, Any], *, snapshot: Mapping[str, Any] | None = None
+) -> str:
+    """Render the activity label with small, explicit Pango state hints."""
+
+    parts: list[str] = []
+    for label, style_name in _activity_parts(session, snapshot=snapshot):
+        escaped = _pango_escape(label)
+        style = _ACTIVITY_LABEL_STYLES.get(style_name or "")
+        if style is None:
+            # ``_pango_escape`` trims surrounding whitespace, so preserve the
+            # fixed semantic separator between separately styled facts.
+            parts.append(label if label == " · " else escaped)
+            continue
+        foreground, background, alpha, background_alpha = style
+        parts.append(
+            f'<span foreground="{foreground}" background="{background}" '
+            f'alpha="{alpha}" background_alpha="{background_alpha}">\u00a0{escaped}\u00a0</span>'
+        )
+    return "".join(parts)
 
 
 def _refresh_outcome(snapshot: Mapping[str, Any] | None) -> str | None:
@@ -1030,15 +1069,15 @@ def _row_display(
     host = sanitize(session.get("host") or session.get("hostId") or "local")
     cwd = _shorten_cwd(session.get("cwd"))
     age = _age(session.get("recencyAt"), now)
-    activity = _activity_label(session, snapshot=snapshot)
-    secondary_parts = [host, cwd, age, activity]
+    activity = _activity_markup(session, snapshot=snapshot)
+    secondary_parts = [_pango_escape(part) for part in (host, cwd, age)]
     status, _, _ = _row_observation(
         session,
         snapshot,
         now,
         refresh_active=refresh_active,
     )
-    secondary_markup = [_pango_escape(part) for part in secondary_parts]
+    secondary_markup = [*secondary_parts, activity]
     if status:
         secondary_markup.append(_pango_escape(status))
     secondary = "  ·  ".join(secondary_markup)

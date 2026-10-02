@@ -906,7 +906,12 @@ class RofiProtocolTest(unittest.TestCase):
         display = options["display"]
         self.assertIn(f"<b>hello world</b>{ROW_SEPARATOR}", display)
         self.assertIn('<span size="smaller" alpha="75%">', display)
-        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  Active?", display)
+        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  ", display)
+        self.assertIn("Active?", display)
+        self.assertIn(
+            'foreground="#d3d7dd" background="#343a40" alpha="92%" background_alpha="58%"',
+            display,
+        )
         decoded = json.loads(options["info"])
         self.assertEqual(THREAD_ID, decoded["id"])
 
@@ -949,7 +954,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertNotIn("sourceObservation", options["info"])
         self.assertNotIn("urgent", options)
         self.assertEqual("true", options["active"])
-        self.assertIn("workstation  ·  ~/code/project  ·  0s  ·  Active?", options["display"])
+        self.assertIn("Active?", options["display"])
 
     def test_observation_statuses_distinguish_retained_global_failure_and_activity_only(
         self,
@@ -1166,7 +1171,8 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertNotIn("Claude Code", display)
         self.assertIn("Claude Code", visible)
         self.assertIn("claude claude-code claude code", meta)
-        self.assertIn("host  ·  /srv/project  ·  0s  ·  Waiting?", display)
+        self.assertIn("host  ·  /srv/project  ·  0s  ·  ", display)
+        self.assertIn("Waiting?", display)
 
         unsafe_secondary = session(
             kind="claude",
@@ -1183,6 +1189,9 @@ class RofiProtocolTest(unittest.TestCase):
         _, unsafe_options = parse_row_options(unsafe_row)
         self.assertIn("host&lt;&amp;&gt;", unsafe_options["display"])
         self.assertIn("/srv/a&lt;&amp;&gt;/project", unsafe_options["display"])
+        self.assertIn("Waiting?", unsafe_options["display"])
+        self.assertIn("Waiting?", unsafe_options["meta"])
+        self.assertNotIn("<span", unsafe_options["meta"])
 
     def test_each_provider_uses_its_icon_and_retains_search_terms(self) -> None:
         for kind in PROVIDER_LABELS:
@@ -1715,9 +1724,9 @@ class RofiProtocolTest(unittest.TestCase):
             'Resume · <span foreground="#42a5f5" weight="bold">[Close]</span> · New',
             close_action,
         )
-        self.assertIn("  │  Tab: Cycle actions", close_action)
+        self.assertIn("  │  Tab: Cycle  │  Alt+A: All", close_action)
         self.assertIn(
-            "Tab: Cycle actions  │  Alt+A: Select All active\u2028\u2028&lt;offline&gt; &amp; busy",
+            "Tab: Cycle  │  Alt+A: All\u2028\u2028&lt;offline&gt; &amp; busy",
             _action_message(ACTION_RESUME, "<offline> & busy"),
         )
         self.assertIn("Refresh errors: alpha/claude: offline", close_action)
@@ -1923,13 +1932,13 @@ class RofiProtocolTest(unittest.TestCase):
                 config=config,
             )
         self.assertIn(
-            "[Resume]</span> · Close · New  │  Tab: Cycle actions  │  Alt+A: Select All active\u2028\u2028Unable to start new session: provider unavailable",
+            "[Resume]</span> · Close · New  │  Tab: Cycle  │  Alt+A: All\u2028\u2028Unable to start new session: provider unavailable",
             output.getvalue(),
         )
         self.assertIn("Agents › All", output.getvalue())
         self.assertIn(_action_data(ACTION_RESUME), output.getvalue())
         self.assertIn(
-            "[Resume]</span> · Close · New  │  Tab: Cycle actions  │  Alt+A: Select All active",
+            "[Resume]</span> · Close · New  │  Tab: Cycle  │  Alt+A: All",
             output.getvalue(),
         )
         self.assertIn("\x00new-selection\x1f2", output.getvalue())
@@ -2980,7 +2989,7 @@ class RofiProtocolTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertNotIn("Checking sessions…", rendered)
         self.assertNotIn("Background refresh stopped", rendered)
-        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", rendered)
+        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle  │  Alt+A: All", rendered)
         self.assertNotIn("\x00theme\x1f", rendered)
 
     def test_background_callback_polls_without_starting_another_refresh(self) -> None:
@@ -3312,7 +3321,7 @@ class RofiProtocolTest(unittest.TestCase):
             )
         expired = output.getvalue()
         self.assertNotIn("Checked just now", expired)
-        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", expired)
+        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle  │  Alt+A: All", expired)
         self.assertIn("\x00data\x1fidle", expired)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
@@ -3461,7 +3470,7 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual(0, result)
         rendered = output.getvalue()
         self.assertNotIn("Refresh errors: local/threads: offline", rendered)
-        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", rendered)
+        self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle  │  Alt+A: All", rendered)
         self.assertIn(
             '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
             rendered,
@@ -3566,7 +3575,9 @@ class RofiProtocolTest(unittest.TestCase):
                 if data is None:
                     self.assertNotIn("Check stopped", rendered)
                     self.assertNotIn("Checking sessions…", rendered)
-                    self.assertIn("[Resume]</span> · Close · New  │  Tab: Cycle actions", rendered)
+                    self.assertIn(
+                        "[Resume]</span> · Close · New  │  Tab: Cycle  │  Alt+A: All", rendered
+                    )
                     self.assertIn(
                         '\x00theme\x1fconfiguration { timeout { delay: 0; action: "kb-custom-19"; } }',
                         rendered,
