@@ -293,8 +293,8 @@ class ViewerRofiTest(unittest.TestCase):
             message = self.header(frame, "message")
             for cycle in range(3):
                 delay = int(re.search(r"delay: (\d+);", self.header(frame, "theme"))[1])
-                self.assertEqual(7, delay)
-                now += delay
+                self.assertEqual(1, delay)
+                now += 7
                 self.clock.return_value = now
                 self.millis.return_value = int(now * 1000)
                 # The timer starts the helper before expiry. Polling it again
@@ -332,6 +332,45 @@ class ViewerRofiTest(unittest.TestCase):
                 self.assertEqual(cycle + 1, spawn.call_count)
         self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
 
+    def test_view_switch_rearms_previous_delay_without_losing_open(self):
+        self.publish()
+        now = 100.0
+        switches = [(106.0, rofi.ROFI_RETV_CUSTOM_2), (120.0, rofi.ROFI_RETV_CUSTOM_3)]
+        helper_due = None
+        with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
+            frame = self.callback(0)
+            message = self.header(frame, "message")
+            delay = int(re.search(r"delay: (\d+);", self.header(frame, "theme"))[1])
+            timer_due = now + delay
+            while now < 126:
+                switching = bool(switches and switches[0][0] <= timer_due)
+                now, retv = switches.pop(0) if switching else (timer_due, rofi.ROFI_RETV_CUSTOM_19)
+                if helper_due is not None and helper_due <= now:
+                    self.clock.return_value = helper_due
+                    self.millis.return_value = int(helper_due * 1000)
+                    self.publish()
+                    helper_due = None
+                self.clock.return_value = now
+                self.millis.return_value = int(now * 1000)
+                # Rofi 2.0 trigger_action resets its timeout BEFORE invoking
+                # mode_result. A returned theme cannot change this armed timer.
+                timer_due = now + delay
+                calls_before = spawn.call_count
+                frame = self.callback(
+                    retv, ROFI_DATA=self.data(frame), ROFI_INFO=rofi.selection_payload(self.row)
+                )
+                self.assertIn("Open", frame, f"lost viewer at {now}")
+                self.assertNotIn("Active?", frame, f"expired viewer at {now}")
+                self.assertEqual(message, self.header(frame, "message"))
+                self.assertIn("\x00keep-filter\x1ftrue", frame)
+                if switching:
+                    self.assertEqual(calls_before, spawn.call_count)
+                elif spawn.call_count > calls_before:
+                    helper_due = now + 1.75
+                delay = int(re.search(r"delay: (\d+);", self.header(frame, "theme"))[1])
+            self.assertGreaterEqual(spawn.call_count, 3)
+        self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
+
     def test_early_helper_does_not_extend_expiry_or_retain_open_after_failure(self):
         self.publish()
         with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
@@ -348,7 +387,7 @@ class ViewerRofiTest(unittest.TestCase):
             )
             frame = self.callback(rofi.ROFI_RETV_CUSTOM_19)
             self.assertIn("Active?", frame)
-            self.assertIn("delay: 10;", self.header(frame, "theme"))
+            self.assertIn("delay: 1;", self.header(frame, "theme"))
             spawn.assert_called_once()
         self.assertEqual(self.provider_bytes, self.store.snapshot_path.read_bytes())
 
@@ -358,7 +397,7 @@ class ViewerRofiTest(unittest.TestCase):
         self.assertTrue(self.store.viewer_store().ingest(self.inventory, self.scope))
         with mock.patch("rofi_agent_plus.viewer_state.subprocess.Popen") as spawn:
             frame = self.callback(0)
-            self.assertIn("delay: 10;", self.header(frame, "theme"))
+            self.assertIn("delay: 1;", self.header(frame, "theme"))
             for now in (107, 109):
                 self.clock.return_value = now
                 self.millis.return_value = now * 1000

@@ -211,6 +211,12 @@ do not run a synchronous window scan on cursor movement. These are finite
 refresh processes with existing owner/deadline controls; closing the picker leaves no recurring
 poller. A running read-only refresh can finish without viewer effects.
 
+Agent Plus `0.12.1` uses a fixed one-second native Rofi tick while watching
+viewer state. Rofi 2.0 rearms its timeout before the script callback, using the
+previous frame's delay; a variable countdown could expire a valid observation
+after a page change. The viewer cache still starts helpers only when the
+seven/ten-second renewal interval is due. Navigation remains cache-only.
+
 Key private observations by endpoint desktop context, Mesh revision, and the
 full tmux identity. Changes to endpoint desktop, session generation, creation
 time, or Mesh invalidate a positive association. Expired observations display

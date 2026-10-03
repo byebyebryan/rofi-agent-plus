@@ -22,7 +22,7 @@ Plus revalidates a typed provider row and calls the public Tmux Session v1
 terminal argv, or raw tmux target. Rename and kill remain Tmux Plus management
 actions, not Agent Plus actions.
 
-Version `0.12.0` supports Python 3.11+ and has no runtime package dependencies.
+Version `0.12.1` supports Python 3.11+ and has no runtime package dependencies.
 The core contract requires Python 3, the Codex CLI, and `rofi-tmux-plus` on
 `PATH`. Claude Code and OpenCode are optional provider tools. Remote hosts
 also require `rofi-ssh-plus` Host Mesh, tmux, and the provider tools they
@@ -319,7 +319,10 @@ request one finite public bulk inventory helper; Tab and page changes only read
 cached observations. Viewer refreshes do not run provider discovery or rewrite provider
 timestamps. The timer continues while the picker is open, including a fresh
 provider cache and local-only mode. All-Unknown and failed observations retain
-the ten-second retry interval. Full tmux identity, endpoint desktop epoch, and
+the ten-second retry interval. While watching viewer state, the Rofi timer uses
+a fixed one-second tick: Rofi arms it before calling the script, so a view
+change must not reuse a longer delay and postpone renewal past expiry. The
+tick does not increase the inventory request frequency. Full tmux identity, endpoint desktop epoch, and
 Mesh revision guard publication; a late superseded helper cannot overwrite a newer observation.
 The shared action bar and frozen batch target lists, counts, and title tint
 remain unchanged by observation refreshes. Closing the picker leaves no recurring

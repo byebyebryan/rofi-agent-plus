@@ -1557,17 +1557,12 @@ def render_snapshot(
             else:
                 timeout_delay = AUTO_REFRESH_POLL_SECONDS
             if watching_viewers:
-                refresh_at = snapshot.get("_viewerRefreshAt")
-                viewer_delay = (
-                    max(1, math.ceil(refresh_at / 1000 - time.time()))
-                    if type(refresh_at) is int and snapshot.get("_viewerPending") is not True
-                    else AUTO_REFRESH_POLL_SECONDS
-                )
-                timeout_delay = (
-                    min(timeout_delay, viewer_delay)
-                    if polling_batch or refresh_deadline or error_deadline or check_deadline
-                    else viewer_delay
-                )
+                # Rofi 2.0 arms its timeout before invoking the script callback.
+                # A page change therefore reuses the previous frame's delay.
+                # Keep that delay fixed so navigation cannot postpone renewal
+                # past expiry. The viewer store still gates helper requests at
+                # seven seconds (known) or ten seconds (unknown/failed).
+                timeout_delay = AUTO_REFRESH_POLL_SECONDS
         else:
             timeout_delay = 0
         headers.append(_protocol("theme", _timeout_theme(timeout_delay)))

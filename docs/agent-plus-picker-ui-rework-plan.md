@@ -190,6 +190,11 @@ failed observations retain the existing ten-second retry behavior. Keep the
 strict expiry and full endpoint/reference join. No new polling daemon or
 selection watcher is needed.
 
+The `0.12.1` follow-up keeps the native Rofi timer at one second while watching
+viewer state. Rofi 2.0 arms its next timeout before invoking the script callback;
+varying that delay let page changes postpone renewal past expiry. The fixed
+tick preserves the seven/ten-second helper cadence and cache-only navigation.
+
 Open can be empty on a cold launch while viewer inspection is pending. Show
 a short non-actionable Checking windows… row, followed by No open sessions
 observed after a successful empty check. Failed or partial checks retain a
