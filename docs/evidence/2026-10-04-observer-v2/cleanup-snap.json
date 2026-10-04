@@ -1,0 +1,32 @@
+{
+  "hostScope": "snap",
+  "namespaceExitedBeforeCleanup": true,
+  "ownedPrivateStoreRemoved": true,
+  "borrowedCredentialCopiesRemoved": true,
+  "ordinaryHashUnchanged": {
+    "/home/bryan/.codex/auth.json": true,
+    "/home/bryan/.codex/config.toml": true,
+    "/home/bryan/.claude/.credentials.json": true,
+    "/home/bryan/.claude/settings.json": true,
+    "/home/bryan/.claude.json": true
+  },
+  "ordinaryGlobalConfigProofPathAbsent": true,
+  "selectedLinks": {
+    "agent-observer": {
+      "resolved": "/home/bryan/.local/share/agent-observer/0.1.0a5-b68ebf4cefbd8b58/bin/agent-observer",
+      "oldPilotSelected": true
+    },
+    "rofi-agent-plus": {
+      "resolved": "/home/bryan/.local/share/rofi-agent-plus/0.13.0a3-76f8a951e2975283/bin/rofi-agent-plus",
+      "oldPilotSelected": true
+    },
+    "rofi-agent-plus-rofi": {
+      "resolved": "/home/bryan/.local/share/rofi-agent-plus/0.13.0a3-76f8a951e2975283/bin/rofi-agent-plus-rofi",
+      "oldPilotSelected": true
+    }
+  },
+  "ordinaryWriteEntryLinkAdded": false,
+  "coordinatorReopened": false,
+  "providerHooksOrPolicyChanged": false,
+  "status": "accepted"
+}

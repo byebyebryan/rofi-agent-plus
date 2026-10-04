@@ -66,3 +66,32 @@ Source gate: all 309 tests, Ruff, format, shell/text checks and released public
 bundle verification pass in the isolated development environment against the
 accepted installed Observer wheel. Controlled write timeout preserves a separate
 descendant, and cleanup removes only that test-owned child. Hosted CI was not run.
+
+## Installed/native closure and continuation
+
+E8 source checkpoint `90e5b4f` is packaged as `0.14.0a1`, wheel SHA-256
+`8ba19a0eba87944aec2848542fb3ddcb91f3ccc33790ba42565928e18daa497b`, and installed
+unselected on Snap and Starship at
+`/home/bryan/.local/share/rofi-agent-plus/0.14.0a1-8ba19a0eba87944a`.
+The [consumer report](evidence/2026-10-04-observer-v2/REPORT.md) records installed
+conformance, passive native reads, real SSH read and native entry results.
+
+Installed Plus/public Observer/native TTY delegation accepts Codex New/exact
+Resume on both hosts and Claude New/live attach/saved Resume on Snap. Tmux
+responses and Host Mesh authority are controlled; graphical/native Tmux and
+ordinary remote writes are later gates. Missing Claude registry directories
+correctly rejected before dispatch; the corrected history-only owned fixture
+passed saved Resume. No producer modification was needed for that rejection.
+All owned private stores and borrowed credentials were removed after namespace
+exit. Ordinary auth/config/settings hashes and old pilot links stayed intact
+during E8. The current coordinator was not reopened.
+
+Next is a compatible managed tuple selection review. The current chezmoi source
+has read/Plus links to the old tuple and no `agent-observer-write` link; installing
+the new wheel alone does not make it available to frontend actions. Update
+Observer read/write and both Plus entry links together on each selected host,
+with scoped rendering/apply/verification and the old tuple retained. Then run
+desktop picker/focus and actual local/remote Tmux entry acceptance. Keep current
+conversation binding unsupported. Native transport-loss/suspend, coordinator
+reopen and dependency publication/hosted CI are independent remaining gates.
+No managed link/configuration edit, push or public release occurred here.
