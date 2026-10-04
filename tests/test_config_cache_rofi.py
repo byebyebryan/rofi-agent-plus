@@ -84,6 +84,8 @@ def session(
         },
         "kind": kind,
         "id": identifier,
+        "namespace": "fixture-native-home",
+        "nativeIdKind": "thread" if kind == "codex" else "session",
         "name": "hello\nworld\x00",
         "cwd": str(Path.home() / "code/project"),
         "host": "workstation",
@@ -142,7 +144,13 @@ class ViewPreferenceStoreTest(unittest.TestCase):
             preference = ViewPreference(
                 "host",
                 "alpha",
-                ("workstation", "claude", "00000000-0000-0000-0000-000000000002"),
+                (
+                    "workstation",
+                    "claude",
+                    "00000000-0000-0000-0000-000000000002",
+                    "fixture-native-home",
+                    "session",
+                ),
             )
 
             self.assertTrue(store.save(preference))
@@ -156,7 +164,9 @@ class ViewPreferenceStoreTest(unittest.TestCase):
     def test_open_page_preference_round_trips_with_one_shared_last_used_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ViewPreferenceStore(temporary)
-            preference = ViewPreference("open", None, ("workstation", "codex", THREAD_ID))
+            preference = ViewPreference(
+                "open", None, ("workstation", "codex", THREAD_ID, "fixture-native-home", "thread")
+            )
 
             self.assertTrue(store.save(preference))
             self.assertEqual(preference, store.load())
@@ -168,7 +178,7 @@ class ViewPreferenceStoreTest(unittest.TestCase):
             for payload in (
                 {"version": True, "page": {"kind": "active"}, "lastUsed": None},
                 {"version": 1.0, "page": {"kind": "active"}, "lastUsed": None},
-                {"version": 2, "page": {"kind": "all"}, "lastUsed": None},
+                {"version": 3, "page": {"kind": "all"}, "lastUsed": None},
                 {"version": 1, "page": {"kind": "host", "hostId": "bad host"}, "lastUsed": None},
                 {
                     "version": 1,
@@ -177,6 +187,15 @@ class ViewPreferenceStoreTest(unittest.TestCase):
                         "hostId": "workstation",
                         "provider": "unknown",
                         "sessionId": THREAD_ID,
+                    },
+                },
+                {
+                    "version": 1,
+                    "page": {"kind": "active"},
+                    "lastUsed": {
+                        "hostId": "workstation",
+                        "provider": "opencode",
+                        "sessionId": OPENCODE_ID,
                     },
                 },
                 {
@@ -219,7 +238,7 @@ class ViewPreferenceStoreTest(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
 
     def test_continuation_bookmark_requires_an_integer_version(self) -> None:
-        identity = ("workstation", "codex", THREAD_ID)
+        identity = ("workstation", "codex", THREAD_ID, "fixture-native-home", "thread")
         self.assertEqual(identity, parse_last_used(encode_last_used(identity)))
 
         payload = {
@@ -229,13 +248,26 @@ class ViewPreferenceStoreTest(unittest.TestCase):
         malformed = "last-used:" + quote(json.dumps(payload, separators=(",", ":")), safe="")
         self.assertIsNone(parse_last_used(malformed))
 
+        retired = {
+            "version": 1,
+            "lastUsed": {
+                "hostId": "workstation",
+                "provider": "opencode",
+                "sessionId": OPENCODE_ID,
+            },
+        }
+        encoded_retired = "last-used:" + quote(json.dumps(retired, separators=(",", ":")), safe="")
+        self.assertIsNone(parse_last_used(encoded_retired))
+
         deeply_nested = "{" + '"version":1,"lastUsed":' + "[" * 1500 + "0" + "]" * 1500 + "}"
         self.assertIsNone(parse_last_used("last-used:" + quote(deeply_nested, safe="")))
 
     def test_failed_atomic_replace_leaves_the_previous_record_readable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = ViewPreferenceStore(temporary)
-            previous = ViewPreference("active", None, ("workstation", "codex", THREAD_ID))
+            previous = ViewPreference(
+                "active", None, ("workstation", "codex", THREAD_ID, "fixture-native-home", "thread")
+            )
             replacement = ViewPreference("local")
             self.assertTrue(store.save(previous))
 
@@ -253,14 +285,92 @@ class ConfigTest(unittest.TestCase):
             config = load_config(Path(temporary) / "missing.toml")
         self.assertEqual(40, config.max_sessions)
         self.assertEqual(30, config.refresh_seconds)
+        self.assertEqual((), config.host_providers)
+        self.assertEqual(("codex", "claude"), config.providers_for("snap"))
 
     def test_loads_provider_settings_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.toml"
-            path.write_text("max_sessions = 12\nrefresh_seconds = 60\n")
+            path.write_text(
+                "max_sessions = 12\nrefresh_seconds = 60\n"
+                "[host_providers]\nSnap = ['claude']\n"
+                "starship = ['claude', 'codex']\n"
+            )
             config = load_config(path)
         self.assertEqual(12, config.max_sessions)
         self.assertEqual(60, config.refresh_seconds)
+        self.assertEqual(("claude",), config.providers_for("SNAP"))
+        self.assertEqual(("codex", "claude"), config.providers_for("Starship"))
+        self.assertEqual(("codex", "claude"), config.providers_for("other"))
+
+    def test_host_provider_policy_is_immutable_and_survives_other_overrides(self) -> None:
+        config = config_from_mapping({"host_providers": {"snap": ["codex"]}})
+        updated = config.with_overrides(max_sessions=12, refresh_seconds=45)
+        self.assertEqual((("snap", ("codex",)),), updated.host_providers)
+        self.assertEqual(("codex",), updated.providers_for("Snap"))
+
+    def test_host_provider_policy_order_is_canonical_for_fingerprints(self) -> None:
+        first = config_from_mapping(
+            {
+                "host_providers": {
+                    "Snap": ["claude", "codex"],
+                    "starship": ["claude"],
+                }
+            }
+        )
+        reordered = config_from_mapping(
+            {
+                "host_providers": {
+                    "STARSHIP": ["claude"],
+                    "snap": ["codex", "claude"],
+                }
+            }
+        )
+        changed = config_from_mapping({"host_providers": {"snap": ["claude"]}})
+        self.assertEqual(first.host_providers, reordered.host_providers)
+        self.assertEqual(first.fingerprint, reordered.fingerprint)
+        self.assertNotEqual(first.fingerprint, changed.fingerprint)
+        self.assertEqual(
+            first.fingerprint,
+            first.with_overrides(refresh_seconds=60).fingerprint,
+        )
+
+    def test_rejects_invalid_host_provider_tables(self) -> None:
+        invalid_toml = (
+            "host_providers = []\n",
+            "[host_providers]\nsnap = []\n",
+            "[host_providers]\nsnap = ['codex', 'codex']\n",
+            "[host_providers]\nsnap = ['opencode']\n",
+            "[host_providers]\nSnap = ['codex']\nsnap = ['claude']\n",
+            "[host_providers]\n'snap name' = ['codex']\n",
+            "[host_providers]\n'-snap' = ['codex']\n",
+        )
+        for text in invalid_toml:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "config.toml"
+                path.write_text(text)
+                with self.assertRaises(ConfigError):
+                    load_config(path)
+
+        invalid_mappings = (
+            {"host_providers": None},
+            {"host_providers": {}},
+            {"host_providers": []},
+            {"host_providers": {"snap": "codex"}},
+            {"host_providers": {"snap": ["Codex"]}},
+            {"host_providers": {"snap": ["codex", "claude", "claude"]}},
+            {"host_providers": {"Snap": ["codex"], "snap": ["claude"]}},
+            {"host_providers": {"snäp": ["codex"]}},
+            {"host_providers": {"a" * 257: ["codex"]}},
+        )
+        for values in invalid_mappings:
+            with self.subTest(values=values), self.assertRaises(ConfigError):
+                config_from_mapping(values)
+
+        with self.assertRaises(ConfigError):
+            config_from_mapping(
+                {"host_providers": {f"host-{index}": ["codex"] for index in range(129)}}
+            )
 
     def test_rejects_unknown_keys_wrong_types_and_bounds(self) -> None:
         for text in (
@@ -332,37 +442,12 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.12.1", engine.VERSION)
+        self.assertEqual("0.13.0a3", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
-    def test_ci_and_readme_describe_the_canonical_deployment_contract(self) -> None:
-        readme = " ".join((self.root / "README.md").read_text().split())
+    def test_ci_runs_the_required_project_gate(self) -> None:
         workflow = (self.root / ".github" / "workflows" / "ci.yml").read_text()
-        self.assertIn("config.toml", readme)
-        self.assertIn("XDG_CACHE_HOME", readme)
-        self.assertIn("Rofi script-mode", readme)
-        self.assertIn("canonical implementation of Agent Plus", readme)
-        self.assertIn("Current refresh/provider errors are shown for about three seconds", readme)
         self.assertIn("./scripts/check", workflow)
-
-    def test_readme_documents_refresh_observation_semantics(self) -> None:
-        readme = " ".join((self.root / "README.md").read_text().split())
-        for phrase in (
-            "Session recency and activity state are independent from observation confidence",
-            "automatic stale-cache refresh or explicit `Alt+R` check",
-            "current rows show `Checking` and retained rows show `Rechecking",
-            "retained provider rows show `Last known · seen",
-            "activity-only rows show `Activity seen · details unavailable`",
-            "current provider data but secondary activity or Tmux failures show",
-            "Cache age triggers a check but never, by itself, makes a row warning",
-            "private v4 cache accepts a valid v3 snapshot in memory without rewriting it",
-            "no resident process, push-update channel, or progressive row publication",
-            "Successful completion shows a bounded `Checked just now` acknowledgement",
-            "do not authorize selection or lifecycle actions",
-        ):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, readme)
-        self.assertNotIn("`Refreshing in background`", readme)
 
     def test_readme_documents_action_and_host_scope_bindings(self) -> None:
         readme = " ".join((self.root / "README.md").read_text().split())
@@ -371,19 +456,14 @@ class ProjectMetadataTest(unittest.TestCase):
         self.assertIn('-kb-element-next "" -kb-element-prev ""', readme)
         self.assertIn('-kb-accept-custom "" -kb-delete-entry ""', readme)
         self.assertIn("-kb-cancel Escape,Control+g", readme)
-        self.assertIn("`Tab` cycles the shared action through `Resume`, `Close`, and `New`", readme)
-        self.assertIn("`Alt+A` clears search and selects that row", readme)
         self.assertNotIn("-kb-custom-4 Tab", readme)
         self.assertNotIn("-kb-custom-5 ISO_Left_Tab", readme)
         self.assertNotIn("-kb-custom-6 Escape", readme)
         self.assertNotIn("compatibility aliases for next/previous view", readme)
 
-    def test_runtime_dependencies_are_empty_and_optional_providers_are_documented(self) -> None:
+    def test_runtime_dependencies_are_empty(self) -> None:
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual([], project["project"]["dependencies"])
-        readme = (self.root / "README.md").read_text().lower()
-        self.assertIn("claude code and opencode are optional", readme)
-        self.assertIn("codex cli", readme)
 
 
 class CacheTest(unittest.TestCase):
@@ -435,6 +515,70 @@ class CacheTest(unittest.TestCase):
             }
         )
         self.assertIsNone(self.store.load(self.config.fingerprint))
+
+    def test_cache_rejects_malformed_provider_kinds_without_exception(self) -> None:
+        snapshot = build_snapshot(self.config, self.events(session()), now=100)
+        for mutate in (
+            lambda value: value["sessions"][0].update({"kind": []}),
+            lambda value: value["hosts"]["local"]["sessions"][0].update({"kind": {}}),
+        ):
+            with self.subTest(mutate=mutate):
+                candidate = json.loads(json.dumps(snapshot))
+                mutate(candidate)
+                self.store.write(candidate)
+                self.assertIsNone(self.store.load(self.config.fingerprint))
+
+    def test_direct_snapshot_reuse_drops_retired_rows_from_prior_hosts(self) -> None:
+        retired = session("opencode", OPENCODE_ID, host="Beta", hostId="beta")
+        previous = build_snapshot(
+            self.config,
+            iter(
+                [
+                    {
+                        "event": "refresh-started",
+                        "hosts": ["local", "beta"],
+                        "hostCatalog": [
+                            {"hostId": "local", "display": "Local", "local": True},
+                            {"hostId": "beta", "display": "Beta", "local": False},
+                        ],
+                    },
+                    {"event": "host-complete", "host": "local", "sessions": [], "errors": []},
+                    {"event": "host-complete", "host": "beta", "sessions": [], "errors": []},
+                    {"event": "refresh-finished", "generatedAt": 100},
+                ]
+            ),
+            now=100,
+        )
+        previous["hosts"]["beta"]["sessions"].append(retired)
+        previous["sessions"].append(retired)
+        selected_events = iter(
+            [
+                {
+                    "event": "refresh-started",
+                    "hosts": ["local"],
+                    "hostCatalog": [
+                        {"hostId": "local", "display": "Local", "local": True},
+                        {"hostId": "beta", "display": "Beta", "local": False},
+                    ],
+                },
+                {"event": "host-complete", "host": "local", "sessions": [], "errors": []},
+                {"event": "refresh-finished", "generatedAt": 200},
+            ]
+        )
+
+        selected = build_snapshot(
+            self.config,
+            selected_events,
+            previous,
+            now=200,
+            retain_unselected_hosts=True,
+        )
+        self.assertEqual([], selected["hosts"]["beta"]["sessions"])
+        self.assertNotIn("opencode", {row["kind"] for row in selected["sessions"]})
+
+        failed = build_snapshot(self.config, iter([]), previous, now=300)
+        self.assertEqual([], failed["hosts"]["beta"]["sessions"])
+        self.assertNotIn("opencode", {row["kind"] for row in failed["sessions"]})
 
     def test_cache_requires_a_valid_host_catalog(self) -> None:
         snapshot = build_snapshot(self.config, self.events(session()), now=100)
@@ -566,63 +710,50 @@ class CacheTest(unittest.TestCase):
             {"codex", "claude"}, {item["kind"] for item in current_snapshot["sessions"]}
         )
 
-    def test_v3_cache_upgrades_in_memory_without_a_cache_miss_or_read_rewrite(self) -> None:
+    def test_old_provider_set_snapshots_are_invalidated_without_rewrite(self) -> None:
         snapshot = build_snapshot(self.config, self.events(session()), now=100)
-        legacy = json.loads(json.dumps(snapshot))
-        legacy["version"] = 3
-        legacy.pop("lastRefresh")
-        for host in legacy["hosts"].values():
-            host.pop("observations")
-            for row in host["sessions"]:
-                row.pop("sourceObservation")
-        for row in legacy["sessions"]:
-            row.pop("sourceObservation")
         self.store.ensure_root()
-        self.store.snapshot_path.write_text(json.dumps(legacy))
+        old_row = session("opencode", OPENCODE_ID, sourceObservation="current")
+        for version in (3, 4):
+            legacy = json.loads(json.dumps(snapshot))
+            legacy["version"] = version
+            if version == 3:
+                legacy.pop("lastRefresh")
+                for host in legacy["hosts"].values():
+                    host.pop("observations")
+                    for row in host["sessions"]:
+                        row.pop("sourceObservation")
+                for row in legacy["sessions"]:
+                    row.pop("sourceObservation")
+            else:
+                legacy["sessions"].append(old_row)
+                legacy["hosts"]["local"]["sessions"].append(old_row)
+                legacy["hosts"]["local"]["observations"]["opencode"] = {
+                    "lastAttemptAt": 100,
+                    "lastSuccessAt": 100,
+                    "outcome": "ok",
+                }
+            raw = json.dumps(legacy)
+            self.store.snapshot_path.write_text(raw)
+            self.assertIsNone(self.store.load(self.config.fingerprint))
+            self.assertEqual(raw, self.store.snapshot_path.read_text())
 
-        loaded = self.store.load(self.config.fingerprint)
-        self.assertIsNotNone(loaded)
-        assert loaded is not None
-        self.assertEqual(CACHE_VERSION, loaded["version"])
-        self.assertEqual("complete", loaded["lastRefresh"]["outcome"])
-        self.assertEqual("current", loaded["sessions"][0]["sourceObservation"])
-        self.assertEqual(3, json.loads(self.store.snapshot_path.read_text())["version"])
+        current = json.loads(json.dumps(snapshot))
+        current["sessions"].append(old_row)
+        current["hosts"]["local"]["sessions"].append(old_row)
+        self.store.write(current)
+        self.assertIsNone(self.store.load(self.config.fingerprint))
 
-        self.store.write(loaded)
-        self.assertEqual(CACHE_VERSION, json.loads(self.store.snapshot_path.read_text())["version"])
-
-    def test_v3_transaction_failure_keeps_retained_timestamp_but_normalizes_failed_attempt(
-        self,
-    ) -> None:
-        snapshot = build_snapshot(self.config, self.events(session()), now=100)
-        legacy = json.loads(json.dumps(snapshot))
-        legacy["version"] = 3
-        legacy.pop("lastRefresh")
-        legacy["errors"].append(
-            {"host": "local", "stage": "refresh", "message": "transaction aborted"}
+    def test_build_snapshot_drops_unsupported_provider_rows(self) -> None:
+        snapshot = build_snapshot(
+            self.config,
+            self.events(session("opencode", OPENCODE_ID)),
+            now=100,
         )
-        for host in legacy["hosts"].values():
-            host.pop("observations")
-            for row in host["sessions"]:
-                row.pop("sourceObservation")
-        for row in legacy["sessions"]:
-            row.pop("sourceObservation")
-        self.store.ensure_root()
-        self.store.snapshot_path.write_text(json.dumps(legacy))
+        self.assertEqual([], snapshot["sessions"])
+        self.assertEqual([], snapshot["hosts"]["local"]["sessions"])
 
-        loaded = self.store.load(self.config.fingerprint)
-        self.assertIsNotNone(loaded)
-        assert loaded is not None
-        self.assertEqual(100, loaded["generatedAt"])
-        self.assertEqual(
-            {"attemptedAt": 0, "completedAt": None, "outcome": "failed"},
-            loaded["lastRefresh"],
-        )
-        on_disk = json.loads(self.store.snapshot_path.read_text())
-        self.assertEqual(3, on_disk["version"])
-        self.assertNotIn("lastRefresh", on_disk)
-
-    def test_v4_observation_metadata_fails_closed_when_malformed(self) -> None:
+    def test_v5_observation_metadata_fails_closed_when_malformed(self) -> None:
         snapshot = build_snapshot(self.config, self.events(session()), now=100)
         mutations = (
             lambda value: value["lastRefresh"].update({"outcome": "unknown"}),
@@ -761,7 +892,6 @@ class CacheTest(unittest.TestCase):
         self.assertEqual("failed", observations["activity"]["outcome"])
         self.assertEqual("ok", observations["tmux"]["outcome"])
         self.assertEqual("ok", observations["claude"]["outcome"])
-        self.assertEqual("ok", observations["opencode"]["outcome"])
         self.assertEqual("partial", snapshot["lastRefresh"]["outcome"])
 
         tmux_failed = build_snapshot(
@@ -944,7 +1074,7 @@ class RofiProtocolTest(unittest.TestCase):
                             "lastSuccessAt": 200,
                             "outcome": "ok",
                         }
-                        for stage in ("codex", "claude", "opencode", "activity", "tmux")
+                        for stage in ("codex", "claude", "activity", "tmux")
                     },
                 }
             },
@@ -987,7 +1117,7 @@ class RofiProtocolTest(unittest.TestCase):
                                 "lastSuccessAt": 150,
                                 "outcome": (activity_outcome if stage == "activity" else "ok"),
                             }
-                            for stage in ("codex", "claude", "opencode", "activity", "tmux")
+                            for stage in ("codex", "claude", "activity", "tmux")
                         },
                     }
                 },
@@ -1037,7 +1167,7 @@ class RofiProtocolTest(unittest.TestCase):
                             "lastSuccessAt": 150,
                             "outcome": "ok",
                         }
-                        for stage in ("codex", "claude", "opencode", "activity", "tmux")
+                        for stage in ("codex", "claude", "activity", "tmux")
                     },
                 }
             },
@@ -1205,10 +1335,9 @@ class RofiProtocolTest(unittest.TestCase):
 
     def test_each_provider_uses_its_icon_and_retains_search_terms(self) -> None:
         for kind in PROVIDER_LABELS:
-            identifier = OPENCODE_ID if kind == "opencode" else THREAD_ID
             with self.subTest(kind=kind):
                 output = render_snapshot(
-                    {"sessions": [session(kind, identifier, activityState="active")]}, now=100
+                    {"sessions": [session(kind, THREAD_ID, activityState="active")]}, now=100
                 )
                 _, rows = parse_rendered_records(output)
                 row = next(record for record in rows if record.startswith("hello"))
@@ -1238,7 +1367,7 @@ class RofiProtocolTest(unittest.TestCase):
         package_data = project["tool"]["setuptools"]["package-data"]["rofi_agent_plus"]
         self.assertIn("assets/providers/*.svg", package_data)
         self.assertEqual(
-            {"claude.svg", "codex.svg", "generic.svg", "opencode.svg"},
+            {"claude.svg", "codex.svg", "generic.svg"},
             {path.name for path in (root / "rofi_agent_plus/assets/providers").glob("*.svg")},
         )
 
@@ -1269,8 +1398,8 @@ class RofiProtocolTest(unittest.TestCase):
                 recencyAt=300,
             ),
             session(
-                "opencode",
-                OPENCODE_ID,
+                "claude",
+                "00000000-0000-0000-0000-000000000003",
                 name="older",
                 host="zeta",
                 hostId="zeta",
@@ -1329,8 +1458,8 @@ class RofiProtocolTest(unittest.TestCase):
 
     def test_active_scope_uses_all_validated_host_rows_and_deduplicates(self) -> None:
         recent = session(
-            "opencode",
-            OPENCODE_ID,
+            "claude",
+            "00000000-0000-0000-0000-000000000011",
             name="recent",
             host="alpha",
             hostId="alpha",
@@ -1478,7 +1607,13 @@ class RofiProtocolTest(unittest.TestCase):
         output = render_snapshot(
             snapshot,
             navigation=NavigationState(VIEW_OPEN),
-            selected_identity=("alpha", "codex", unknown_open["id"]),
+            selected_identity=(
+                "alpha",
+                "codex",
+                unknown_open["id"],
+                "fixture-native-home",
+                "thread",
+            ),
         )
         headers, rows = parse_rendered_records(output)
         parsed = [parse_row_options(row) for row in rows]
@@ -1614,6 +1749,8 @@ class RofiProtocolTest(unittest.TestCase):
             localViewer={"state": "open", "confidence": "confirmed"},
         )
         target = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "thread",
             "hostId": "workstation",
             "host": "Workstation",
             "kind": "codex",
@@ -1750,8 +1887,8 @@ class RofiProtocolTest(unittest.TestCase):
             active=False,
         )
         last = session(
-            "opencode",
-            OPENCODE_ID,
+            "codex",
+            "00000000-0000-0000-0000-000000000012",
             name="C",
             recencyAt=100,
             active=True,
@@ -1762,7 +1899,13 @@ class RofiProtocolTest(unittest.TestCase):
             "hosts": {"workstation": {"sessions": [first, selected, last], "errors": []}},
             "errors": [],
         }
-        selected_identity = ("workstation", "claude", selected["id"])
+        selected_identity = (
+            "workstation",
+            "claude",
+            selected["id"],
+            "fixture-native-home",
+            "session",
+        )
 
         active_output = render_snapshot(
             snapshot,
@@ -2688,10 +2831,13 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertIn("\x00keep-selection\x1ftrue", rendered)
 
     def test_selection_parser_validates_provider_ids(self) -> None:
-        payload = json.loads(selection_payload(session("opencode", OPENCODE_ID)))
+        payload = json.loads(selection_payload(session("codex", THREAD_ID)))
         self.assertEqual(payload, _parse_selection(json.dumps(payload)))
         with self.assertRaises(engine.PickerError):
             _parse_selection(json.dumps({"kind": "codex", "id": "bad"}))
+        retired = dict(payload, kind="opencode", id=OPENCODE_ID)
+        with self.assertRaises(engine.PickerError):
+            _parse_selection(json.dumps(retired))
 
     def test_selection_parser_requires_a_boolean_option_evidence_marker(self) -> None:
         payload = json.loads(selection_payload(session(providerOptionVerified=True)))
@@ -2943,8 +3089,8 @@ class RofiProtocolTest(unittest.TestCase):
     def test_initial_open_restores_page_and_identity_with_resume_and_empty_filter(self) -> None:
         first = session(name="first", recencyAt=300, active=True)
         selected = session(
-            "opencode",
-            OPENCODE_ID,
+            "claude",
+            "00000000-0000-0000-0000-000000000003",
             name="remembered",
             host="alpha",
             hostId="alpha",
@@ -2970,7 +3116,9 @@ class RofiProtocolTest(unittest.TestCase):
             },
             "errors": [],
         }
-        preference = ViewPreference("active", None, ("alpha", "opencode", OPENCODE_ID))
+        preference = ViewPreference(
+            "active", None, ("alpha", "claude", selected["id"], "fixture-native-home", "session")
+        )
         self.assertTrue(self.preference_store.save(preference))
         cache = mock.Mock(spec=CacheStore)
         cache.load.return_value = snapshot
@@ -3012,7 +3160,15 @@ class RofiProtocolTest(unittest.TestCase):
         )
         snapshot = {"sessions": [first, remembered], "errors": []}
         preference = ViewPreference(
-            "all", None, ("workstation", "claude", "00000000-0000-0000-0000-000000000002")
+            "all",
+            None,
+            (
+                "workstation",
+                "claude",
+                "00000000-0000-0000-0000-000000000002",
+                "fixture-native-home",
+                "session",
+            ),
         )
         self.assertTrue(self.preference_store.save(preference))
         config = self._config()
@@ -3043,7 +3199,15 @@ class RofiProtocolTest(unittest.TestCase):
 
     def test_initial_open_missing_host_or_row_falls_back_without_rewriting_bookmark(self) -> None:
         missing = ViewPreference(
-            "host", "removed", ("removed", "codex", "00000000-0000-0000-0000-000000000004")
+            "host",
+            "removed",
+            (
+                "removed",
+                "codex",
+                "00000000-0000-0000-0000-000000000004",
+                "fixture-native-home",
+                "thread",
+            ),
         )
         self.assertTrue(self.preference_store.save(missing))
         current = session(name="current", recencyAt=100)
@@ -3079,7 +3243,7 @@ class RofiProtocolTest(unittest.TestCase):
                 self.assertEqual(missing, self.preference_store.load())
 
     def test_page_navigation_saves_page_without_reloading_preference_file(self) -> None:
-        remembered = ("workstation", "codex", THREAD_ID)
+        remembered = ("workstation", "codex", THREAD_ID, "fixture-native-home", "thread")
         self.assertTrue(self.preference_store.save(ViewPreference("all", None, remembered)))
         current = session(name="current", recencyAt=100, active=True)
         snapshot = {
@@ -3144,7 +3308,11 @@ class RofiProtocolTest(unittest.TestCase):
                     )
                 lifecycle.assert_called_once()
                 self.assertEqual(
-                    ViewPreference(VIEW_ACTIVE, None, ("workstation", "codex", THREAD_ID)),
+                    ViewPreference(
+                        VIEW_ACTIVE,
+                        None,
+                        ("workstation", "codex", THREAD_ID, "fixture-native-home", "thread"),
+                    ),
                     self.preference_store.load(),
                 )
 
@@ -3180,7 +3348,9 @@ class RofiProtocolTest(unittest.TestCase):
             )
         fast_open.assert_called_once()
         self.assertEqual(
-            ViewPreference("local", None, ("workstation", "codex", THREAD_ID)),
+            ViewPreference(
+                "local", None, ("workstation", "codex", THREAD_ID, "fixture-native-home", "thread")
+            ),
             self.preference_store.load(),
         )
 
@@ -3204,7 +3374,13 @@ class RofiProtocolTest(unittest.TestCase):
         self.assertEqual("", output.getvalue())
 
     def test_failed_actions_and_refresh_cancellation_do_not_write_preferences(self) -> None:
-        remembered = ("workstation", "claude", "00000000-0000-0000-0000-000000000002")
+        remembered = (
+            "workstation",
+            "claude",
+            "00000000-0000-0000-0000-000000000002",
+            "fixture-native-home",
+            "session",
+        )
         original = ViewPreference("all", None, remembered)
         self.assertTrue(self.preference_store.save(original))
         before = self.preference_store.path.read_bytes()

@@ -20,6 +20,7 @@ from . import batch, engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig, load_config
 from .contract_lifecycle import ContractLifecycle, LifecycleError, fast_open_selection
+from .session_identity import SessionIdentity, logical_identity
 from .view_preferences import (
     ViewPreference,
     ViewPreferenceStore,
@@ -46,7 +47,7 @@ AUTO_REFRESH_DATA_PREFIX = "background-refresh:"
 AUTO_REFRESH_IDLE_DATA = "idle"
 ERROR_NOTICE_SECONDS = 3
 FAST_OPEN_FALLBACK_CODES = frozenset(
-    {"stale_session", "session_not_found", "stale_mesh", "invalid_input"}
+    {"stale_session", "session_not_found", "stale_mesh", "invalid_input", "unsupported_binding"}
 )
 ERROR_NOTICE_DATA_PREFIX = "error-notice:"
 CHECK_NOTICE_SECONDS = 2
@@ -68,12 +69,10 @@ _DISPLAY_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 PROVIDER_LABELS = {
     "codex": "Codex",
     "claude": "Claude Code",
-    "opencode": "OpenCode",
 }
 PROVIDER_SEARCH_TERMS = {
     "codex": "codex",
     "claude": "claude claude-code claude code",
-    "opencode": "opencode open-code open code",
 }
 PROVIDER_ICON_PATHS = {
     kind: Path(__file__).resolve().parent / "assets" / "providers" / f"{kind}.svg"
@@ -95,7 +94,6 @@ VIEW_HOST = "host"
 VIEW_ACTIVE = "active"
 VIEW_OPEN = "open"
 _VIEWS = frozenset({VIEW_ACTIVE, VIEW_OPEN, VIEW_ALL, VIEW_LOCAL, VIEW_HOST})
-SessionIdentity = tuple[str, str, str]
 
 
 def sanitize(value: object) -> str:
@@ -271,10 +269,16 @@ def _parse_batch_ui_state(value: object) -> BatchUIState | None:
     source_identity: SessionIdentity | None = None
     raw_identity = payload.get("sourceIdentity")
     if raw_identity is not None:
-        if not isinstance(raw_identity, list) or len(raw_identity) != 3:
+        if not isinstance(raw_identity, list) or len(raw_identity) != 5:
             return None
         source_identity = _session_identity(
-            {"hostId": raw_identity[0], "kind": raw_identity[1], "id": raw_identity[2]}
+            {
+                "hostId": raw_identity[0],
+                "kind": raw_identity[1],
+                "id": raw_identity[2],
+                "namespace": raw_identity[3],
+                "nativeIdKind": raw_identity[4],
+            }
         )
         if source_identity is None:
             return None
@@ -361,35 +365,12 @@ def _age(timestamp: object, now: float | None = None) -> str:
     return f"{days // 365}y"
 
 
-def _session_key(session: Mapping[str, Any]) -> tuple[str, str, str]:
-    return (
-        str(session.get("hostId") or session.get("host") or "local"),
-        str(session.get("kind") or ""),
-        str(session.get("id") or ""),
-    )
+def _session_key(session: Mapping[str, Any]) -> SessionIdentity:
+    return logical_identity(session) or ("", "", "", "", "")
 
 
 def _session_identity(session: Mapping[str, Any]) -> SessionIdentity | None:
-    """Return the stable logical identity of one trusted presentation row."""
-
-    host_id = session.get("hostId")
-    kind = session.get("kind")
-    identifier = session.get("id")
-    if (
-        not isinstance(host_id, str)
-        or not host_id
-        or len(host_id) > 256
-        or not _HOST_ID.fullmatch(host_id)
-        or not isinstance(kind, str)
-        or kind not in PROVIDER_LABELS
-        or not isinstance(identifier, str)
-        or not identifier
-    ):
-        return None
-    pattern = engine.OPENCODE_ID_PATTERN if kind == "opencode" else engine.UUID_PATTERN
-    if pattern.fullmatch(identifier) is None:
-        return None
-    return host_id.casefold(), kind, identifier
+    return logical_identity(session)
 
 
 def _parse_selected_identity(raw: object) -> SessionIdentity | None:
@@ -463,6 +444,7 @@ def _valid_sessions(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]:
             not isinstance(identifier, str)
             or not identifier
             or item.get("contractMode") is not True
+            or logical_identity(item) is None
         ):
             continue
         result.append(dict(item))
@@ -919,7 +901,11 @@ def selection_payload(session: Mapping[str, Any]) -> str:
 
     if session.get("contractMode") is not True:
         raise engine.PickerError("Rofi can only open contract-backed sessions")
-    payload = {key: session[key] for key in ("kind", "id", "name", "cwd", "host") if key in session}
+    payload = {
+        key: session[key]
+        for key in ("kind", "id", "name", "cwd", "host", "namespace", "nativeIdKind")
+        if key in session
+    }
     payload.update(
         {
             "contractMode": True,
@@ -968,6 +954,18 @@ def _activity_parts(
 ) -> tuple[tuple[str, str | None], ...]:
     """Return plain activity label fragments and their semantic treatments."""
 
+    if isinstance(session.get("observerSource"), Mapping):
+        work = session.get("work")
+        label = "Work unknown"
+        if isinstance(work, Mapping) and work.get("health") == "current":
+            label = {
+                "working": "Working",
+                "needs_input": "Waiting",
+                "settled": "Settled",
+                "interrupted": "Interrupted",
+                "error": "Error",
+            }.get(str(work.get("value")), "Work unknown")
+        return ((label, "neutral" if label in {"Working", "Waiting"} else None),)
     if (
         session.get("sourceObservation") == "retained"
         or session.get("activityState") == "unknown"
@@ -1817,12 +1815,9 @@ def _parse_selection(raw: str | None) -> dict[str, Any]:
         raise engine.PickerError("Rofi selection metadata is incomplete")
     if any(char in identifier for char in "\x00\n\r\t"):
         raise engine.PickerError("Rofi selection contains invalid control characters")
-    if kind == "codex" or kind == "claude":
-        if not engine.UUID_PATTERN.fullmatch(identifier):
-            raise engine.PickerError("Rofi selection contains an invalid session id")
-    elif not engine.OPENCODE_ID_PATTERN.fullmatch(identifier):
+    if not engine.UUID_PATTERN.fullmatch(identifier):
         raise engine.PickerError("Rofi selection contains an invalid session id")
-    if payload.get("contractMode") is not True:
+    if payload.get("contractMode") is not True or logical_identity(payload) is None:
         raise engine.PickerError("Rofi contract selection metadata is invalid")
     host_id = payload.get("hostId")
     backend = payload.get("backend")

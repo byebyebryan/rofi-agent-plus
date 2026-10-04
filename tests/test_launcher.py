@@ -14,6 +14,28 @@ from rofi_agent_plus import app, launcher
 
 
 class LauncherTest(unittest.TestCase):
+    def test_installed_default_mode_uses_sibling_cli_from_same_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "bin"
+            commands.mkdir()
+            agent = commands / "rofi-agent-plus"
+            agent.write_text("#!/bin/sh\nexit 0\n")
+            agent.chmod(0o700)
+            entry = commands / "rofi-agent-plus-rofi"
+            entry.write_text("#!/bin/sh\nexit 0\n")
+            entry.chmod(0o700)
+            with (
+                mock.patch("sys.argv", [str(entry)]),
+                mock.patch.object(launcher, "__file__", str(root / "site-packages/launcher.py")),
+                mock.patch.object(launcher, "run_rofi", side_effect=lambda _env: print("row")),
+                mock.patch.object(launcher.subprocess, "run") as run,
+            ):
+                run.return_value.returncode = 0
+                self.assertEqual(0, launcher.main([]))
+                argv = run.call_args.args[0]
+                self.assertEqual(f"agent-plus:{agent}", argv[argv.index("-modes") + 1])
+
     def test_initial_frame_is_shared_and_removed_without_second_discovery(self) -> None:
         frame = "\x00new-selection\x1f2\n\x00delim\x1f\\t\na\tb\tc\t"
         path_seen: list[Path] = []

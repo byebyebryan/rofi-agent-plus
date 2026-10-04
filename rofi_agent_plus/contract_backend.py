@@ -1,6 +1,8 @@
-"""Process-only Host Mesh/Tmux Session discovery backend.
+"""Host Mesh/Tmux routing plus Agent Observer session discovery backend.
 
-This module deliberately knows only the public JSON contracts.  Tmux Plus is
+Provider facts arrive through one host-scoped Agent Observer JSON command.
+Tmux Plus remains a separate inventory; this module does not correlate its
+provider options or process records with Observer sessions. Tmux Plus is
 required; when SSH Plus is absent it synthesizes the documented local-only
 identity rather than reviving an Agent-owned SSH or tmux path.
 """
@@ -17,7 +19,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
@@ -28,26 +29,29 @@ from threading import Event, Lock
 from typing import Any
 
 from . import engine
-from .claude_probe import SESSION_PROBE as CLAUDE_SESSION_PROBE
-from .codex import AppServerClient
-from .opencode_probe import SESSION_PROBE as OPENCODE_SESSION_PROBE
+from .claude_actions import (
+    MAX_BACKGROUND_STDOUT,
+    ClaudeActionError,
+    background_session,
+    parse_background_job_id,
+    workspace_trust_required,
+)
+from .observer_contract import ObserverContractError, ObserverSnapshot, parse_snapshot
 from .wire import WireError, decode_document, validate_string_bounds
 
 _MAX_STDOUT = 1 << 20
 _MAX_STDERR = 1 << 16
 _MAX_HOST_STDOUT = 512 * 1024
 _MAX_INVENTORY_STDOUT = 1 << 20
-_MAX_COMPOSITE_STAGE_STDOUT = 128 * 1024
-_MAX_COMPOSITE_STAGE_STDERR = 16 * 1024
 _MAX_FIELD = 16 * 1024
 _MAX_HOSTS = 128
+_DEFAULT_PROVIDERS = ("codex", "claude")
+_PROVIDER_STAGE = {"codex": "threads", "claude": "claude"}
 _HOST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", re.ASCII)
 _SESSION_ID = re.compile(r"^\$[0-9]+$", re.ASCII)
 _PANE_ID = re.compile(r"^%[0-9]+$", re.ASCII)
 _REVISION = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 _ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$", re.ASCII)
-_UUID = engine.UUID_PATTERN
-_OPENCODE = engine.OPENCODE_ID_PATTERN
 _MARKER_PREFIX = "\x1eROFI_PLUS_REACHED_V1:"
 _MARKER_SUFFIX = "\x1f\n"
 _TRANSPORT_TEXT = (
@@ -67,14 +71,12 @@ _OPTIONS = (
     "@codex_name",
     "@claude_session_id",
     "@claude_name",
-    "@opencode_session_id",
-    "@opencode_name",
     "@agent_picker_waiting",
 )
 _MAX_HOST_WORKERS = 8
 _WHOLE_REFRESH_MIN_SECONDS = 12.0
 _WHOLE_REFRESH_MAX_SECONDS = 30.0
-_NEW_SESSION_EXECUTABLES = frozenset({"codex", "claude", "opencode"})
+_NEW_SESSION_EXECUTABLES = frozenset({"codex", "claude"})
 _PREFLIGHT_CWD_MISSING = 11
 _PREFLIGHT_PROVIDER_MISSING = 12
 _PREFLIGHT_PROVIDER_PROGRAM = r"""cwd=$1
@@ -84,6 +86,23 @@ if [ ! -d "$cwd" ]; then
 fi
 command -v "$provider" >/dev/null 2>&1 || exit 12
 """
+_CLAUDE_BACKGROUND_PROGRAM = r"""cwd=$1
+config_home=$2
+config_home_kind=$3
+settings=$4
+resume_id=$5
+cd "$cwd" || exit 11
+if [ -n "$resume_id" ]; then
+  set -- --resume "$resume_id" --bg
+else
+  set -- --bg
+fi
+if [ "$config_home_kind" = default ]; then
+  exec env -u CLAUDE_CONFIG_DIR claude --settings "$settings" "$@"
+fi
+exec env CLAUDE_CONFIG_DIR="$config_home" claude --settings "$settings" "$@"
+"""
+_CLAUDE_BACKGROUND_SETTINGS = '{"worktree":{"bgIsolation":"none"}}'
 
 
 class ContractError(engine.PickerError):
@@ -126,6 +145,7 @@ def _run_bounded(
     argv: Sequence[str],
     *,
     input_data: bytes | None = None,
+    cwd: str | None = None,
     timeout: float,
     stdout_limit: int = _MAX_STDOUT,
     stderr_limit: int = _MAX_STDERR,
@@ -157,6 +177,7 @@ def _run_bounded(
             stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=cwd,
             close_fds=True,
             start_new_session=True,
         )
@@ -691,365 +712,6 @@ exec "$@"'''
     ]
 
 
-# This is provider/process discovery only.  It intentionally contains no
-# tmux invocation or parsing: pane ownership comes solely from Tmux Plus.
-_ACTIVE_PROBE = r"""
-import json, os, re, socket, subprocess
-from pathlib import Path
-uuid=re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
-opencode_re=re.compile(r"ses_[A-Za-z0-9]+")
-root=Path(os.environ.get("ROFI_AGENT_PLUS_PROC_ROOT","/proc")); parents={}; rows=[]
-try: output=subprocess.run(["ps","-u",str(os.getuid()),"-o","pid=,ppid=,comm="],capture_output=True,text=True,check=True).stdout
-except Exception as error: raise SystemExit("provider process table failed: %s" % error)
-for line in output.splitlines():
- p=line.split(None,2)
- if len(p)!=3: continue
- try: pid,ppid=int(p[0]),int(p[1])
- except ValueError: continue
- parents[pid]=ppid; rows.append((pid,p[2].lower()))
-def args(pid):
- try: return (root/str(pid)/"cmdline").read_bytes().decode(errors="replace").split("\0")
- except OSError: return []
-def ancestry(pid):
- out=[]; seen=set()
- while pid>1 and pid not in seen:
-  seen.add(pid); out.append(pid); pid=parents.get(pid,0)
- return out[:128]
-def shared(arguments):
- try: begin=arguments.index("app-server")
- except ValueError: return False
- values=arguments[begin+1:]
- for i,value in enumerate(values):
-  endpoint=values[i+1] if value=="--listen" and i+1<len(values) else value.partition("=")[2] if value.startswith("--listen=") else None
-  if endpoint is not None: return endpoint not in {"stdio://","off"}
- return False
-def subagent(path):
- try:
-  record=json.loads(Path(path).open(encoding="utf-8").readline())
- except (OSError,UnicodeError,json.JSONDecodeError): return None
- payload=record.get("payload") if isinstance(record,dict) else None
- source=payload.get("source") if isinstance(payload,dict) else None
- return isinstance(source,dict) and "subagent" in source
-def codex_id(pid):
- values={}
- try: entries=sorted((root/str(pid)/"fd").iterdir(),key=lambda item:item.name)
- except OSError: return None
- for entry in entries:
-  try: target=os.readlink(entry)
-  except OSError: continue
-  match=uuid.search(target)
-  if "rollout-" not in target or ".jsonl" not in target or not match: continue
-  ident=match.group(1).lower(); child=subagent(target)
-  if ident not in values or (values[ident] is True and child is not True): values[ident]=child
- for child in (False,None):
-  found=sorted(ident for ident,value in values.items() if value is child)
-  if found: return found[0]
- return None
-def claude_id(pid,arguments):
- for i,value in enumerate(arguments):
-  if value in ("--resume","-r","--session-id") and i+1<len(arguments) and uuid.fullmatch(arguments[i+1].lower()): return arguments[i+1].lower()
-  for flag in ("--resume=","--session-id="):
-   if value.startswith(flag) and uuid.fullmatch(value[len(flag):].lower()): return value[len(flag):].lower()
- try: entries=(root/str(pid)/"fd").iterdir()
- except OSError: return None
- # A fresh Claude TUI can close its transcript but retains its session task directory.
- task_sessions=set()
- for entry in entries:
-  try: path=Path(os.readlink(entry))
-  except OSError: continue
-  if path.suffix==".jsonl" and "projects" in path.parts and uuid.fullmatch(path.stem.lower()): return path.stem.lower()
-  if path.name=="tasks" and uuid.fullmatch(path.parent.name) and path.parent.parent.parent.name=="claude-%s" % os.getuid(): task_sessions.add(path.parent.name.lower())
- if len(task_sessions)==1: return next(iter(task_sessions))
- return None
-def open_id(arguments):
- for i,value in enumerate(arguments):
-  if value in ("--session","-s") and i+1<len(arguments) and opencode_re.fullmatch(arguments[i+1]): return arguments[i+1]
-  if value.startswith("--session=") and opencode_re.fullmatch(value.partition("=")[2]): return value.partition("=")[2]
- return None
-def put(dst,ident,pid):
- if ident: dst.setdefault(ident,{"candidates":[]})["candidates"].append({"pid":pid,"ancestors":ancestry(pid)})
-codex={}; claude={}; opencode={}
-for pid,command in rows:
- a=args(pid)
- if "codex" in command and not shared(a): put(codex,codex_id(pid),pid)
- if "claude" in command: put(claude,claude_id(pid,a),pid)
- if "opencode" in command: put(opencode,open_id(a),pid)
-print(json.dumps({"nativeHostname":socket.gethostname(),"parents":parents,"active":codex,"claudeActive":claude,"opencodeActive":opencode},separators=(",",":")))
-"""
-
-
-# Remote process discovery is deliberately one bounded SSH domain command.
-# The child probes remain separate processes: a corrupted transcript, an
-# unavailable binary, or an activity-table failure must not turn into a false
-# failure for a successful sibling.  The parent prints the *only* JSON record
-# on stdout after it has reaped every child.
-_COMPOSITE_PROBE_TEMPLATE = r"""
-import json, os, selectors, signal, subprocess, sys, time
-from concurrent.futures import ThreadPoolExecutor
-
-STAGE_STDOUT_LIMIT = __STAGE_STDOUT_LIMIT__
-STAGE_STDERR_LIMIT = __STAGE_STDERR_LIMIT__
-SOURCES = {
-    "active": __ACTIVE_SOURCE__,
-    "claude": __CLAUDE_SOURCE__,
-    "opencode": __OPENCODE_SOURCE__,
-}
-
-
-class StageTimeout(Exception):
-    pass
-
-
-class StageLimit(Exception):
-    pass
-
-
-def clean(value):
-    return " ".join(str(value).split())[:1024] or "stage failed"
-
-
-def terminate(process):
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        process.kill()
-    process.wait()
-
-
-def capture(source, arguments, timeout):
-    process = None
-    poller = None
-    try:
-        process = subprocess.Popen(
-            [sys.executable, "-c", source, *arguments],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            start_new_session=True,
-        )
-        poller = selectors.DefaultSelector()
-        poller.register(process.stdout, selectors.EVENT_READ, "stdout")
-        poller.register(process.stderr, selectors.EVENT_READ, "stderr")
-        buffers = {"stdout": bytearray(), "stderr": bytearray()}
-        deadline = time.monotonic() + timeout
-        while poller.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise StageTimeout()
-            for key, _events in poller.select(remaining):
-                chunk = os.read(key.fileobj.fileno(), 65536)
-                if not chunk:
-                    poller.unregister(key.fileobj)
-                    continue
-                buffers[key.data].extend(chunk)
-                limit = STAGE_STDOUT_LIMIT if key.data == "stdout" else STAGE_STDERR_LIMIT
-                if len(buffers[key.data]) > limit:
-                    raise StageLimit(key.data)
-        try:
-            code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired as error:
-            raise StageTimeout() from error
-        return code, bytes(buffers["stdout"]), bytes(buffers["stderr"])
-    except (StageTimeout, StageLimit):
-        if process is not None:
-            terminate(process)
-        raise
-    finally:
-        if process is not None:
-            terminate(process)
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
-        if poller is not None:
-            poller.close()
-
-
-def stage(name, source, arguments, timeout):
-    try:
-        code, stdout, stderr = capture(source, arguments, timeout)
-    except StageTimeout:
-        return {"ok": False, "error": {"code": "timed_out", "message": "stage timed out"}}
-    except StageLimit as error:
-        return {"ok": False, "error": {"code": "output_limit", "message": clean(error)}}
-    except Exception as error:
-        return {"ok": False, "error": {"code": "start_failed", "message": clean(error)}}
-    if code != 0:
-        return {"ok": False, "error": {"code": "exit_%d" % code, "message": clean(stderr)}}
-    try:
-        payload = json.loads(stdout.decode("utf-8", "strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        return {"ok": False, "error": {"code": "invalid_json", "message": clean(error)}}
-    if not isinstance(payload, dict):
-        return {"ok": False, "error": {"code": "invalid_json", "message": "stage returned a non-object"}}
-    return {"ok": True, "payload": payload}
-
-
-def main():
-    timeout = max(0.05, float(sys.argv[1]))
-    maximum = str(max(1, int(sys.argv[2])))
-    arguments = {
-        "active": [],
-        "claude": [maximum, ""],
-        "opencode": [maximum, ""],
-    }
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="rofi-agent-composite") as pool:
-        futures = {
-            name: pool.submit(stage, name, source, arguments[name], timeout)
-            for name, source in SOURCES.items()
-        }
-        stages = {name: future.result() for name, future in futures.items()}
-    print(json.dumps({"schemaVersion": 1, "stages": stages}, separators=(",", ":")))
-
-
-main()
-"""
-
-
-def _composite_probe_input() -> bytes:
-    """Render the remote-only, self-contained provider probe transaction."""
-
-    source = (
-        _COMPOSITE_PROBE_TEMPLATE.replace(
-            "__STAGE_STDOUT_LIMIT__", str(_MAX_COMPOSITE_STAGE_STDOUT)
-        )
-        .replace("__STAGE_STDERR_LIMIT__", str(_MAX_COMPOSITE_STAGE_STDERR))
-        .replace("__ACTIVE_SOURCE__", repr(_ACTIVE_PROBE))
-        .replace("__CLAUDE_SOURCE__", repr(CLAUDE_SESSION_PROBE))
-        .replace("__OPENCODE_SOURCE__", repr(OPENCODE_SESSION_PROBE))
-    )
-    # The remote program gives its own children a bounded share of the same
-    # refresh budget.  The outer SSH command keeps the authoritative absolute
-    # deadline and reaps its local process group on a transport failure.
-    return source.encode("utf-8")
-
-
-def _validate_active(payload: object) -> dict[str, object]:
-    if not isinstance(payload, Mapping):
-        raise ContractError("provider activity probe returned invalid JSON")
-    native = _text(payload.get("nativeHostname"), "native hostname")
-    result: dict[str, object] = {"nativeHostname": native}
-    for key, pattern in (("active", _UUID), ("claudeActive", _UUID), ("opencodeActive", _OPENCODE)):
-        value = payload.get(key)
-        if not isinstance(value, Mapping):
-            raise ContractError("provider activity probe returned invalid data")
-        clean: dict[str, dict[str, object]] = {}
-        for identifier, details in value.items():
-            if not isinstance(identifier, str) or not pattern.fullmatch(identifier):
-                raise ContractError("provider activity probe returned invalid data")
-            if isinstance(details, Mapping) and isinstance(details.get("candidates"), list):
-                raw_candidates = details["candidates"]
-            elif isinstance(details, Mapping):
-                # Accept the first P5a draft's single-candidate probe shape
-                # while normalizing it before correlation.
-                raw_candidates = [details]
-            else:
-                raise ContractError("provider activity probe returned invalid data")
-            if not 1 <= len(raw_candidates) <= 128:
-                raise ContractError("provider activity probe returned invalid data")
-            candidates: list[dict[str, object]] = []
-            seen_pids: set[int] = set()
-            for candidate in raw_candidates:
-                if not isinstance(candidate, Mapping):
-                    raise ContractError("provider activity probe returned invalid data")
-                pid = candidate.get("pid")
-                ancestors = candidate.get("ancestors")
-                if (
-                    isinstance(pid, bool)
-                    or not isinstance(pid, int)
-                    or pid < 1
-                    or pid in seen_pids
-                    or not isinstance(ancestors, list)
-                ):
-                    raise ContractError("provider activity probe returned invalid data")
-                chain = [
-                    item
-                    for item in ancestors
-                    if isinstance(item, int) and not isinstance(item, bool) and item > 0
-                ]
-                if len(chain) != len(ancestors) or len(chain) > 128:
-                    raise ContractError("provider activity probe returned invalid data")
-                seen_pids.add(pid)
-                candidates.append({"pid": pid, "ancestors": chain})
-            clean[identifier.lower() if key != "opencodeActive" else identifier] = {
-                "candidates": candidates,
-            }
-        result[key] = clean
-    return result
-
-
-def _validate_session_payload(payload: object, label: str) -> dict[str, object]:
-    """Validate the narrow common envelope shared by history probes."""
-
-    if not isinstance(payload, Mapping):
-        raise ContractError(f"{label} session query returned invalid data")
-    if not isinstance(payload.get("installed"), bool) or not isinstance(
-        payload.get("sessions"), list
-    ):
-        raise ContractError(f"{label} session query returned invalid data")
-    return dict(payload)
-
-
-def _composite_results(
-    command: CommandOutput,
-) -> tuple[dict[str, object] | Exception, object, object]:
-    """Project a composite envelope into independent provider-stage results."""
-
-    try:
-        payload = _json(
-            command,
-            "provider composite transaction",
-            limit=_MAX_HOST_STDOUT,
-        )
-        if (
-            payload.get("schemaVersion") != 1
-            or isinstance(payload.get("schemaVersion"), bool)
-            or not isinstance(payload.get("schemaVersion"), int)
-            or not isinstance(payload.get("stages"), Mapping)
-        ):
-            raise ContractError("provider composite transaction returned invalid data")
-        stages = payload["stages"]
-        assert isinstance(stages, Mapping)
-        if set(stages) != {"active", "claude", "opencode"}:
-            raise ContractError("provider composite transaction returned invalid data")
-    except ContractError as error:
-        return error, error, error
-
-    def stage(
-        name: str,
-        label: str,
-        validator: Callable[[object], object],
-    ) -> object:
-        entry = stages.get(name)
-        if not isinstance(entry, Mapping) or not isinstance(entry.get("ok"), bool):
-            return ContractError(f"{label} session query returned invalid composite stage")
-        if entry["ok"] is True:
-            if set(entry) != {"ok", "payload"}:
-                return ContractError(f"{label} session query returned invalid composite stage")
-            try:
-                return validator(entry["payload"])
-            except ContractError as error:
-                return error
-        if set(entry) != {"ok", "error"} or not isinstance(entry.get("error"), Mapping):
-            return ContractError(f"{label} session query returned invalid composite stage")
-        error = entry["error"]
-        assert isinstance(error, Mapping)
-        try:
-            code = _error_code(error.get("code"), "provider composite stage error")
-            message = _text(error.get("message"), "provider composite stage error")
-        except ContractError:
-            return ContractError(f"{label} session query returned invalid composite stage")
-        return ContractError(f"{label} session query failed [{code}]: {message}")
-
-    return (
-        stage("active", "provider activity probe", _validate_active),
-        stage("claude", "Claude", lambda value: _validate_session_payload(value, "Claude")),
-        stage("opencode", "opencode", lambda value: _validate_session_payload(value, "opencode")),
-    )
-
-
 def _inventory_args(tmux_command: str, mesh: Mesh, *, with_viewers: bool = False) -> list[str]:
     argv = [tmux_command, "inventory", "--json", "--panes"]
     if with_viewers:
@@ -1327,89 +989,6 @@ def _tmux_reference(session: Mapping[str, object], revision: str | None) -> dict
     }
 
 
-def _tmux_association(
-    host: Mapping[str, object],
-    provider: str,
-    identifier: str,
-    active: Mapping[str, object],
-    revision: str | None,
-) -> tuple[dict[str, object] | None, str | None]:
-    """Return one conservative association or an ambiguity diagnostic.
-
-    Options and process ancestry are independent evidence.  We never choose a
-    first claimant: duplicated option claims, duplicated pane claims, or a
-    disagreement between those sources are explicitly ambiguous.
-    """
-
-    option = {
-        "codex": "@codex_thread_id",
-        "claude": "@claude_session_id",
-        "opencode": "@opencode_session_id",
-    }[provider]
-    active_ancestors: set[int] = set()
-    if isinstance(active, Mapping):
-        candidates = active.get("candidates")
-        if not isinstance(candidates, list):
-            candidates = [active]
-        for candidate in candidates:
-            if isinstance(candidate, Mapping):
-                active_ancestors.update(
-                    item
-                    for item in candidate.get("ancestors", [])
-                    if isinstance(item, int) and not isinstance(item, bool) and item > 0
-                )
-    option_claims: dict[tuple[str, str, int], dict[str, object]] = {}
-    process_claims: dict[tuple[str, str, int], dict[str, object]] = {}
-    for session in host.get("sessions", []):
-        if not isinstance(session, Mapping):
-            raise ContractError("Tmux Session inventory session is invalid")
-        reference = _tmux_reference(session, revision)
-        options = session.get("options")
-        panes = session.get("panes")
-        if (
-            not isinstance(options, Mapping)
-            or not isinstance(panes, list)
-            or set(_OPTIONS) - set(options)
-        ):
-            raise ContractError("Tmux Session inventory omitted requested pane metadata")
-        key = (
-            str(reference["serverGeneration"]),
-            str(reference["sessionId"]),
-            int(reference["createdAt"]),
-        )
-        candidate = dict(reference)
-        candidate["pending"] = (
-            session.get("pending") is True or options.get("@agent_picker_waiting") == "1"
-        )
-        if options.get(option) == identifier:
-            # A required provider option is the only discovery evidence that
-            # can safely skip the expensive selected-host revalidation on
-            # open.  Process ancestry remains useful correlation evidence,
-            # but it is a transient observation and is deliberately not
-            # eligible for the guarded lifecycle fast path.
-            candidate["providerOptionVerified"] = True
-            option_claims[key] = candidate
-        for pane in panes:
-            if not isinstance(pane, Mapping) or not _PANE_ID.fullmatch(
-                str(pane.get("paneId") or "")
-            ):
-                raise ContractError("Tmux Session pane is invalid")
-            pid = pane.get("pid")
-            if isinstance(pid, int) and not isinstance(pid, bool) and pid in active_ancestors:
-                process_claims[key] = candidate
-
-    option_keys = set(option_claims)
-    process_keys = set(process_claims)
-    if len(option_keys) > 1 or len(process_keys) > 1:
-        return None, "ambiguous provider correlation"
-    if option_keys and process_keys and option_keys != process_keys:
-        return None, "provider option conflicts with process correlation"
-    key = next(iter(option_keys or process_keys), None)
-    if key is None:
-        return None, None
-    return option_claims.get(key) or process_claims.get(key), None
-
-
 class ContractBackend:
     """Contract-backed discovery with one bounded Mesh retry on stale state."""
 
@@ -1629,6 +1208,57 @@ class ContractBackend:
                         self._report_flights.pop(key, None)
                     flight.completed.set()
 
+    def _observer_snapshot(
+        self,
+        host: MeshHost,
+        deadline: float,
+        *,
+        providers: tuple[str, ...] = _DEFAULT_PROVIDERS,
+    ) -> tuple[str | None, ObserverSnapshot | ContractError]:
+        """Read one host-scoped Observer document without provider fallbacks."""
+
+        route: str | None = None
+        argv = ["agent-observer", "snapshot", "--host-scope", host.host_id]
+        if providers != _DEFAULT_PROVIDERS:
+            for provider in providers:
+                argv.extend(("--provider", provider))
+        try:
+            if host.local:
+                command: CommandOutput | ContractError = self._run(
+                    argv,
+                    timeout=self._remaining(deadline),
+                    stdout_limit=_MAX_HOST_STDOUT,
+                    stderr_limit=_MAX_STDERR,
+                )
+            else:
+                route, command = self._remote_command(
+                    host,
+                    deadline,
+                    remote_argv=argv,
+                    input_data=None,
+                    label="Agent Observer snapshot",
+                    stdout_limit=_MAX_HOST_STDOUT,
+                )
+            if isinstance(command, StaleMeshError):
+                raise command
+            if isinstance(command, ContractError):
+                return route, command
+            if command.timed_out or command.returncode != 0:
+                return route, ContractError("Agent Observer snapshot command failed")
+            try:
+                return route, parse_snapshot(
+                    _command_bytes(command, "stdout"),
+                    expected_host_scope=host.host_id,
+                    expected_providers=providers,
+                    limit=_MAX_HOST_STDOUT,
+                )
+            except ObserverContractError as error:
+                return route, ContractError(_bounded_text(error))
+        except StaleMeshError:
+            raise
+        except ContractError as error:
+            return route, ContractError(_bounded_text(error))
+
     def _remote_command(
         self,
         host: MeshHost,
@@ -1757,298 +1387,254 @@ class ContractBackend:
             raise ContractError("provider executable is unavailable on selected host")
         raise ContractError("provider launch preflight failed")
 
-    def _remote_active(
-        self, host: MeshHost, deadline: float
-    ) -> tuple[str | None, dict[str, object] | Exception]:
-        route, result = self._remote_command(
-            host,
-            deadline,
-            remote_argv=("python3", "-"),
-            input_data=_ACTIVE_PROBE.encode(),
-            label="provider activity probe",
-        )
-        if isinstance(result, ContractError):
-            return route, result
-        if result.returncode != 0:
-            return route, ContractError(
-                f"provider activity probe failed: {_bounded_text(result.stderr)}"
-            )
-        try:
-            return route, _validate_active(_json(result, "provider activity probe"))
-        except ContractError as error:
-            return route, error
-
-    def _remote_composite(
+    def create_claude_background(
         self,
-        host: MeshHost,
-        config: Any,
+        host_id: str,
+        cwd: str,
+        config_home: str,
+        namespace: str,
+        *,
+        config_home_kind: str,
         deadline: float,
-    ) -> tuple[str | None, object, object, object]:
-        """Collect active, Claude, and opencode through one marked command."""
-
-        assert self.mesh is not None
-        child_timeout = min(
-            engine.DEFAULT_TIMEOUT,
-            float(self.mesh.connect_timeout + 3),
-            self._remaining(deadline),
+    ) -> dict[str, object]:
+        """Create one empty supervised session without a provider retry."""
+        return self._claude_background(
+            host_id,
+            cwd,
+            config_home,
+            namespace,
+            config_home_kind=config_home_kind,
+            deadline=deadline,
         )
-        route, command = self._remote_command(
-            host,
-            deadline,
-            remote_argv=(
-                "python3",
-                "-",
-                f"{max(0.05, child_timeout):.3f}",
-                str(config.max_sessions),
-            ),
-            input_data=_composite_probe_input(),
-            label="provider composite transaction",
-            stdout_limit=_MAX_HOST_STDOUT,
-        )
-        if isinstance(command, ContractError):
-            return route, command, command, command
-        active, claude, opencode = _composite_results(command)
-        return route, active, claude, opencode
 
-    def _active(
-        self, host: MeshHost, deadline: float
-    ) -> tuple[str | None, dict[str, object] | Exception]:
-        if host.local:
-            try:
-                output = self._run(
-                    [sys.executable, "-"],
-                    input_data=_ACTIVE_PROBE.encode(),
-                    timeout=self._remaining(deadline),
-                )
-                return None, _validate_active(_json(output, "provider activity probe"))
-            except Exception as error:  # noqa: BLE001 - provider stage remains isolated
-                return None, error
-        return self._remote_active(host, deadline)
-
-    def _remote_codex_threads(self, host: MeshHost, config: Any, deadline: float) -> object:
-        """Discover Codex through marked app-server attempts, never bare SSH."""
-
-        assert self.mesh is not None
-        unclassified: str | None = None
-        for route in host.routes:
-            nonce = secrets.token_hex(16)
-            marker = _marker(nonce).encode()
-            client: AppServerClient | None = None
-            reached = False
-            reported_reachable = False
-            diagnostic = ""
-            try:
-                client = AppServerClient(
-                    _ssh_argv(self.mesh, route, nonce, ("codex", "app-server", "--stdio")),
-                    min(engine.DEFAULT_TIMEOUT, self._remaining(deadline)),
-                    engine.VERSION,
-                    ContractError,
-                    stdout_limit=_MAX_STDOUT,
-                    stderr_limit=_MAX_STDERR,
-                    reached_marker=marker,
-                )
-                # The reached-host handshake is the first bounded remote
-                # discovery stage.  Its per-route allowance mirrors the
-                # other marked SSH commands, retaining enough time for the
-                # configured connection timeout without letting one route
-                # consume the whole refresh budget and suppress fallback.
-                reached, diagnostic = client.wait_for_marker(
-                    min(float(self.mesh.connect_timeout + 4), self._remaining(deadline))
-                )
-                if not reached:
-                    if _transport_failure(diagnostic):
-                        self._report_hint(host, route, "unreachable", deadline)
-                    else:
-                        unclassified = _bounded_text(diagnostic or "missing reached-host marker")
-                    continue
-                self._report_hint(host, route, "reachable", deadline)
-                reported_reachable = True
-                client.timeout = self._remaining(deadline)
-                client.initialize()
-                client.timeout = self._remaining(deadline)
-                payload = client.call(
-                    "thread/list",
-                    {
-                        "archived": False,
-                        "limit": config.max_sessions,
-                        "sortDirection": "desc",
-                        "sortKey": "recency_at",
-                        "sourceKinds": ["cli"],
-                        "useStateDbOnly": True,
-                    },
-                )
-                if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
-                    raise ContractError("Codex app-server returned invalid thread list")
-                return [item for item in payload["data"] if isinstance(item, dict)]
-            except StaleMeshError:
-                raise
-            except ContractError as error:
-                if client is not None:
-                    reached, diagnostic = client.marker_result()
-                if reached:
-                    # Domain failure after an exact marker is final and does
-                    # not receive a second route attempt.
-                    if not reported_reachable:
-                        try:
-                            self._report_hint(host, route, "reachable", deadline)
-                        except StaleMeshError:
-                            raise
-                    raise error
-                if _transport_failure(diagnostic or str(error), "timed out" in str(error)):
-                    self._report_hint(host, route, "unreachable", deadline)
-                else:
-                    unclassified = _bounded_text(diagnostic or error)
-            finally:
-                if client is not None:
-                    client.close()
-        raise ContractError(unclassified or "Codex app-server could not reach host")
-
-    def _provider_results(
-        self, host: MeshHost, config: Any, deadline: float
-    ) -> tuple[object, object, object]:
-        assert self.mesh is not None
-
-        if not host.local:
-            _route, codex, claude, opencode, _active = self._remote_provider_results(
-                host, config, deadline
-            )
-            return codex, claude, opencode
-
-        def session_probe(probe: str, label: str) -> object:
-            timeout = min(engine.DEFAULT_TIMEOUT, self._remaining(deadline))
-            arguments = [str(config.max_sessions), ""]
-            argv = [sys.executable, "-", *arguments]
-            command = self._run(argv, input_data=probe.encode(), timeout=timeout)
-            payload = _json(
-                command,
-                f"{label} session query",
-            )
-            return _validate_session_payload(payload, label)
-
-        def codex_threads() -> object:
-            timeout = min(engine.DEFAULT_TIMEOUT, self._remaining(deadline))
-            command = ["codex", "app-server", "--stdio"]
-            with AppServerClient(
-                command,
-                timeout,
-                engine.VERSION,
-                ContractError,
-                stdout_limit=_MAX_STDOUT,
-                stderr_limit=_MAX_STDERR,
-            ) as client:
-                client.timeout = self._remaining(deadline)
-                client.initialize()
-                client.timeout = self._remaining(deadline)
-                payload = client.call(
-                    "thread/list",
-                    {
-                        "archived": False,
-                        "limit": config.max_sessions,
-                        "sortDirection": "desc",
-                        "sortKey": "recency_at",
-                        "sourceKinds": ["cli"],
-                        "useStateDbOnly": True,
-                    },
-                )
-            if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
-                raise ContractError("Codex app-server returned invalid thread list")
-            return [item for item in payload["data"] if isinstance(item, dict)]
-
-        def result(call: Callable[[], object]) -> object:
-            try:
-                return call()
-            except Exception as error:  # noqa: BLE001 - independent provider stages
-                return error
-
-        # Provider failures are independent rows, not a reason to discard a
-        # reached Host Mesh identity or a successful sibling provider.
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="rofi-agent-provider") as pool:
-            futures = [
-                pool.submit(result, call)
-                for call in (
-                    codex_threads,
-                    lambda: session_probe(CLAUDE_SESSION_PROBE, "Claude"),
-                    lambda: session_probe(OPENCODE_SESSION_PROBE, "opencode"),
-                )
-            ]
-            return tuple(future.result() for future in futures)  # type: ignore[return-value]
-
-    def _remote_provider_results(
+    def resume_claude_background(
         self,
-        host: MeshHost,
-        config: Any,
+        host_id: str,
+        cwd: str,
+        config_home: str,
+        namespace: str,
+        session_id: str,
+        *,
+        config_home_kind: str,
         deadline: float,
-    ) -> tuple[str | None, object, object, object, object]:
-        """Run the two independent remote discovery domains concurrently."""
+    ) -> dict[str, object]:
+        """Resume the exact saved UUID once, then resolve its actual job/session.
 
-        def composite() -> tuple[str | None, object, object, object]:
-            try:
-                return self._remote_composite(host, config, deadline)
-            except StaleMeshError:
-                raise
-            except Exception as error:  # noqa: BLE001 - Codex may still succeed
-                return None, error, error, error
+        Claude may copy history into another UUID. The native command's exact
+        attach cue selects the job; public Observer identity selects the actual
+        session. Neither UUID prefixes nor directory/title matches correlate it.
+        """
+        if not isinstance(session_id, str) or not engine.UUID_PATTERN.fullmatch(session_id):
+            raise ContractError("Claude saved resume identity is invalid")
+        return self._claude_background(
+            host_id,
+            cwd,
+            config_home,
+            namespace,
+            config_home_kind=config_home_kind,
+            deadline=deadline,
+            resume_session_id=session_id,
+        )
 
-        def codex() -> object:
-            try:
-                return self._remote_codex_threads(host, config, deadline)
-            except StaleMeshError:
-                raise
-            except Exception as error:  # noqa: BLE001 - a composite sibling may still succeed
-                return error
+    def _claude_background(
+        self,
+        host_id: str,
+        cwd: str,
+        config_home: str,
+        namespace: str,
+        *,
+        config_home_kind: str,
+        deadline: float,
+        resume_session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Invoke one native command with closed stdin and validate its result.
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rofi-agent-remote") as pool:
-            composite_future = pool.submit(composite)
-            codex_future = pool.submit(codex)
-            route, active, claude, opencode = composite_future.result()
-            codex_threads = codex_future.result()
-        return route, codex_threads, claude, opencode, active
-
-    @staticmethod
-    def _append_active_only_rows(
-        sessions: list[dict[str, object]],
-        active: object,
-    ) -> None:
-        """Keep a provider-active process visible even when history is absent.
-
-        It is intentionally not given a guessed tmux reference.  The later
-        correlation pass can add one only when Tmux Plus provides unambiguous
-        evidence for this exact provider identifier.
+        Remote actions pin one configured route. An uncertain command or
+        transport outcome never falls through to a retry or another route.
         """
 
-        if not isinstance(active, Mapping):
-            return
-        present = {(str(row.get("kind")), str(row.get("id"))) for row in sessions}
-        for kind, key in (
-            ("codex", "active"),
-            ("claude", "claudeActive"),
-            ("opencode", "opencodeActive"),
+        def absolute_context(value: object) -> bool:
+            return (
+                isinstance(value, str)
+                and bool(value)
+                and value.startswith("/")
+                and not value.startswith("//")
+                and len(value) <= _MAX_FIELD
+                and not any(unicodedata.category(char).startswith("C") for char in value)
+            )
+
+        if (
+            not isinstance(host_id, str)
+            or not _HOST_ID.fullmatch(host_id)
+            or not absolute_context(cwd)
+            or not absolute_context(config_home)
+            or not isinstance(config_home_kind, str)
+            or config_home_kind not in {"default", "explicit"}
+            or not isinstance(namespace, str)
+            or not namespace
+            or len(namespace) > _MAX_FIELD
+            or any(unicodedata.category(char).startswith("C") for char in namespace)
         ):
-            values = active.get(key)
-            if not isinstance(values, Mapping):
-                continue
-            for identifier in values:
-                if not isinstance(identifier, str) or (kind, identifier) in present:
-                    continue
-                sessions.append(
-                    {
-                        "kind": kind,
-                        "id": identifier,
-                        "name": identifier[:8] if kind != "opencode" else identifier,
-                        "cwd": "",
-                        "recencyAt": 0,
-                        "updatedAt": 0,
-                        "active": True,
-                        "activityState": "active",
-                        "tmuxSession": None,
-                        # Private cache/event provenance: this row comes from
-                        # a successful activity probe, not provider history.
-                        # It is intentionally not a Host Mesh/Tmux contract
-                        # field or selection authority.
-                        "sourceObservation": "activity-only",
-                    }
+            raise ContractError("Claude background creation context is invalid")
+        if self.mesh is None:
+            raise ContractError("Host Mesh authority is unavailable")
+        host = next((item for item in self.mesh.hosts if item.host_id == host_id), None)
+        if host is None:
+            raise StaleMeshError("selected host is no longer in the current Host Mesh")
+
+        try:
+            timeout = self._remaining(deadline)
+            remote_action_stderr: bytes | None = None
+            if config_home_kind == "default":
+                claude_argv = [
+                    "env",
+                    "-u",
+                    "CLAUDE_CONFIG_DIR",
+                    "claude",
+                    "--settings",
+                    _CLAUDE_BACKGROUND_SETTINGS,
+                    "--bg",
+                ]
+            else:
+                claude_argv = [
+                    "env",
+                    f"CLAUDE_CONFIG_DIR={config_home}",
+                    "claude",
+                    "--settings",
+                    _CLAUDE_BACKGROUND_SETTINGS,
+                    "--bg",
+                ]
+            if resume_session_id is not None:
+                claude_argv[-1:] = ["--resume", resume_session_id, "--bg"]
+            if host.local:
+                command = self._run(
+                    claude_argv,
+                    cwd=cwd,
+                    input_data=None,
+                    timeout=timeout,
+                    stdout_limit=MAX_BACKGROUND_STDOUT,
+                    stderr_limit=_MAX_STDERR,
                 )
-                present.add((kind, identifier))
+            else:
+                if not host.routes:
+                    raise ContractError("selected remote host has no configured route")
+                # A non-idempotent provider launch cannot use the discovery
+                # command's route fallback. This one route is authoritative
+                # for the attempt; an uncertain transport result is terminal.
+                route = host.routes[0]
+                nonce = secrets.token_hex(16)
+                command = self._run(
+                    _ssh_argv(
+                        self.mesh,
+                        route,
+                        nonce,
+                        (
+                            "sh",
+                            "-c",
+                            _CLAUDE_BACKGROUND_PROGRAM,
+                            "rofi-agent-plus-claude-background",
+                            cwd,
+                            config_home,
+                            config_home_kind,
+                            _CLAUDE_BACKGROUND_SETTINGS,
+                            resume_session_id or "",
+                        ),
+                    ),
+                    input_data=None,
+                    timeout=min(
+                        float(self.mesh.connect_timeout + 4),
+                        self._remaining(deadline),
+                    ),
+                    stdout_limit=MAX_BACKGROUND_STDOUT,
+                    stderr_limit=_MAX_STDERR,
+                )
+                reached, _stderr = parse_reached_marker(command.stderr, nonce)
+                if not reached:
+                    raise ContractError(
+                        "Claude background launch route was ambiguous; no retry was attempted"
+                    )
+                try:
+                    raw_stderr = _command_bytes(command, "stderr")
+                except (WireError, UnicodeEncodeError):
+                    raw_stderr = b""
+                marker = _marker(nonce).encode("utf-8")
+                if raw_stderr.count(marker) == 1:
+                    remote_action_stderr = raw_stderr.replace(marker, b"", 1)
+            if command.timed_out:
+                raise ContractError("Claude background command failed; no retry was attempted")
+            if command.returncode != 0:
+                try:
+                    stdout = _command_bytes(command, "stdout")
+                    stderr = (
+                        remote_action_stderr
+                        if remote_action_stderr is not None
+                        else _command_bytes(command, "stderr")
+                    )
+                except (WireError, UnicodeEncodeError):
+                    stdout = b"not-empty"
+                    stderr = b""
+                if not stdout and workspace_trust_required(stderr, cwd=cwd):
+                    raise ContractError(
+                        "workspace trust is required; open directory in native Claude first"
+                    )
+                raise ContractError("Claude background command failed; no retry was attempted")
+            try:
+                job_id = parse_background_job_id(_command_bytes(command, "stdout"))
+            except (ClaudeActionError, WireError, UnicodeEncodeError) as error:
+                raise ContractError(
+                    "Claude background output was unsupported; no retry was attempted"
+                ) from error
+        except StaleMeshError:
+            # This can only occur before the native command is invoked.
+            raise
+        except ContractError:
+            # The command may have reached Claude even when the transport or
+            # bounded runner failed. Never convert uncertainty into a retry.
+            raise
+
+        try:
+            while True:
+                self._remaining(deadline)
+                try:
+                    _route, snapshot = self._observer_snapshot(
+                        host, deadline, providers=("claude",)
+                    )
+                except StaleMeshError as error:
+                    raise ContractError(
+                        "Claude background was created; post-action Observer validation failed"
+                    ) from error
+                if not isinstance(snapshot, ContractError):
+                    try:
+                        row = background_session(
+                            snapshot,
+                            host_id=host_id,
+                            cwd=cwd,
+                            config_home=config_home,
+                            config_home_kind=config_home_kind,
+                            namespace=namespace,
+                            job_id=job_id,
+                        )
+                    except ClaudeActionError as error:
+                        raise ContractError(
+                            "Claude background was created; its Observer identity was ambiguous or mismatched"
+                        ) from error
+                    if row is not None:
+                        row.update(
+                            {
+                                "contractMode": True,
+                                "backend": dict(self.identity),
+                                "host": host.display,
+                                "hostId": host.host_id,
+                            }
+                        )
+                        return row
+                time.sleep(min(0.2, self._remaining(deadline)))
+        except ContractError as error:
+            if str(error).startswith("Claude background was created;"):
+                raise
+            raise ContractError(
+                "Claude background was created; public Observer could not verify it before the deadline"
+            ) from error
 
     def _once(
         self,
@@ -2085,27 +1671,15 @@ class ContractBackend:
         with self._report_error_lock:
             self._report_errors = []
         self._reset_report_transaction()
-        stages: dict[str, tuple[str | None, object, object, object, object]] = {}
+        stages: dict[str, tuple[str | None, ObserverSnapshot | ContractError]] = {}
 
         def host_stage(
             host: MeshHost,
-        ) -> tuple[str, tuple[str | None, object, object, object, object]]:
-            if host.local:
-                route, active = self._active(host, deadline)
-                if isinstance(active, StaleMeshError):
-                    raise active
-                codex, claude, opencode = self._provider_results(host, config, deadline)
-            else:
-                # The marked composite and Codex app-server transports are
-                # independent authority domains.  Do not use activity as a
-                # reachability gate: either successful side remains useful.
-                route, codex, claude, opencode, active = self._remote_provider_results(
-                    host, config, deadline
-                )
-            for stage in (codex, claude, opencode, active):
-                if isinstance(stage, StaleMeshError):
-                    raise stage
-            return host.host_id, (route, codex, claude, opencode, active)
+        ) -> tuple[str, tuple[str | None, ObserverSnapshot | ContractError]]:
+            providers = config.providers_for(host.host_id)
+            if providers == _DEFAULT_PROVIDERS:
+                return host.host_id, self._observer_snapshot(host, deadline)
+            return host.host_id, self._observer_snapshot(host, deadline, providers=providers)
 
         def inventory_stage() -> dict[str, dict[str, object]]:
             payload, rows = self._inventory_document(mesh, deadline)
@@ -2163,18 +1737,22 @@ class ContractBackend:
             }
         ]
         for host in mesh.hosts:
-            route, codex, claude, opencode, active = stages[host.host_id]
-            merged = engine.merge_provider_results(
-                host.host_id,
-                host.display,
-                codex,
-                claude,
-                opencode,
-                active,
-                config.max_sessions,
-            )
-            self._append_active_only_rows(merged["sessions"], active)
-            errors = list(merged["errors"])
+            route, observation = stages[host.host_id]
+            if isinstance(observation, ContractError):
+                sessions: list[dict[str, object]] = []
+                errors = [
+                    {
+                        "host": host.host_id,
+                        "stage": _PROVIDER_STAGE[provider],
+                        "message": _bounded_text(observation),
+                    }
+                    for provider in config.providers_for(host.host_id)
+                ]
+            else:
+                sessions = [
+                    dict(row) for row in observation.sessions if row.get("threadKind") != "child"
+                ]
+                errors = [dict(error) for error in observation.errors]
             with self._report_error_lock:
                 errors.extend(
                     error for error in self._report_errors if error["host"] == host.host_id
@@ -2210,58 +1788,16 @@ class ContractBackend:
                         "message": "tmux_missing",
                     }
                 )
-            for row in merged["sessions"]:
+            for row in sessions:
                 row["contractMode"] = True
                 row["backend"] = dict(self.identity)
                 row["host"] = host.display
                 row["hostId"] = host.host_id
-                activity = (
-                    active.get(
-                        {"codex": "active", "claude": "claudeActive", "opencode": "opencodeActive"}[
-                            row["kind"]
-                        ],
-                        {},
-                    )
-                    if isinstance(active, Mapping)
-                    else {}
-                )
-                info = activity.get(row["id"]) if isinstance(activity, Mapping) else None
-                association: dict[str, object] | None = None
-                ambiguity: str | None = None
-                if isinstance(tmux_row, Mapping) and tmux_row.get("status") == "ok":
-                    try:
-                        association, ambiguity = _tmux_association(
-                            tmux_row,
-                            str(row["kind"]),
-                            str(row["id"]),
-                            info if isinstance(info, Mapping) else {},
-                            mesh.revision,
-                        )
-                    except ContractError as error:
-                        errors.append(
-                            {"host": host.host_id, "stage": "tmux", "message": _bounded_text(error)}
-                        )
-                if association is not None:
-                    tmux_reference = dict(association)
-                    option_verified = tmux_reference.pop("providerOptionVerified", None)
-                    if option_verified is True:
-                        row["providerOptionVerified"] = True
-                    else:
-                        row.pop("providerOptionVerified", None)
-                    row["tmux"] = tmux_reference
-                    row["tmuxSession"] = association["observedName"]
-                    if association["pending"] and not row.get("active"):
-                        row["activityState"] = "waiting"
-                elif ambiguity:
-                    row["tmuxAmbiguous"] = True
-                    errors.append(
-                        {"host": host.host_id, "stage": "tmux-correlation", "message": ambiguity}
-                    )
             events.append(
                 {
                     "event": "host-complete",
                     "host": host.host_id,
-                    "sessions": merged["sessions"],
+                    "sessions": sessions,
                     "errors": errors,
                     "backend": self.identity,
                 }

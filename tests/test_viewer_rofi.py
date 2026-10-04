@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from rofi_agent_plus import rofi
-from rofi_agent_plus.cache import CacheStore, PresentationContext
+from rofi_agent_plus.cache import CACHE_VERSION, CacheStore, PresentationContext
 from rofi_agent_plus.config import PickerConfig
 from rofi_agent_plus.contract_backend import ContractBackend, _tmux_reference, parse_mesh
 from rofi_agent_plus.view_preferences import ViewPreference, ViewPreferenceStore
@@ -34,6 +34,8 @@ class ViewerRofiTest(unittest.TestCase):
         reference = self.inventory["hosts"][0]["sessions"][0]
         self.row = {
             "kind": "codex",
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "thread",
             "id": "11111111-1111-1111-1111-111111111111",
             "name": "Viewer state",
             "host": "alpha",
@@ -51,10 +53,10 @@ class ViewerRofiTest(unittest.TestCase):
         }
         stages = {
             stage: {"outcome": "ok", "lastAttemptAt": 100, "lastSuccessAt": 100}
-            for stage in ("codex", "claude", "opencode", "activity", "tmux")
+            for stage in ("codex", "claude", "activity", "tmux")
         }
         self.snapshot = {
-            "version": 4,
+            "version": CACHE_VERSION,
             "fingerprint": self.config.fingerprint,
             "backend": self.backend.identity,
             "generatedAt": 100,
@@ -452,6 +454,8 @@ class ViewerRofiTest(unittest.TestCase):
 
     def test_observation_completion_preserves_frozen_preview_count_tint_and_action_bar(self):
         target = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "thread",
             "hostId": "alpha",
             "host": "Alpha",
             "kind": "codex",

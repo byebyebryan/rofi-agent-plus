@@ -1,109 +1,54 @@
-"""Focused tests for Agent Plus provider-native helpers."""
+"""The picker delegates observation through its prepared public CLI backend."""
 
 from __future__ import annotations
 
-import tempfile
+import io
+import json
 import unittest
-from pathlib import Path
-from unittest import mock
+from unittest.mock import patch
 
-from rofi_agent_plus import engine
+from rofi_agent_plus import app, engine
 
-THREAD = "11111111-1111-1111-1111-111111111111"
-OPENCODE = "ses_0319af718ffegy8N1IoMEggx4B"
+ID = "11111111-1111-1111-1111-111111111111"
 
 
-class ProviderCorrelationTest(unittest.TestCase):
-    def test_claude_task_directory_identifies_fresh_tui_session(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fd = root / "proc" / "42" / "fd"
-            fd.mkdir(parents=True)
-            tasks = root / f"claude-{engine.os.getuid()}" / "project" / THREAD / "tasks"
-            tasks.mkdir(parents=True)
-            (fd / "3").symlink_to(tasks)
-            with mock.patch.object(engine, "_process_arguments", return_value=["claude"]):
-                self.assertEqual(THREAD, engine._claude_session_id_for_process(42, root / "proc"))
-
-    def test_claude_task_directory_rejects_ambiguous_or_foreign_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fd = root / "proc" / "42" / "fd"
-            fd.mkdir(parents=True)
-            session_root = root / f"claude-{engine.os.getuid()}" / "project"
-            first = session_root / THREAD / "tasks"
-            second = session_root / "22222222-2222-2222-2222-222222222222" / "tasks"
-            foreign = root / "claude-999999" / "project" / THREAD / "tasks"
-            for path in (first, second, foreign):
-                path.mkdir(parents=True)
-            (fd / "3").symlink_to(foreign)
-            with mock.patch.object(engine, "_process_arguments", return_value=["claude"]):
-                self.assertIsNone(engine._claude_session_id_for_process(42, root / "proc"))
-                (fd / "4").symlink_to(first)
-                self.assertEqual(THREAD, engine._claude_session_id_for_process(42, root / "proc"))
-                (fd / "5").symlink_to(second)
-                self.assertIsNone(engine._claude_session_id_for_process(42, root / "proc"))
-
-    def test_root_rollout_wins_over_a_subagent_rollout(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fd = root / "proc" / "42" / "fd"
-            fd.mkdir(parents=True)
-            root_rollout = root / f"rollout-{THREAD}.jsonl"
-            root_rollout.write_text('{"type":"session_meta","payload":{"source":"cli"}}\n')
-            child_rollout = root / "rollout-22222222-2222-2222-2222-222222222222.jsonl"
-            child_rollout.write_text(
-                '{"type":"session_meta","payload":{"source":{"subagent":{}}}}\n'
-            )
-            (fd / "3").symlink_to(child_rollout)
-            (fd / "4").symlink_to(root_rollout)
-            self.assertEqual(THREAD, engine._thread_id_for_process(42, root / "proc"))
-
-    def test_provider_active_snapshot_never_queries_tmux(self) -> None:
-        with (
-            mock.patch.object(
-                engine,
-                "_process_table",
-                return_value=({10: 1}, {10}, set(), set()),
-            ),
-            mock.patch.object(engine, "_thread_id_for_process", return_value=THREAD),
-        ):
-            result = engine.provider_active_snapshot()
-        self.assertEqual([10], result["active"][THREAD]["candidates"][0]["ancestors"])
-        self.assertNotIn("tmuxSession", result["active"][THREAD]["candidates"][0])
-
-    def test_provider_active_snapshot_reports_probe_failure_without_a_traceback(self) -> None:
-        with mock.patch.object(engine, "_process_table", side_effect=OSError("ps unavailable")):
-            with self.assertRaisesRegex(engine.PickerError, "provider activity probe failed"):
-                engine.provider_active_snapshot()
-
-    def test_merge_preserves_provider_rows_and_partial_failure(self) -> None:
-        result = engine.merge_provider_results(
-            "local",
-            "local",
-            [{"id": THREAD, "name": "Codex", "cwd": "/work", "recencyAt": 5}],
-            engine.PickerError("Claude unavailable"),
-            {"installed": True, "sessions": [{"id": OPENCODE, "cwd": "/code", "recencyAt": 6}]},
+class ActiveCommandTest(unittest.TestCase):
+    def test_active_uses_full_host_inventory_and_preserves_namespace_identity(self):
+        rows = [
             {
-                "active": {THREAD: {"candidates": [{"pid": 10, "ancestors": [10]}]}},
-                "claudeActive": {},
-                "opencodeActive": {},
-            },
-            40,
-        )
-        self.assertEqual([OPENCODE, THREAD], [row["id"] for row in result["sessions"]])
-        self.assertTrue(result["sessions"][1]["active"])
-        self.assertEqual("claude", result["errors"][0]["stage"])
+                "hostId": "snap",
+                "kind": "codex",
+                "id": ID,
+                "namespace": namespace,
+                "nativeIdKind": "thread",
+                "active": True,
+            }
+            for namespace in ("config-a", "config-b")
+        ]
+        unknown = {**rows[0], "id": "22222222-2222-2222-2222-222222222222", "active": None}
+        snapshot = {
+            "sessions": rows[:1],
+            "hosts": {"snap": {"sessions": [*rows, unknown]}},
+            "errors": [],
+        }
+        with (
+            patch.object(app, "CacheStore") as store,
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            store.return_value.refresh.return_value = snapshot
+            self.assertEqual(0, app.diagnostic_main(["active"]))
+        result = json.loads(output.getvalue())
+        self.assertEqual(["config-a", "config-b"], [row["namespace"] for row in result["sessions"]])
+        store.return_value.refresh.assert_called_once()
 
-
-class RetiredLifecycleTest(unittest.TestCase):
-    def test_agent_engine_has_no_generic_lifecycle_surface(self) -> None:
+    def test_engine_has_no_provider_or_generic_lifecycle_surface(self):
         for name in (
+            "provider_active_snapshot",
+            "merge_provider_results",
+            "_process_table",
+            "_thread_id_for_process",
             "HostTarget",
             "SshPolicy",
-            "parse_host_routes",
-            "stream_session_events",
-            "resolve_open_target",
             "launch_attach",
             "focus_existing_window",
         ):

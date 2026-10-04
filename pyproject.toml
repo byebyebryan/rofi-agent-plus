@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rofi-agent-plus"
-version = "0.12.1"
-description = "Standalone Rofi picker for Codex, Claude Code, and OpenCode sessions"
+version = "0.13.0a3"
+description = "Standalone Rofi picker for Codex and Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

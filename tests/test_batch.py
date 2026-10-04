@@ -149,6 +149,8 @@ def _row(
         "host": "Workstation" if host_id == "local" else "Snap",
         "kind": kind,
         "id": identifier,
+        "namespace": "fixture-native-home",
+        "nativeIdKind": "thread" if kind == "codex" else "session",
         "name": f"{kind}-{host_id}",
         "active": True,
         "activityState": "active",
@@ -163,9 +165,7 @@ def _row(
 def _snapshot(
     local_rows: list[dict[str, object]], remote_rows: list[dict[str, object]]
 ) -> dict[str, object]:
-    observation = {
-        stage: {"outcome": "ok"} for stage in ("activity", "codex", "claude", "opencode", "tmux")
-    }
+    observation = {stage: {"outcome": "ok"} for stage in ("activity", "codex", "claude", "tmux")}
     return {
         "backend": dict(BACKEND_IDENTITY),
         "hostCatalog": CATALOG,
@@ -535,7 +535,7 @@ class BatchPreparationTest(unittest.TestCase):
         no_ref.pop("tmux")
         retained = _row("remote", "claude", "00000000-0000-0000-0000-000000000004", "$4", 4)
         retained["sourceObservation"] = "retained"
-        ambiguous = _row("remote", "opencode", "ses_0319af718ffegy8N1IoMEggx4B", "$5", 5)
+        ambiguous = _row("remote", "codex", "00000000-0000-0000-0000-000000000007", "$5", 5)
         ambiguous["tmuxAmbiguous"] = True
         store = FakeStore(
             _snapshot([local], [duplicate_runtime, second_catalog_row, no_ref, retained, ambiguous])
@@ -598,6 +598,8 @@ class BatchWorkerTest(unittest.TestCase):
                 "scope": "Active · all hosts",
                 "targets": [
                     {
+                        "namespace": "fixture-native-home",
+                        "nativeIdKind": "session",
                         "hostId": "remote",
                         "kind": "claude",
                         "id": REMOTE_ID,
@@ -635,6 +637,8 @@ class BatchWorkerTest(unittest.TestCase):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as temporary:
                 state = batch.BatchStateStore(Path(temporary))
                 target = {
+                    "namespace": "fixture-native-home",
+                    "nativeIdKind": "thread",
                     "hostId": "local",
                     "kind": "codex",
                     "id": LOCAL_ID,
@@ -700,6 +704,8 @@ class BatchWorkerTest(unittest.TestCase):
 
     def test_submit_rejects_halted_empty_and_stale_previews(self) -> None:
         target: dict[str, object] = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "session",
             "hostId": "remote",
             "kind": "claude",
             "id": REMOTE_ID,
@@ -751,6 +757,8 @@ class BatchWorkerTest(unittest.TestCase):
         snapshot = _snapshot([], [row])
         store = FakeStore(snapshot)
         target: dict[str, object] = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "session",
             "hostId": "remote",
             "kind": "claude",
             "id": REMOTE_ID,
@@ -783,6 +791,8 @@ class BatchWorkerTest(unittest.TestCase):
         row = _row("remote", "claude", REMOTE_ID, "$9", 9)
         cache_store = FakeStore(_snapshot([], [row]))
         target: dict[str, object] = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "session",
             "hostId": "remote",
             "kind": "claude",
             "id": REMOTE_ID,
@@ -822,6 +832,8 @@ class BatchWorkerTest(unittest.TestCase):
         current = _row("remote", "claude", REMOTE_ID, "$10", 10)
         store = FakeStore(_snapshot([], [current]))
         target: dict[str, object] = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "session",
             "hostId": "remote",
             "kind": "claude",
             "id": REMOTE_ID,
@@ -1106,7 +1118,7 @@ class BatchPickerTest(unittest.TestCase):
         headers, rows = _records(
             render_snapshot(
                 _snapshot([row], []),
-                selected_identity=("local", "codex", LOCAL_ID),
+                selected_identity=("local", "codex", LOCAL_ID, "fixture-native-home", "thread"),
                 initial_open=True,
             )
         )
@@ -1460,7 +1472,10 @@ class BatchPickerTest(unittest.TestCase):
                 state = parse_continuation_state(self._data(preview_output)).batch_state
                 preview = state_store.read_preview(state.record_id)
                 self.assertEqual(ACTION_CLOSE, state.action)
-                self.assertEqual(("local", "codex", LOCAL_ID), state.source_identity)
+                self.assertEqual(
+                    ("local", "codex", LOCAL_ID, "fixture-native-home", "thread"),
+                    state.source_identity,
+                )
                 self.assertEqual(1, len(preview["targets"]))
                 target = preview["targets"][0]
                 self.assertEqual(LOCAL_ID, target["id"])
@@ -1649,6 +1664,8 @@ class BatchPickerTest(unittest.TestCase):
     def test_changed_reference_is_listed_without_exact_target_tint(self) -> None:
         current = _row("local", "codex", LOCAL_ID, "$99", 99)
         frozen = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "thread",
             "hostId": "local",
             "kind": "codex",
             "id": LOCAL_ID,
@@ -1684,6 +1701,8 @@ class BatchPickerTest(unittest.TestCase):
         included = _row("local", "codex", LOCAL_ID, "$1", 1, name="included")
         excluded = _row("local", "claude", REMOTE_ID, "$2", 2, name="excluded")
         target = {
+            "namespace": "fixture-native-home",
+            "nativeIdKind": "thread",
             "hostId": "local",
             "kind": "codex",
             "id": LOCAL_ID,

@@ -18,6 +18,19 @@ INITIAL_FRAME_ENV = "ROFI_AGENT_PLUS_INITIAL_FRAME"
 MAX_INITIAL_FRAME_BYTES = 16 * 1024 * 1024
 
 
+def _agent_executable() -> Path:
+    """Use the same artifact's sibling CLI for installed entry points."""
+    invoked = Path(sys.argv[0])
+    if invoked.name == "rofi-agent-plus-rofi":
+        sibling = invoked.resolve().with_name("rofi-agent-plus")
+        if sibling.is_file() and os.access(sibling, os.X_OK):
+            return sibling
+    checkout = Path(__file__).resolve().parents[1] / "bin" / "rofi-agent-plus"
+    if checkout.is_file() and os.access(checkout, os.X_OK):
+        return checkout
+    raise ValueError("matching Agent Plus executable is unavailable")
+
+
 def initial_frame(environ: Mapping[str, str]) -> str | None:
     """Serve a launch-owned first frame; subsequent callbacks run normally."""
 
@@ -60,7 +73,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
-        executable = Path(__file__).resolve().parents[1] / "bin" / "rofi-agent-plus"
+        try:
+            executable = _agent_executable()
+        except ValueError as error:
+            print(f"rofi-agent-plus-rofi: {error}", file=sys.stderr)
+            return 1
         arguments = [
             "-show",
             "agent-plus",

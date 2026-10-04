@@ -20,6 +20,7 @@ from rofi_agent_plus.contract_backend import (
     ContractBackend,
     parse_mesh,
 )
+from rofi_agent_plus.observer_contract import ObserverSnapshot
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contract"
 
@@ -45,8 +46,8 @@ class ViewerBackendTest(unittest.TestCase):
         self.backend.mesh = self.mesh
         remote = mock.patch.object(
             self.backend,
-            "_remote_provider_results",
-            return_value=(None, [], {"sessions": []}, {"sessions": []}, {}),
+            "_observer_snapshot",
+            return_value=(None, ObserverSnapshot((), (), "current")),
         )
         remote.start()
         self.addCleanup(remote.stop)
@@ -137,26 +138,14 @@ class ViewerBackendTest(unittest.TestCase):
     def test_normal_discovery_reuses_inventory_and_enrichment_failure_keeps_owner_facts(
         self,
     ) -> None:
-        with mock.patch.object(self.backend, "_active", return_value=(None, {})):
-            with mock.patch.object(
-                self.backend,
-                "_provider_results",
-                return_value=([], {"sessions": []}, {"sessions": []}),
-            ):
-                events = self.backend._once(self.config)
+        events = self.backend._once(self.config)
         self.assertEqual(1, len(self.calls))
         self.assertTrue(events)
         self.assertIsNotNone(self.backend.viewer_inventory_result)
         self.store._ingest_viewers(self.config, self.backend)
         self.assertEqual("open", self.viewers.current(self.scope)["rows"][0]["viewer"]["state"])
         self.payload["viewerEndpoint"]["hostId"] = "beta"
-        with mock.patch.object(self.backend, "_active", return_value=(None, {})):
-            with mock.patch.object(
-                self.backend,
-                "_provider_results",
-                return_value=([], {"sessions": []}, {"sessions": []}),
-            ):
-                events = self.backend._once(self.config)
+        events = self.backend._once(self.config)
         self.assertIsNone(self.backend.viewer_inventory_result)
         self.assertFalse(
             any(

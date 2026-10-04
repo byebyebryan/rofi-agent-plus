@@ -13,6 +13,7 @@ from .cache import CacheStore
 from .config import ConfigError, PickerConfig, load_config
 from .launcher import initial_frame
 from .rofi import run_rofi
+from .session_identity import logical_identity
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list", help="refresh and list agent sessions as JSON")
     list_parser.add_argument("--limit", type=int, default=None)
 
-    subparsers.add_parser("active", help="show active local provider processes as JSON")
+    subparsers.add_parser("active", help="list sessions with observed live provider presence")
 
     refresh_parser = subparsers.add_parser("refresh", help="refresh the session cache")
     refresh_parser.add_argument("--background", action="store_true")
@@ -42,16 +43,27 @@ def diagnostic_main(argv: Sequence[str] | None = None) -> int:
     refresh_store = CacheStore() if args.command == "refresh" else None
     try:
         config = _apply_cli_config(load_config(), args)
-        if args.command == "active":
-            print(json.dumps(engine.provider_active_snapshot(), separators=(",", ":")))
-            return 0
-
         store = refresh_store or CacheStore()
         try:
             snapshot = store.refresh(config, force=True)
         finally:
             if args.command == "refresh" and args.background:
                 store.clear_owned_background_marker()
+        if args.command == "active":
+            active_rows = []
+            seen = set()
+            hosts = snapshot.get("hosts", {})
+            for host in hosts.values() if isinstance(hosts, dict) else ():
+                rows = host.get("sessions", []) if isinstance(host, dict) else []
+                for row in rows if isinstance(rows, list) else ():
+                    if not isinstance(row, dict) or row.get("active") is not True:
+                        continue
+                    identity = logical_identity(row)
+                    if identity is None or identity in seen:
+                        continue
+                    seen.add(identity)
+                    active_rows.append(row)
+            snapshot = {**snapshot, "sessions": active_rows}
         if args.command != "refresh" or not args.background:
             print(json.dumps(snapshot, separators=(",", ":")))
         return 0

@@ -18,7 +18,8 @@ from typing import Protocol
 from . import engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig
-from .contract_backend import CommandOutput, StaleMeshError, select_backend
+from .contract_backend import CommandOutput, StaleMeshError
+from .session_identity import logical_identity
 from .wire import WireError, decode_document, validate_string_bounds
 
 _SCHEMA_VERSION = 1
@@ -36,7 +37,6 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", re.ASCII)
 _PROVIDER_OPTIONS = {
     "codex": ("@codex_thread_id", "@codex_name", "codex", "resume"),
     "claude": ("@claude_session_id", "@claude_name", "claude", "--resume"),
-    "opencode": ("@opencode_session_id", "@opencode_name", "opencode", "--session"),
 }
 
 
@@ -207,6 +207,7 @@ def _provider_row(
         or not _HOST_ID.fullmatch(host_id)
         or kind not in _PROVIDER_OPTIONS
         or not isinstance(identifier, str)
+        or logical_identity(selection) is None
     ):
         raise LifecycleError("operation_failed", "selected contract session is invalid")
     if snapshot.get("backend") != dict(identity):
@@ -223,6 +224,7 @@ def _provider_row(
         and row.get("hostId") == host_id
         and row.get("kind") == kind
         and row.get("id") == identifier
+        and logical_identity(row) == logical_identity(selection)
     ]
     if len(matched) != 1:
         raise LifecycleError(
@@ -230,7 +232,7 @@ def _provider_row(
         )
     row = matched[0]
     errors = snapshot.get("errors")
-    stale_stages = {"codex": "threads", "claude": "claude", "opencode": "opencode"}
+    stale_stages = {"codex": "threads", "claude": "claude"}
     if isinstance(errors, list):
         host_stages = {
             error.get("stage")
@@ -239,7 +241,9 @@ def _provider_row(
         }
         if stale_stages[str(kind)] in host_stages:
             raise LifecycleError("operation_failed", "selected session has stale provider state")
-        if require_tmux_and_activity_evidence:
+        if require_tmux_and_activity_evidence and not isinstance(
+            row.get("observerSource"), Mapping
+        ):
             # A normal ``tmux_missing`` observation is authoritative
             # capability data and a provider wrapper may safely be created
             # there. A generic tmux-stage error is not: an absent association
@@ -250,7 +254,7 @@ def _provider_row(
                 raise LifecycleError(
                     "operation_failed", "selected session has stale provider state"
                 )
-    if require_tmux_and_activity_evidence:
+    if require_tmux_and_activity_evidence and not isinstance(row.get("observerSource"), Mapping):
         if row.get("tmuxStale") or row.get("tmuxAmbiguous"):
             raise LifecycleError(
                 "operation_failed", "selected session has stale or ambiguous tmux state"
@@ -522,58 +526,13 @@ def fast_open_selection(
     backend: _ContractBackend | None = None,
     timeout: float = _LIFECYCLE_SECONDS,
 ) -> None:
-    """Open an option-proven session without refreshing the Agent snapshot.
+    """Require a fresh native observation before selecting an attachment.
 
-    This is deliberately a narrow optimization.  The selection parser and
-    discovery backend mark a row eligible only when the provider's exact tmux
-    user option claimed the same provider ID.  Tmux Plus then revalidates that
-    option, the complete stable reference, and Mesh revision before any
-    action.  All other rows continue through :class:`ContractLifecycle`.
+    Historical launch options cannot establish the conversation displayed by
+    a TUI after native /new or resume navigation.
     """
-
-    if selection.get("providerOptionVerified") is not True:
-        raise LifecycleError(
-            "operation_failed", "selected session lacks option-backed tmux evidence"
-        )
-    identity = _backend_identity(selection.get("backend"))
-    host_id = selection.get("hostId")
-    kind = selection.get("kind")
-    identifier = selection.get("id")
-    if (
-        not isinstance(host_id, str)
-        or len(host_id) > _MAX_FIELD
-        or not _HOST_ID.fullmatch(host_id)
-        or kind not in _PROVIDER_OPTIONS
-        or not isinstance(identifier, str)
-    ):
-        raise LifecycleError("operation_failed", "selected contract session is invalid")
-    if kind in {"codex", "claude"}:
-        valid_identifier = engine.UUID_PATTERN.fullmatch(identifier)
-    else:
-        valid_identifier = engine.OPENCODE_ID_PATTERN.fullmatch(identifier)
-    if valid_identifier is None:
-        raise LifecycleError("operation_failed", "selected provider session is invalid")
-    revision = identity["meshRevision"]
-    if revision is None:
-        # An omitted --mesh-revision is intentionally unpinned at the Tmux
-        # contract boundary.  Never turn a local-only/null authority into a
-        # fast action that could cross into a newly available Mesh.
-        raise LifecycleError(
-            "operation_failed", "null-authority sessions require full revalidation"
-        )
-    reference = _reference(selection.get("tmux"), host_id, revision)
-    selected_backend = backend or select_backend()
-    if not (
-        isinstance(getattr(selected_backend, "tmux_command", None), str)
-        and callable(getattr(selected_backend, "_run", None))
-    ):
-        raise LifecycleError("operation_failed", "contract lifecycle backend is unavailable")
-    _open_reference(
-        selected_backend,
-        reference,
-        time.monotonic() + timeout,
-        required_option=(_PROVIDER_OPTIONS[str(kind)][0], identifier),
-        expected_name=True,
+    raise LifecycleError(
+        "unsupported_binding", "current conversation binding requires fresh revalidation"
     )
 
 
@@ -599,6 +558,169 @@ def _resume_argv(kind: str, identifier: str) -> tuple[str, ...]:
     except KeyError as error:
         raise LifecycleError("operation_failed", "selected provider is invalid") from error
     return str(executable), str(flag), identifier
+
+
+_NATIVE_ARTIFACTS = {
+    "codex": ("0.160.0", "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad"),
+    "claude": ("2.1.287", "3920489a5109cff5786a1a392c25277408ff22bc796d5edb9c16a60e5a1718f0"),
+}
+
+
+def _native_source_config(row: Mapping[str, object]) -> str:
+    """Validate source identity and artifact independently of attachment."""
+    source = row.get("observerSource")
+    runtime = source.get("runtime") if isinstance(source, Mapping) else None
+    kind = row.get("kind")
+    if not isinstance(kind, str) or kind not in _NATIVE_ARTIFACTS:
+        raise LifecycleError("operation_failed", "selected provider is invalid")
+    if kind == "codex" and (
+        row.get("threadKind") == "child"
+        or any(
+            issue in {"thread_classification_conflict", "thread_classification_unavailable"}
+            for issue in row.get("metadataIssues", ())
+        )
+    ):
+        raise LifecycleError(
+            "unsupported_attachment", "Codex child or ambiguous session cannot be opened"
+        )
+    expected_version, expected_hash = _NATIVE_ARTIFACTS[kind]
+    if (
+        not isinstance(source, Mapping)
+        or source.get("schemaVersion") != 1
+        or source.get("sourceHealth") != "current"
+        or source.get("provider") != kind
+        or source.get("namespace") != row.get("namespace")
+        or not isinstance(runtime, Mapping)
+        or runtime.get("version") != expected_version
+        or runtime.get("binarySha256") != expected_hash
+        or row.get("sourceObservation") != "current"
+        or logical_identity(row) is None
+    ):
+        raise LifecycleError(
+            "operation_failed", "native attachment source is unavailable or unsupported"
+        )
+    config_home = _absolute_provider_cwd(source.get("configHome"))
+    if config_home is None:
+        raise LifecycleError("operation_failed", "native attachment configuration is unavailable")
+    topology = (
+        "native_managed_endpoint" if kind == "codex" else "private_session_registry_and_job_store"
+    )
+    if runtime.get("topology") != topology:
+        raise LifecycleError("operation_failed", "native runtime topology is unsupported")
+    if kind == "claude" and (
+        not isinstance(source.get("configHomeKind"), str)
+        or source["configHomeKind"] not in {"default", "explicit"}
+    ):
+        raise LifecycleError(
+            "operation_failed", "native Claude configuration context is unavailable"
+        )
+    return config_home
+
+
+def _native_resume_argv(row: Mapping[str, object]) -> tuple[str, ...]:
+    """Select a fresh attachment without inferring a current viewer binding."""
+    config_home = _native_source_config(row)
+    kind = row["kind"]
+    native_ids = row.get("nativeIds")
+    if not isinstance(native_ids, Mapping):
+        raise LifecycleError("operation_failed", "native attachment identity is unavailable")
+    if kind == "codex":
+        identifier = native_ids.get("sessionId")
+        if not isinstance(identifier, str) or not engine.UUID_PATTERN.fullmatch(identifier):
+            raise LifecycleError(
+                "operation_failed", "exact native Codex resume identity is unavailable"
+            )
+        # Thread.id and sessionId are distinct protocol fields even when
+        # their values happen to match in a particular native release.
+        return "env", f"CODEX_HOME={config_home}", "codex", "resume", "--all", identifier
+    presence = row.get("presence")
+    job = native_ids.get("jobId")
+    if (
+        row.get("sessionKind") != "bg"
+        or not isinstance(presence, Mapping)
+        or presence.get("value") != "present"
+        or presence.get("health") != "current"
+        or native_ids.get("sessionId") != row.get("id")
+        or not isinstance(job, str)
+        or re.fullmatch(r"[0-9a-f]{8}", job, re.ASCII) is None
+    ):
+        raise LifecycleError(
+            "unsupported_attachment", "this Claude session has no proved native attachment route"
+        )
+    source = row["observerSource"]
+    environment = (
+        ("env", "-u", "CLAUDE_CONFIG_DIR")
+        if source["configHomeKind"] == "default"
+        else ("env", f"CLAUDE_CONFIG_DIR={config_home}")
+    )
+    return *environment, "claude", "attach", job
+
+
+def _native_history_resume_context(row: Mapping[str, object]) -> tuple[str, str]:
+    """Require fresh saved metadata without inventing liveness or work state."""
+    config_home = _native_source_config(row)
+    history = row.get("history")
+    native_ids = row.get("nativeIds")
+    presence = row.get("presence")
+    cwd = _absolute_provider_cwd(row.get("cwd"))
+    identifier = row.get("id")
+    saved = row.get("inventory") == "saved"
+    canonical_saved = (
+        saved
+        and row.get("sessionKind") == "unknown"
+        and isinstance(native_ids, Mapping)
+        and native_ids.get("jobId") is None
+        and row.get("job") is None
+        and row.get("cwdSource") == "claude_history"
+        and all(
+            isinstance(row.get(dimension), Mapping)
+            and row[dimension].get("value") == "unknown"
+            and row[dimension].get("health") == "unavailable"
+            and row[dimension].get("reason") == "unobserved"
+            and row[dimension].get("observedAt") is None
+            and row[dimension].get("source") is None
+            and "lastKnownValue" not in row[dimension]
+            for dimension in ("work", "presence")
+        )
+    )
+    job = row.get("job")
+    terminal_history = (
+        row.get("inventory") == "retained_job"
+        and row.get("sessionKind") in {"bg", "unknown"}
+        and isinstance(presence, Mapping)
+        and (
+            (presence.get("value") == "absent" and presence.get("health") == "current")
+            or (
+                presence.get("value") == "unknown"
+                and presence.get("health") == "unavailable"
+                and presence.get("reason") == "unobserved"
+            )
+        )
+        and isinstance(job, Mapping)
+        and job.get("retained") is True
+        and job.get("state") in {"done", "failed", "stopped"}
+        and isinstance(native_ids, Mapping)
+        and isinstance(job.get("id"), str)
+        and re.fullmatch(r"[0-9a-f]{8}", job["id"], re.ASCII) is not None
+        and native_ids.get("jobId") == job["id"]
+    )
+    if (
+        row.get("kind") != "claude"
+        or not isinstance(history, Mapping)
+        or history.get("source") != "claude_sdk"
+        or history.get("sdkVersion") != "0.2.163"
+        or not isinstance(native_ids, Mapping)
+        or not isinstance(identifier, str)
+        or not engine.UUID_PATTERN.fullmatch(identifier)
+        or native_ids.get("sessionId") != identifier
+        or not (canonical_saved or terminal_history)
+        or row.get("metadataIssues")
+        or cwd is None
+    ):
+        raise LifecycleError(
+            "unsupported_attachment", "saved Claude resume evidence is unavailable or ambiguous"
+        )
+    return config_home, cwd
 
 
 def _display_name(row: Mapping[str, object], identifier: str) -> str:
@@ -733,6 +855,8 @@ class ContractLifecycle:
             host_id=str(selection["hostId"]),
             kind=str(selection["kind"]),
             identifier=str(selection["id"]),
+            namespace=str(selection["namespace"]),
+            native_id_kind=str(selection["nativeIdKind"]),
             reference=reference.payload(),
             deadline=self.deadline,
         )
@@ -757,6 +881,8 @@ class ContractLifecycle:
             and not any(unicodedata.category(char).startswith("C") for char in cwd)
             else None
         )
+        native = isinstance(row.get("observerSource"), Mapping)
+        resume_argv = _native_resume_argv(row) if native else _resume_argv(kind, identifier)
         invalid_cwd_retry = False
         for collision in range(_MAX_CREATE_COLLISIONS):
             wrapper_name = _safe_wrapper_name(row.get("name"), kind, identifier, collision)
@@ -783,7 +909,7 @@ class ContractLifecycle:
                     "--defer-until-attached",
                     "--open",
                     "--",
-                    *_resume_argv(kind, identifier),
+                    *resume_argv,
                 )
             )
             try:
@@ -796,7 +922,12 @@ class ContractLifecycle:
                     opening=True,
                 )
             except LifecycleError as error:
-                if error.code == "invalid_cwd" and cwd_value is not None and not invalid_cwd_retry:
+                if (
+                    error.code == "invalid_cwd"
+                    and cwd_value is not None
+                    and not invalid_cwd_retry
+                    and not native
+                ):
                     cwd_value = None
                     invalid_cwd_retry = True
                     continue
@@ -873,6 +1004,53 @@ class ContractLifecycle:
         host_id = str(selection["hostId"])
         kind = str(selection["kind"])
         executable = _PROVIDER_OPTIONS[kind][2]
+        launch_argv = (executable,)
+        source = selection.get("observerSource")
+        if isinstance(source, Mapping):
+            config_home = _native_source_config(selection)
+            if kind == "claude":
+                creator = getattr(self.backend, "create_claude_background", None)
+                if not callable(creator):
+                    raise LifecycleError(
+                        "unsupported_creation", "supervised Claude creation is unavailable"
+                    )
+                try:
+                    new_row = creator(
+                        host_id,
+                        cwd,
+                        config_home,
+                        str(selection["namespace"]),
+                        deadline=self.deadline,
+                        config_home_kind=str(source["configHomeKind"]),
+                    )
+                except StaleMeshError as error:
+                    # The backend exposes this only before invoking creation.
+                    raise LifecycleError("stale_mesh", str(error)) from error
+                except (engine.PickerError, OSError) as error:
+                    raise LifecycleError("operation_failed", str(error)) from error
+                try:
+                    if (
+                        not isinstance(new_row, Mapping)
+                        or new_row.get("hostId") != host_id
+                        or new_row.get("kind") != "claude"
+                        or new_row.get("namespace") != selection["namespace"]
+                        or new_row.get("cwd") != cwd
+                        or new_row.get("id") == selection["id"]
+                        or _native_source_config(new_row) != config_home
+                        or new_row["observerSource"].get("configHomeKind")
+                        != source["configHomeKind"]
+                    ):
+                        raise LifecycleError("operation_failed", "new native identity is invalid")
+                    _native_resume_argv(new_row)
+                    return self._create(new_row, new_row)
+                except (LifecycleError, engine.PickerError, OSError) as error:
+                    # Creation has happened. A changed Mesh or failed viewer
+                    # must never dispatch another empty background session.
+                    raise LifecycleError(
+                        "operation_failed",
+                        "Claude session created; fresh attachment failed and the session was preserved",
+                    ) from error
+            launch_argv = ("env", f"CODEX_HOME={config_home}", executable)
         revision = self.identity["meshRevision"]
         for collision in range(_MAX_CREATE_COLLISIONS):
             argv = [
@@ -893,7 +1071,7 @@ class ContractLifecycle:
                     "--defer-until-attached",
                     "--open",
                     "--",
-                    executable,
+                    *launch_argv,
                 )
             )
             try:
@@ -922,9 +1100,9 @@ class ContractLifecycle:
         """
 
         def attempt(*, whole_mesh: bool) -> None:
-            _row, cwd = self._new_session_row(selection, whole_mesh=whole_mesh)
-            self._preflight_new_session(selection, cwd)
-            self._create_new_session(selection, cwd)
+            row, cwd = self._new_session_row(selection, whole_mesh=whole_mesh)
+            self._preflight_new_session(row, cwd)
+            self._create_new_session(row, cwd)
 
         try:
             attempt(whole_mesh=False)
@@ -936,8 +1114,79 @@ class ContractLifecycle:
             # still has current evidence and the same provider-reported cwd.
             attempt(whole_mesh=True)
 
+    def _resume_saved_claude(self, row: Mapping[str, object]) -> None:
+        config_home, cwd = _native_history_resume_context(row)
+        self._preflight_new_session(row, cwd)
+        resumer = getattr(self.backend, "resume_claude_background", None)
+        if not callable(resumer):
+            raise LifecycleError("unsupported_attachment", "saved Claude resume is unavailable")
+        source = row["observerSource"]
+        try:
+            actual = resumer(
+                str(row["hostId"]),
+                cwd,
+                config_home,
+                str(row["namespace"]),
+                str(row["id"]),
+                config_home_kind=str(source["configHomeKind"]),
+                deadline=self.deadline,
+            )
+        except StaleMeshError as error:
+            # The backend exposes this only before dispatching the native command.
+            raise LifecycleError("stale_mesh", str(error)) from error
+        except (engine.PickerError, OSError) as error:
+            raise LifecycleError("operation_failed", str(error)) from error
+        try:
+            if (
+                not isinstance(actual, Mapping)
+                or actual.get("hostId") != row["hostId"]
+                or actual.get("kind") != "claude"
+                or actual.get("namespace") != row["namespace"]
+                or actual.get("cwd") != cwd
+                or _native_source_config(actual) != config_home
+                or actual["observerSource"].get("configHomeKind") != source["configHomeKind"]
+            ):
+                raise LifecycleError("operation_failed", "resumed Claude identity is invalid")
+            _native_resume_argv(actual)
+            # A copied result uses its actual identity for the wrapper, never
+            # a historical launch association with the requested source UUID.
+            self._create(actual, actual)
+        except (LifecycleError, engine.PickerError, OSError) as error:
+            raise LifecycleError(
+                "operation_failed",
+                "Claude history resumed; attachment failed and the session was preserved",
+            ) from error
+
     def open_or_create(self, selection: Mapping[str, object]) -> None:
+        # Every migrated provider row is re-read through Observer. Unsupported
+        # current-client binding permits a fresh attachment, never a focus or
+        # close of a historical wrapper that may now display another session.
         row = self._refresh_row(selection)
+        if isinstance(row.get("observerSource"), Mapping):
+
+            def native_attempt(current: Mapping[str, object]) -> None:
+                if (
+                    current.get("kind") == "claude"
+                    and current.get("history")
+                    and not (
+                        isinstance(current.get("presence"), Mapping)
+                        and current["presence"].get("value") == "present"
+                    )
+                ):
+                    self._resume_saved_claude(current)
+                else:
+                    _native_resume_argv(current)  # fail before any Tmux action
+                    self._create(current, current)
+
+            try:
+                native_attempt(row)
+            except LifecycleError as error:
+                if error.code != "stale_mesh":
+                    raise
+                retry_row = self._refresh_row(selection, source_only=True, whole_mesh=True)
+                native_attempt(retry_row)
+            # Wrapper launch identity does not establish current conversation binding.
+            return
         host_id = str(selection["hostId"])
         revision = self.identity["meshRevision"]
         if revision is not None and not isinstance(revision, str):

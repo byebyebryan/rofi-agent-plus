@@ -12,14 +12,14 @@ from pathlib import Path
 from urllib.parse import quote, unquote_to_bytes
 
 from . import engine
+from .session_identity import SessionIdentity, logical_identity
 
-PREFERENCE_VERSION = 1
+PREFERENCE_VERSION = 2
 PREFERENCE_DATA_PREFIX = "last-used:"
 MAX_RECORD_BYTES = 64 * 1024
 MAX_ID_LENGTH = 16 * 1024
 _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
-_PROVIDERS = frozenset({"codex", "claude", "opencode"})
-SessionIdentity = tuple[str, str, str]
+_PROVIDERS = frozenset({"codex", "claude"})
 
 
 @dataclass(frozen=True)
@@ -36,7 +36,13 @@ def _valid_host_id(value: object) -> bool:
 
 
 def _valid_identity(value: object) -> SessionIdentity | None:
-    if not isinstance(value, dict) or set(value) != {"hostId", "provider", "sessionId"}:
+    if not isinstance(value, dict) or set(value) != {
+        "hostId",
+        "provider",
+        "sessionId",
+        "namespace",
+        "nativeIdKind",
+    }:
         return None
     host_id = value.get("hostId")
     provider = value.get("provider")
@@ -50,22 +56,36 @@ def _valid_identity(value: object) -> SessionIdentity | None:
         or len(session_id) > MAX_ID_LENGTH
     ):
         return None
-    pattern = engine.OPENCODE_ID_PATTERN if provider == "opencode" else engine.UUID_PATTERN
-    if pattern.fullmatch(session_id) is None:
+    if engine.UUID_PATTERN.fullmatch(session_id) is None:
         return None
-    return host_id.casefold(), provider, session_id
+    return logical_identity(
+        {
+            "hostId": host_id,
+            "kind": provider,
+            "id": session_id,
+            "namespace": value["namespace"],
+            "nativeIdKind": value["nativeIdKind"],
+        }
+    )
 
 
 def _identity_json(identity: SessionIdentity | None) -> dict[str, str] | None:
     if identity is None:
         return None
-    if not isinstance(identity, tuple) or len(identity) != 3:
+    if not isinstance(identity, tuple) or len(identity) != 5:
         return None
-    host_id, provider, session_id = identity
-    parsed = _valid_identity({"hostId": host_id, "provider": provider, "sessionId": session_id})
+    host_id, provider, session_id, namespace, native_kind = identity
+    value = {
+        "hostId": host_id,
+        "provider": provider,
+        "sessionId": session_id,
+        "namespace": namespace,
+        "nativeIdKind": native_kind,
+    }
+    parsed = _valid_identity(value)
     if parsed is None:
         return None
-    return {"hostId": host_id, "provider": provider, "sessionId": session_id}
+    return value
 
 
 def _preference_json(preference: ViewPreference) -> dict[str, object] | None:

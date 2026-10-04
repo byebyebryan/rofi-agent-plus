@@ -36,13 +36,14 @@ from .contract_lifecycle import (
     _backend_identity,
     _reference,
 )
+from .session_identity import SessionIdentity, logical_identity
 
 ACTION_CLOSE = "close"
 ACTION_RESUME = "resume"
 _ACTIONS = frozenset({ACTION_CLOSE, ACTION_RESUME})
 _ID = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,255}\Z", re.ASCII)
-_PROVIDERS = frozenset({"codex", "claude", "opencode"})
+_PROVIDERS = frozenset({"codex", "claude"})
 _VIEWS = frozenset({"active", "open", "all", "local", "host"})
 _DESKTOP = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -258,8 +259,7 @@ def _provider_option(row: Mapping[str, object]) -> tuple[str, str] | None:
 def _valid_provider_identifier(kind: object, identifier: object) -> bool:
     if not isinstance(kind, str) or kind not in _PROVIDERS or not isinstance(identifier, str):
         return False
-    pattern = engine.OPENCODE_ID_PATTERN if kind == "opencode" else engine.UUID_PATTERN
-    return pattern.fullmatch(identifier) is not None
+    return engine.UUID_PATTERN.fullmatch(identifier) is not None
 
 
 def _ref_payload(reference: StableReference) -> dict[str, object]:
@@ -306,24 +306,31 @@ def _candidate_rows(
         record = _host_record(snapshot, host_id)
         raw_rows = record.get("sessions") if isinstance(record, Mapping) else None
         rows = raw_rows if isinstance(raw_rows, list) else []
-        identity_counts: dict[tuple[str, str, str], int] = {}
-        candidates_for_host: list[tuple[Mapping[str, object], tuple[str, str, str]]] = []
+        identity_counts: dict[SessionIdentity, int] = {}
+        candidates_for_host: list[tuple[Mapping[str, object], SessionIdentity]] = []
         for raw in rows:
             if not isinstance(raw, Mapping) or not _valid_provider_identifier(
                 raw.get("kind"), raw.get("id")
             ):
                 continue
             kind, identifier = str(raw["kind"]), str(raw["id"])
-            logical = (host_id.casefold(), kind, identifier)
+            logical = logical_identity(raw)
+            if logical is None or logical[0] != host_id.casefold():
+                continue
             identity_counts[logical] = identity_counts.get(logical, 0) + 1
             candidates_for_host.append((raw, logical))
-        reported_duplicates: set[tuple[str, str, str]] = set()
+        reported_duplicates: set[SessionIdentity] = set()
         for raw, logical in candidates_for_host:
             kind, identifier = str(raw["kind"]), str(raw["id"])
             active = raw.get("active") is True or raw.get("activityState") == "waiting"
             if not active:
                 continue
             row = dict(raw)
+            if isinstance(row.get("observerSource"), Mapping):
+                exclusions.append(
+                    _text_target(row, display, "current conversation binding is unsupported")
+                )
+                continue
             if open_refs is not None:
                 raw_ref = row.get("tmux")
                 if (
@@ -377,6 +384,8 @@ def _candidate_rows(
                 "hostId": host_id,
                 "kind": str(kind),
                 "id": identifier,
+                "namespace": row["namespace"],
+                "nativeIdKind": row["nativeIdKind"],
                 "name": _short(row.get("name") or identifier),
                 "host": display,
                 "reference": _ref_payload(reference),
@@ -490,6 +499,17 @@ def build_single_close_preview(
             return excluded("selected session belongs to an older Host Mesh authority")
     except LifecycleError:
         return excluded("selected session has no verifiable Host Mesh authority")
+    host_record = _host_record(snapshot, str(host_id))
+    saved_rows = host_record.get("sessions") if isinstance(host_record, Mapping) else None
+    if isinstance(saved_rows, list) and any(
+        isinstance(item, Mapping)
+        and logical_identity(item) == logical_identity(selection)
+        and isinstance(item.get("observerSource"), Mapping)
+        for item in saved_rows
+    ):
+        return excluded("current conversation binding is unsupported")
+    if logical_identity(selection) is None:
+        return excluded("selected namespace identity is invalid")
     if selection.get("tmuxAssociationCurrent") is not True:
         return excluded("selected tmux association is stale or ambiguous")
     if selection.get("providerOptionVerified") is not True:
@@ -528,6 +548,8 @@ def build_single_close_preview(
         "hostId": host_id,
         "kind": kind,
         "id": identifier,
+        "namespace": selection["namespace"],
+        "nativeIdKind": selection["nativeIdKind"],
         "name": _short(selection.get("name") or identifier),
         "host": display,
         "reference": _ref_payload(reference),
@@ -974,7 +996,7 @@ class BatchStateStore:
             not isinstance(value, Mapping)
             or set(value) - {"viewerDesktop"} != fields
             or type(value.get("version")) is not int
-            or value["version"] != 1
+            or value["version"] != 2
             or not _ID.fullmatch(request_id)
             or value.get("requestId") != request_id
             or not isinstance(value.get("action"), str)
@@ -1049,7 +1071,7 @@ class BatchStateStore:
                     return str(current["requestId"])
             self.preview_path.unlink(missing_ok=True)
             record = {
-                "version": 1,
+                "version": 2,
                 "requestId": request_id,
                 "action": action,
                 "view": scope.view,
@@ -1080,7 +1102,7 @@ class BatchStateStore:
                 return False
             preview_id = secrets.token_hex(16)
             preview = dict(payload)
-            preview.update(version=1, previewId=preview_id, createdAt=int(time.time()))
+            preview.update(version=2, previewId=preview_id, createdAt=int(time.time()))
             if current["view"] == "open":
                 open_context = preview.get("openContext")
                 if (
@@ -1131,7 +1153,7 @@ class BatchStateStore:
             raise BatchError("Batch preview is too large")
         preview_id = secrets.token_hex(16)
         record = dict(payload)
-        record.update({"version": 1, "previewId": preview_id, "createdAt": int(time.time())})
+        record.update({"version": 2, "previewId": preview_id, "createdAt": int(time.time())})
         with self.locked():
             current = self._active_job_locked()
             if current is not None:
@@ -1147,7 +1169,7 @@ class BatchStateStore:
             record = self._read_preview()
             if (
                 record is None
-                or record.get("version") != 1
+                or record.get("version") != 2
                 or record.get("previewId") != preview_id
                 or isinstance(record.get("createdAt"), bool)
                 or not isinstance(record.get("createdAt"), int)
@@ -1234,7 +1256,7 @@ class BatchStateStore:
             preview = self._read_preview()
             if (
                 preview is None
-                or preview.get("version") != 1
+                or preview.get("version") != 2
                 or preview.get("previewId") != preview_id
                 or preview.get("action") not in _ACTIONS
                 or not isinstance(preview.get("backend"), Mapping)
@@ -1259,7 +1281,7 @@ class BatchStateStore:
             job_id = secrets.token_hex(16)
             now = int(time.time())
             job: dict[str, object] = {
-                "version": 1,
+                "version": 2,
                 "jobId": job_id,
                 "previewId": preview_id,
                 "status": "queued",
@@ -1394,6 +1416,8 @@ def _valid_target(
         "host",
         "reference",
         "requiredOption",
+        "namespace",
+        "nativeIdKind",
         "mode",
         "viewers",
     }
@@ -1510,7 +1534,7 @@ def _valid_job_record(value: object, job_id: str) -> bool:
     backend = value.get("backend")
     if (
         type(value.get("version")) is not int
-        or value.get("version") != 1
+        or value.get("version") != 2
         or value.get("jobId") != job_id
         or not isinstance(value.get("previewId"), str)
         or not _ID.fullmatch(value["previewId"])
@@ -1556,7 +1580,7 @@ def _valid_preview_record(value: object, preview_id: str) -> bool:
         or not fields.issubset(value)
         or set(value) - fields - optional
         or type(value.get("version")) is not int
-        or value.get("version") != 1
+        or value.get("version") != 2
         or value.get("previewId") != preview_id
         or value.get("action") not in _ACTIONS
         or not isinstance(value.get("backend"), Mapping)
@@ -1604,20 +1628,8 @@ def _valid_exclusions(value: object) -> bool:
     return True
 
 
-def _target_identity(target: Mapping[str, object]) -> tuple[str, str, str] | None:
-    host_id, kind, identifier = target.get("hostId"), target.get("kind"), target.get("id")
-    if (
-        not isinstance(host_id, str)
-        or not _HOST_ID.fullmatch(host_id)
-        or not isinstance(kind, str)
-        or kind not in _PROVIDERS
-        or not isinstance(identifier, str)
-        or not identifier
-        or len(identifier) > _MAX_TEXT
-        or not _valid_provider_identifier(kind, identifier)
-    ):
-        return None
-    return host_id, kind, identifier
+def _target_identity(target: Mapping[str, object]) -> SessionIdentity | None:
+    return logical_identity(target)
 
 
 def _current_active_row(
@@ -1628,7 +1640,7 @@ def _current_active_row(
     identity = _target_identity(target)
     if identity is None or _backend_identity(snapshot.get("backend")) != dict(expected_identity):
         return None, "current authority changed"
-    host_id, kind, identifier = identity
+    host_id, kind, identifier, _namespace, _native_kind = identity
     record = _host_record(snapshot, host_id)
     if record is None:
         return None, "host observations are unavailable"
@@ -1642,6 +1654,7 @@ def _current_active_row(
         and row.get("hostId") == host_id
         and row.get("kind") == kind
         and row.get("id") == identifier
+        and logical_identity(row) == identity
         and row.get("contractMode") is True
         and row.get("backend") == dict(expected_identity)
     ]

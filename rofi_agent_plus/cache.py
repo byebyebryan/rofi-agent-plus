@@ -24,23 +24,20 @@ from .config import PickerConfig
 if TYPE_CHECKING:
     from .viewer_state import ViewerStateStore
 
-# v4 adds private refresh-observation provenance.  A Host Mesh revision (or
-# the explicit local-only ``null`` identity) remains part of cache validity.
-# v3 snapshots are upgraded in memory on read and rewritten as v4 only by a
-# later legitimate cache mutation.
-CACHE_VERSION = 4
-_PREVIOUS_CACHE_VERSION = 3
+# v5 marks the current provider set. Older private snapshots may contain
+# retired rows and stage history, so they are invalidated as a whole instead
+# of being reinterpreted under the current contract.
+CACHE_VERSION = 6
 DEFAULT_CACHE_DIR = Path("rofi-agent-plus")
 SNAPSHOT_NAME = "snapshot.json"
 LOCK_NAME = "refresh.lock"
 BACKGROUND_MARKER_NAME = "refresh.background"
 LOCK_WAIT_SECONDS = 30.0
-_PROVIDER_FOR_STAGE = {"threads": "codex", "claude": "claude", "opencode": "opencode"}
-_OBSERVATION_STAGES = ("codex", "claude", "opencode", "activity", "tmux")
+_PROVIDER_FOR_STAGE = {"threads": "codex", "claude": "claude"}
+_OBSERVATION_STAGES = ("codex", "claude", "activity", "tmux")
 _OBSERVATION_STAGE_FOR_ERROR = {
     "threads": "codex",
     "claude": "claude",
-    "opencode": "opencode",
     "active": "activity",
     "tmux": "tmux",
 }
@@ -157,17 +154,45 @@ def _atomic_write_private(path: Path, content: str, prefix: str) -> None:
             pass
 
 
-def _as_session_key(session: Mapping[str, Any]) -> tuple[str, str, str]:
+def _as_session_key(session: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
     return (
         str(session.get("hostId") or session.get("windowHost") or session.get("host") or "local"),
         str(session.get("kind") or ""),
         str(session.get("id") or ""),
+        str(session.get("namespace") or ""),
+        str(session.get("nativeIdKind") or ""),
     )
 
 
 def _provider_for_session(session: Mapping[str, Any]) -> str:
     kind = str(session.get("kind") or "")
-    return kind if kind in {"codex", "claude", "opencode"} else ""
+    return kind if kind in {"codex", "claude"} else ""
+
+
+def _valid_provider_session(value: object) -> bool:
+    """Accept only a current Codex or Claude identity in private cache rows."""
+
+    if not isinstance(value, Mapping):
+        return False
+    kind = value.get("kind")
+    if not isinstance(kind, str) or kind not in {"codex", "claude"}:
+        return False
+    from .session_identity import logical_identity
+
+    return logical_identity(value) is not None
+
+
+def _filtered_host_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only current provider rows when directly reusing prior cache data."""
+
+    host = dict(value)
+    rows = value.get("sessions")
+    host["sessions"] = (
+        [dict(row) for row in rows if _valid_provider_session(row)]
+        if isinstance(rows, list)
+        else []
+    )
+    return host
 
 
 def _timestamp(value: object, default: int = 0) -> int:
@@ -225,8 +250,8 @@ def _observation_outcome(errors: object) -> str:
         for error in errors
     ):
         # These errors mean no complete authority-scoped transaction reached
-        # the cache.  A retained generatedAt belongs to an older success and
-        # must not make a v3 migration look complete.
+        # the cache. A retained generatedAt belongs to an older success and
+        # must not make this failed refresh look complete.
         return "failed"
     if _error_stages(errors):
         return "partial"
@@ -295,6 +320,8 @@ def _merge_host_snapshot(
         if not isinstance(item, dict):
             continue
         row = dict(item)
+        if not _valid_provider_session(row):
+            continue
         row["sourceObservation"] = _source_from_current_event(row.get("sourceObservation"))
         current_sessions.append(row)
     current_errors = [dict(item) for item in current.get("errors", []) if isinstance(item, dict)]
@@ -471,8 +498,10 @@ def _valid_stage_observation(value: object) -> bool:
 
 
 def _valid_observations(value: object) -> bool:
-    return isinstance(value, Mapping) and all(
-        _valid_stage_observation(value.get(stage)) for stage in _OBSERVATION_STAGES
+    return (
+        isinstance(value, Mapping)
+        and set(value) == set(_OBSERVATION_STAGES)
+        and all(_valid_stage_observation(value.get(stage)) for stage in _OBSERVATION_STAGES)
     )
 
 
@@ -494,80 +523,8 @@ def _valid_last_refresh(value: object) -> bool:
     return isinstance(completed, int) and not isinstance(completed, bool) and completed >= attempted
 
 
-def _v3_row_source(row: Mapping[str, Any], errors: object) -> str:
-    """Recover the only trustworthy v3 row distinction from host errors."""
-
-    provider = _provider_for_session(row)
-    failed = _error_stages(errors)
-    return "retained" if provider in failed else "current"
-
-
-def _migrate_v3_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Create an in-memory v4 view of a valid v3 private snapshot.
-
-    v3 had no exact per-stage success history.  We recover current provider
-    failures from its host errors and leave their prior success timestamp at
-    zero instead of inventing a time.  The first normal refresh replaces that
-    legacy uncertainty with v4 observations.
-    """
-
-    # Snapshots enter this function from JSON or CacheStore.write, so this is
-    # also a convenient deep copy that guarantees a read never mutates disk
-    # data or caller-owned objects.
-    migrated = json.loads(json.dumps(payload, ensure_ascii=False))
-    migrated["version"] = CACHE_VERSION
-    generated_at = _timestamp(migrated.get("generatedAt"))
-    backend = _backend_identity(migrated.get("backend"))
-    if backend is None or backend["kind"] != "contract" or generated_at == 0:
-        migrated["lastRefresh"] = _last_refresh(0, completed_at=None, outcome="failed")
-    else:
-        outcome = _observation_outcome(migrated.get("errors"))
-        migrated["lastRefresh"] = (
-            _last_refresh(0, completed_at=None, outcome="failed")
-            if outcome == "failed"
-            else _last_refresh(generated_at, completed_at=generated_at, outcome=outcome)
-        )
-    hosts = migrated.get("hosts")
-    if not isinstance(hosts, dict):
-        return migrated
-    errors_by_host: dict[str, list[object]] = {}
-    row_sources: dict[tuple[str, str, str], str] = {}
-    for key, host in hosts.items():
-        if not isinstance(key, str) or not isinstance(host, dict):
-            continue
-        host_errors = host.get("errors") if isinstance(host.get("errors"), list) else []
-        errors_by_host[key] = host_errors
-        observed_at = _timestamp(host.get("generatedAt"), generated_at)
-        failed = _error_stages(host_errors)
-        host["observations"] = {
-            stage: {
-                "lastAttemptAt": observed_at,
-                "lastSuccessAt": 0 if stage in failed else observed_at,
-                "outcome": "failed" if stage in failed else "ok",
-            }
-            for stage in _OBSERVATION_STAGES
-        }
-        rows = host.get("sessions")
-        if isinstance(rows, list):
-            for row in rows:
-                if isinstance(row, dict):
-                    source = _v3_row_source(row, host_errors)
-                    row["sourceObservation"] = source
-                    row_sources[_as_session_key(row)] = source
-    rows = migrated.get("sessions")
-    if isinstance(rows, list):
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            host_key = str(row.get("hostId") or row.get("windowHost") or row.get("host") or "local")
-            row["sourceObservation"] = row_sources.get(
-                _as_session_key(row), _v3_row_source(row, errors_by_host.get(host_key, []))
-            )
-    return migrated
-
-
 def _prior_last_refresh(previous: Mapping[str, Any] | None) -> dict[str, object]:
-    """Read v4 metadata or safely synthesize it for direct legacy callers."""
+    """Read current metadata or safely synthesize it for direct callers."""
 
     if previous is not None and _valid_last_refresh(previous.get("lastRefresh")):
         value = previous["lastRefresh"]
@@ -598,7 +555,16 @@ def _failed_contract_snapshot(
         if previous is not None and _backend_identity(previous.get("backend")) == dict(backend)
         else None
     )
-    hosts = dict(prior.get("hosts", {})) if isinstance(prior, Mapping) else {}
+    prior_hosts = prior.get("hosts") if isinstance(prior, Mapping) else None
+    hosts = (
+        {
+            key: _filtered_host_snapshot(value)
+            for key, value in prior_hosts.items()
+            if isinstance(key, str) and isinstance(value, Mapping)
+        }
+        if isinstance(prior_hosts, Mapping)
+        else {}
+    )
     catalog = _host_catalog(prior.get("hostCatalog")) if isinstance(prior, Mapping) else None
     prior_refresh = _prior_last_refresh(prior)
     if retain_unselected_hosts:
@@ -628,7 +594,7 @@ def _failed_contract_snapshot(
 
 def _flatten_hosts(hosts: Mapping[str, Mapping[str, Any]], limit: int) -> list[dict[str, Any]]:
     sessions: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str]] = set()
     for host in hosts.values():
         for item in host.get("sessions", []):
             if not isinstance(item, dict):
@@ -735,7 +701,7 @@ def build_snapshot(
                 and isinstance(value, dict)
                 and (expected is None or key in expected)
             ):
-                hosts[key] = dict(value)
+                hosts[key] = _filtered_host_snapshot(value)
 
     try:
         for event in events:
@@ -943,10 +909,7 @@ class CacheStore:
                 payload = json.load(stream)
         except (OSError, ValueError, json.JSONDecodeError):
             return None
-        if not isinstance(payload, dict) or payload.get("version") not in {
-            _PREVIOUS_CACHE_VERSION,
-            CACHE_VERSION,
-        }:
+        if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION:
             return None
         if fingerprint is not None and payload.get("fingerprint") != fingerprint:
             return None
@@ -967,15 +930,13 @@ class CacheStore:
         for key, host in payload["hosts"].items():
             if not isinstance(key, str) or not isinstance(host, dict):
                 return None
-            if not isinstance(host.get("sessions", []), list) or not isinstance(
-                host.get("errors", []), list
+            host_rows = host.get("sessions", [])
+            if (
+                not isinstance(host_rows, list)
+                or any(not _valid_provider_session(row) for row in host_rows)
+                or not isinstance(host.get("errors", []), list)
             ):
                 return None
-        if payload.get("version") == _PREVIOUS_CACHE_VERSION:
-            # Deliberately return the upgraded copy only.  Opening Rofi must
-            # not rewrite a valid old cache or turn migration into a cache
-            # miss; a later refresh/reconciliation write persists v4.
-            payload = _migrate_v3_snapshot(payload)
         if not _valid_last_refresh(payload.get("lastRefresh")):
             return None
         for host in payload["hosts"].values():
@@ -991,7 +952,8 @@ class CacheStore:
                 return None
         rows = payload.get("sessions", [])
         if any(
-            not isinstance(row, dict) or row.get("sourceObservation") not in _SOURCE_OBSERVATIONS
+            not _valid_provider_session(row)
+            or row.get("sourceObservation") not in _SOURCE_OBSERVATIONS
             for row in rows
         ):
             return None
@@ -1145,10 +1107,7 @@ class CacheStore:
 
     def write(self, snapshot: Mapping[str, Any]) -> None:
         self.ensure_root()
-        persisted: Mapping[str, Any] = snapshot
-        if snapshot.get("version") == _PREVIOUS_CACHE_VERSION:
-            persisted = _migrate_v3_snapshot(snapshot)
-        encoded = json.dumps(persisted, ensure_ascii=False, separators=(",", ":"))
+        encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
         _atomic_write_private(self.snapshot_path, encoded, ".snapshot.")
 
     def reconcile_contract_reference(
@@ -1160,6 +1119,8 @@ class CacheStore:
         kind: str,
         identifier: str,
         reference: Mapping[str, object],
+        namespace: str | None = None,
+        native_id_kind: str | None = None,
         wait_seconds: float = 1.0,
         deadline: float | None = None,
     ) -> bool:
@@ -1176,7 +1137,9 @@ class CacheStore:
             return False
         wanted_backend = _backend_identity(context.backend)
         assert wanted_backend is not None
-        wanted = (host_id, kind, identifier)
+        if not namespace or not native_id_kind:
+            return False
+        wanted = (host_id, kind, identifier, namespace, native_id_kind)
         wait_deadline = time.monotonic() + max(0.0, wait_seconds)
         if deadline is not None:
             wait_deadline = min(wait_deadline, deadline)

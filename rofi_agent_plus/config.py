@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -18,8 +19,12 @@ MIN_MAX_SESSIONS = 1
 MAX_MAX_SESSIONS = 100
 MIN_REFRESH_SECONDS = 5
 MAX_REFRESH_SECONDS = 300
+MAX_HOST_PROVIDER_ENTRIES = 128
+MAX_HOST_ID_LENGTH = 256
+SUPPORTED_PROVIDERS = ("codex", "claude")
+_HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
 CONFIG_RELATIVE_PATH = Path("rofi-agent-plus") / "config.toml"
-CONFIG_KEYS = frozenset({"max_sessions", "refresh_seconds"})
+CONFIG_KEYS = frozenset({"max_sessions", "refresh_seconds", "host_providers"})
 
 
 class ConfigError(PickerError):
@@ -40,12 +45,52 @@ def _integer(value: Any, key: str, minimum: int, maximum: int) -> int:
     return value
 
 
+def _host_providers(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if not isinstance(value, Mapping):
+        raise ConfigError("config host_providers must be a table")
+    if not value:
+        raise ConfigError("config host_providers must contain at least one host")
+    if len(value) > MAX_HOST_PROVIDER_ENTRIES:
+        raise ConfigError(
+            f"config host_providers must contain at most {MAX_HOST_PROVIDER_ENTRIES} hosts"
+        )
+
+    normalized: dict[str, tuple[str, ...]] = {}
+    for host_id, selected in value.items():
+        if (
+            not isinstance(host_id, str)
+            or len(host_id) > MAX_HOST_ID_LENGTH
+            or not _HOST_ID.fullmatch(host_id)
+        ):
+            raise ConfigError("config host_providers contains an invalid host id")
+        key = host_id.casefold()
+        if key in normalized:
+            raise ConfigError("config host_providers contains case-colliding host ids")
+        if not isinstance(selected, (list, tuple)) or not selected:
+            raise ConfigError(f"config host_providers.{host_id} must select at least one provider")
+
+        selected_providers: set[str] = set()
+        for provider in selected:
+            if not isinstance(provider, str) or provider not in SUPPORTED_PROVIDERS:
+                raise ConfigError(
+                    f"config host_providers.{host_id} contains an unsupported provider"
+                )
+            if provider in selected_providers:
+                raise ConfigError(f"config host_providers.{host_id} contains a duplicate provider")
+            selected_providers.add(provider)
+        normalized[key] = tuple(
+            provider for provider in SUPPORTED_PROVIDERS if provider in selected_providers
+        )
+    return tuple(sorted(normalized.items()))
+
+
 @dataclass(frozen=True)
 class PickerConfig:
     """Only the provider cache's durable settings belong to Agent Plus."""
 
     max_sessions: int = DEFAULT_LIMIT
     refresh_seconds: int = DEFAULT_REFRESH_SECONDS
+    host_providers: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def validate(self) -> None:
         _integer(self.max_sessions, "max_sessions", MIN_MAX_SESSIONS, MAX_MAX_SESSIONS)
@@ -55,13 +100,69 @@ class PickerConfig:
             MIN_REFRESH_SECONDS,
             MAX_REFRESH_SECONDS,
         )
+        if not isinstance(self.host_providers, tuple):
+            raise ConfigError("config host_providers must use an immutable canonical value")
+        if len(self.host_providers) > MAX_HOST_PROVIDER_ENTRIES:
+            raise ConfigError(
+                f"config host_providers must contain at most {MAX_HOST_PROVIDER_ENTRIES} hosts"
+            )
+        seen: set[str] = set()
+        previous_host: str | None = None
+        for entry in self.host_providers:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise ConfigError("config host_providers must use an immutable canonical value")
+            host_id, selected = entry
+            if (
+                not isinstance(host_id, str)
+                or len(host_id) > MAX_HOST_ID_LENGTH
+                or not _HOST_ID.fullmatch(host_id)
+                or host_id != host_id.casefold()
+                or not isinstance(selected, tuple)
+                or not selected
+            ):
+                raise ConfigError("config host_providers must use an immutable canonical value")
+            if host_id in seen or (previous_host is not None and host_id <= previous_host):
+                raise ConfigError("config host_providers must use an immutable canonical value")
+            if any(provider not in SUPPORTED_PROVIDERS for provider in selected):
+                raise ConfigError("config host_providers contains an unsupported provider")
+            if len(set(selected)) != len(selected):
+                raise ConfigError("config host_providers contains a duplicate provider")
+            canonical = tuple(provider for provider in SUPPORTED_PROVIDERS if provider in selected)
+            if selected != canonical:
+                raise ConfigError("config host_providers must use an immutable canonical value")
+            seen.add(host_id)
+            previous_host = host_id
+
+    def providers_for(self, host_id: str) -> tuple[str, ...]:
+        """Return the configured provider set, defaulting to both supported providers."""
+
+        self.validate()
+        if (
+            not isinstance(host_id, str)
+            or len(host_id) > MAX_HOST_ID_LENGTH
+            or not _HOST_ID.fullmatch(host_id)
+        ):
+            raise ConfigError("host id is invalid")
+        wanted = host_id.casefold()
+        for configured_host, providers in self.host_providers:
+            if configured_host == wanted:
+                return providers
+        return SUPPORTED_PROVIDERS
 
     @property
     def fingerprint(self) -> str:
         """Fingerprint only settings that alter provider discovery results."""
 
+        self.validate()
         encoded = json.dumps(
-            {"max_sessions": self.max_sessions}, sort_keys=True, separators=(",", ":")
+            {
+                "max_sessions": self.max_sessions,
+                "host_providers": [
+                    [host_id, list(providers)] for host_id, providers in self.host_providers
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         ).encode()
         return hashlib.sha256(encoded).hexdigest()
 
@@ -77,6 +178,8 @@ class PickerConfig:
             value = values.get(field)
             if value is not None:
                 candidate = replace(candidate, **{field: _integer(value, field, minimum, maximum)})
+        if "host_providers" in values:
+            candidate = replace(candidate, host_providers=_host_providers(values["host_providers"]))
         candidate.validate()
         return candidate
 
@@ -99,9 +202,14 @@ def load_config(path: Path | None = None) -> PickerConfig:
     unknown = sorted(set(raw) - CONFIG_KEYS)
     if unknown:
         raise ConfigError(f"unknown config key(s): {', '.join(unknown)}")
+    overrides: dict[str, Any] = {
+        "max_sessions": raw.get("max_sessions"),
+        "refresh_seconds": raw.get("refresh_seconds"),
+    }
+    if "host_providers" in raw:
+        overrides["host_providers"] = raw["host_providers"]
     return PickerConfig().with_overrides(
-        max_sessions=raw.get("max_sessions"),
-        refresh_seconds=raw.get("refresh_seconds"),
+        **overrides,
     )
 
 
@@ -111,7 +219,10 @@ def config_from_mapping(values: Mapping[str, Any]) -> PickerConfig:
     unknown = sorted(set(values) - CONFIG_KEYS)
     if unknown:
         raise ConfigError(f"unknown config key(s): {', '.join(unknown)}")
-    return PickerConfig().with_overrides(
-        max_sessions=values.get("max_sessions"),
-        refresh_seconds=values.get("refresh_seconds"),
-    )
+    overrides: dict[str, Any] = {
+        "max_sessions": values.get("max_sessions"),
+        "refresh_seconds": values.get("refresh_seconds"),
+    }
+    if "host_providers" in values:
+        overrides["host_providers"] = values["host_providers"]
+    return PickerConfig().with_overrides(**overrides)
