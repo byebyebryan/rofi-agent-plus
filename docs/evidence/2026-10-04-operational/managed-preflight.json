@@ -1,0 +1,16 @@
+{
+  "status": "accepted",
+  "scope": "pilot_source_and_render",
+  "hostMatrix": [
+    "snap",
+    "starship",
+    "carbon",
+    "unknown"
+  ],
+  "newToolLint": true,
+  "legacyGateSelfTests": true,
+  "pilotIdentitySelfTests": 5,
+  "rollbackRoundTripAndReplacementGuard": true,
+  "broadChezmoiGate": "blocked_unrelated_external_archive_checksum",
+  "externalPinsUnchanged": true
+}

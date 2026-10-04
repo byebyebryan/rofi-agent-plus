@@ -6,10 +6,14 @@ Agent Plus owns the picker, presentation and host/selection validation, and
 calls Observer's separate write client for native entry. Tmux Plus owns terminal and viewer lifecycle. OpenCode is
 no longer a supported provider in this migration candidate.
 
-Version `0.14.0a1` is an unreleased migration candidate for Python 3.11+ with the pinned
+Version `0.14.0a1` is the unpublished provisional pilot selected on Snap and
+Starship, for Python 3.11+ with the pinned
 `agent-observer==0.2.0a3` public contract library. This checkout replaces the earlier foreground
 process-correlation implementation. Historical study and acceptance documents
 remain evidence for their stated versions; they do not certify this runtime.
+The [operational proof](docs/native-operational-proof.md) records independent
+Observer acceptance, installed real Tmux/SSH entry, selected headless gates and
+the remaining desktop/release checks.
 
 ## Runtime boundary
 

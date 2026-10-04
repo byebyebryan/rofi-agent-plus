@@ -1,0 +1,15 @@
+{
+  "status": "accepted",
+  "ownedNamespacesStopped": 2,
+  "ownedProviderStoresRemoved": 2,
+  "borrowedAuthCopiesRemoved": true,
+  "ordinaryProviderDeleteActions": 0,
+  "borrowedCredentialFilesRemaining": {
+    "snap": 0,
+    "starship": 0
+  },
+  "ordinaryConsumerStateUnchanged": {
+    "snap": true,
+    "starship": true
+  }
+}

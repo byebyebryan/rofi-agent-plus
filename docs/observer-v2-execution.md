@@ -95,3 +95,29 @@ desktop picker/focus and actual local/remote Tmux entry acceptance. Keep current
 conversation binding unsupported. Native transport-loss/suspend, coordinator
 reopen and dependency publication/hosted CI are independent remaining gates.
 No managed link/configuration edit, push or public release occurred here.
+
+## Subsequent operational selection
+
+The next regular goal loop retained these exact package bytes. Observer independently
+accepted fresh installation and bounded watch/daemon recovery before consumer
+work. Plus `a2dcf65` then accepted actual installed Tmux/SSH native entry in owned
+namespaces: Codex New/exact Resume on both hosts and Claude New/live/saved Resume
+on Snap. See [the operational proof](native-operational-proof.md); terminal and
+private trust adapters are explicit, with no graphical acceptance claim.
+
+Chezmoi `ac0f420` prepared all five selectors, exact artifact/live gates and private
+guarded rollback. Observer `0.2.0a3` and Plus `0.14.0a1` are now selected on Snap
+and Starship, including the public write entry and Rofi script link. Selected
+ordinary passive reads, v7 refresh, headless callbacks and launcher preparation
+pass on both hosts. The generic Tmux lifecycle gate covered both hosts with exact
+cleanup and preserved SSH usage history. Ordinary provider hashes match baseline;
+all owned provider test stores and borrowed auth copies are removed. Plus has
+312 passing source tests; package/source code is otherwise frozen at `90e5b4f`.
+
+Desktop names/pages/order, ordinary New/Resume focus/trust UX, physical suspend,
+deliberate coordinator reopen and public publication/hosted CI remain manual or
+separate gates. No push occurred. An unrelated managed external archive checksum
+blocks broad chezmoi validation/apply; a reviewed five-template projection enabled
+only this scoped pilot selection without changing those pins. The selected-live
+reports under `docs/evidence/2026-10-04-operational` are bounded metadata, not raw
+provider observations.
