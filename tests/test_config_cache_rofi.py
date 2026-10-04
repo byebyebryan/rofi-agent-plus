@@ -442,7 +442,7 @@ class ProjectMetadataTest(unittest.TestCase):
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
         self.assertEqual(engine.VERSION, project["project"]["version"])
         self.assertEqual(VERSION, engine.VERSION)
-        self.assertEqual("0.13.0a3", engine.VERSION)
+        self.assertEqual("0.14.0a1", engine.VERSION)
         self.assertIn(f"Version `{engine.VERSION}`", (self.root / "README.md").read_text())
 
     def test_ci_runs_the_required_project_gate(self) -> None:
@@ -461,9 +461,9 @@ class ProjectMetadataTest(unittest.TestCase):
         self.assertNotIn("-kb-custom-6 Escape", readme)
         self.assertNotIn("compatibility aliases for next/previous view", readme)
 
-    def test_runtime_dependencies_are_empty(self) -> None:
+    def test_runtime_dependency_pins_public_observer_contract(self) -> None:
         project = tomllib.loads((self.root / "pyproject.toml").read_text())
-        self.assertEqual([], project["project"]["dependencies"])
+        self.assertEqual(["agent-observer==0.2.0a3"], project["project"]["dependencies"])
 
 
 class CacheTest(unittest.TestCase):

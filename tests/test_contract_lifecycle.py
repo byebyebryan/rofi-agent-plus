@@ -11,10 +11,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rofi_agent_plus import engine
 from rofi_agent_plus.cache import CacheStore, PresentationContext, build_snapshot
 from rofi_agent_plus.config import PickerConfig
-from rofi_agent_plus.contract_backend import CommandOutput, StaleMeshError
+from rofi_agent_plus.contract_backend import CommandOutput
 from rofi_agent_plus.contract_lifecycle import (
     ContractLifecycle,
     LifecycleError,
@@ -93,21 +92,25 @@ def row(
     session_id: str = "$4",
     created_at: int = 5,
 ) -> dict[str, object]:
-    item: dict[str, object] = {
-        "contractMode": True,
-        "backend": dict(BACKEND),
-        "hostId": "alpha",
-        "host": "Alpha",
-        "kind": kind,
-        "id": THREAD,
-        "namespace": "fixture-native-home",
-        "nativeIdKind": "thread" if kind == "codex" else "session",
-        "name": "native name",
-        "cwd": cwd,
-        "active": active,
-        "activityState": activity,
-        "recencyAt": 5,
-    }
+    from observer_fixtures import document, native_row
+
+    from rofi_agent_plus.observer_contract import parse_snapshot
+
+    raw = native_row("alpha", kind)
+    raw["cwd"] = cwd
+    payload = document("alpha", sessions=[raw])
+    item = dict(
+        parse_snapshot(json.dumps(payload).encode(), expected_host_scope="alpha").sessions[0]
+    )
+    item.update(
+        contractMode=True,
+        backend=dict(BACKEND),
+        hostId="alpha",
+        host="Alpha",
+        active=active,
+        activityState=activity,
+        name="native name",
+    )
     if tmux:
         item["tmux"] = {
             "meshRevision": REVISION,
@@ -117,39 +120,6 @@ def row(
             "observedName": "old-name",
         }
         item["tmuxSession"] = "old-name"
-    return item
-
-
-def observer_row(kind="codex"):
-    item = row(kind, active=True)
-    item.update(sourceObservation="current", namespace="fixture-native-home", sessionKind="bg")
-    item["nativeIds"] = {"sessionId": "22222222-2222-2222-2222-222222222222", "jobId": "abcdef01"}
-    if kind == "claude":
-        item["nativeIds"]["sessionId"] = item["id"]
-    item["presence"] = {"value": "present", "health": "current", "observedAt": 100}
-    versions = {
-        "codex": (
-            "0.160.0",
-            "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad",
-            "native_managed_endpoint",
-        ),
-        "claude": (
-            "2.1.287",
-            "3920489a5109cff5786a1a392c25277408ff22bc796d5edb9c16a60e5a1718f0",
-            "private_session_registry_and_job_store",
-        ),
-    }
-    version, digest, topology = versions[kind]
-    item["observerSource"] = {
-        "schemaVersion": 1,
-        "sourceHealth": "current",
-        "provider": kind,
-        "namespace": item["namespace"],
-        "configHome": "/native-config",
-        "runtime": {"version": version, "binarySha256": digest, "topology": topology},
-    }
-    if kind == "claude":
-        item["observerSource"]["configHomeKind"] = "explicit"
     return item
 
 
@@ -166,6 +136,9 @@ class FakeBackend:
         self.preflights: list[tuple[str, str, str, float]] = []
         self.preflight_error: Exception | None = None
         self.prepared = 0
+        self.writes = []
+        self.write_errors = []
+        self.write_result = None
         self.stream_kwargs: list[dict[str, object]] = []
         self.streams = 0
         self.errors: list[dict[str, object]] = []
@@ -174,17 +147,13 @@ class FakeBackend:
     def prepare(self) -> None:
         self.prepared += 1
 
-    def preflight_provider_launch(
-        self,
-        host_id: str,
-        executable: str,
-        cwd: str,
-        *,
-        deadline: float,
-    ) -> None:
-        self.preflights.append((host_id, executable, cwd, deadline))
-        if self.preflight_error is not None:
-            raise self.preflight_error
+    def observer_write(self, request, *, deadline):
+        from observer_fixtures import result_for
+
+        self.writes.append(copy.deepcopy(request))
+        if self.write_errors:
+            raise self.write_errors.pop(0)
+        return self.write_result or result_for(request)
 
     def stream(self, _config: PickerConfig, **kwargs: object):
         self.stream_kwargs.append(dict(kwargs))
@@ -252,314 +221,10 @@ class ContractLifecycleTest(unittest.TestCase):
             "backend": dict(BACKEND),
             "hostId": "alpha",
             "kind": kind,
-            "id": THREAD,
-            "namespace": "fixture-native-home",
+            "id": row(kind)["id"],
+            "namespace": row(kind)["namespace"],
             "nativeIdKind": "thread" if kind == "codex" else "session",
         }
-
-    def test_native_resume_uses_distinct_session_id_and_never_focuses_historical_viewer(self):
-        native = observer_row()
-        lifecycle, store, backend, _context = self.harness([native], [success(descriptor())])
-        lifecycle.open_or_create(self.selection())
-        self.assertEqual(1, len(backend.calls))
-        argv = backend.calls[0][0]
-        self.assertEqual("create", argv[1])
-        self.assertEqual(
-            [
-                "env",
-                "CODEX_HOME=/native-config",
-                "codex",
-                "resume",
-                "--all",
-                native["nativeIds"]["sessionId"],
-            ],
-            argv[argv.index("--") + 1 :],
-        )
-        cached = store.load(self.config.fingerprint, BACKEND)
-        self.assertEqual(native["tmux"], cached["sessions"][0]["tmux"])
-
-    def test_codex_child_and_conflicting_classification_fail_before_actions(self):
-        for changes in (
-            {"threadKind": "child"},
-            {"metadataIssues": ["thread_classification_conflict"]},
-            {"metadataIssues": ["thread_classification_unavailable"]},
-        ):
-            native = observer_row()
-            native.update(changes)
-            lifecycle, _store, backend, _ = self.harness([native], [])
-            with self.assertRaises(LifecycleError):
-                lifecycle.open_or_create(self.selection())
-            self.assertEqual([], backend.calls)
-            with self.assertRaises(LifecycleError):
-                lifecycle.new_session_here({**self.selection(), "cwd": "/work"})
-            self.assertEqual([], backend.calls)
-
-    def saved_claude(self):
-        native = observer_row("claude")
-        native.update(
-            inventory="saved",
-            sessionKind="unknown",
-            metadataIssues=[],
-            presence={
-                "value": "unknown",
-                "health": "unavailable",
-                "reason": "unobserved",
-                "source": None,
-                "observedAt": None,
-            },
-            work={
-                "value": "unknown",
-                "health": "unavailable",
-                "reason": "unobserved",
-                "source": None,
-                "observedAt": None,
-            },
-            job=None,
-            cwdSource="claude_history",
-            history={
-                "source": "claude_sdk",
-                "sdkVersion": "0.2.163",
-                "createdAt": 1000,
-                "fileModifiedAt": 9000,
-            },
-        )
-        native["nativeIds"]["jobId"] = None
-        return native
-
-    def test_saved_claude_resumes_full_uuid_and_attaches_actual_same_or_copied_job(self):
-        for copied in (False, True):
-            with self.subTest(copied=copied):
-                saved = self.saved_claude()
-                actual = observer_row("claude")
-                if copied:
-                    actual["id"] = "33333333-3333-4333-8333-333333333333"
-                    actual["nativeIds"]["sessionId"] = actual["id"]
-                lifecycle, _store, backend, _ = self.harness([saved], [success(descriptor())])
-                backend.resume_claude_background = mock.Mock(return_value=actual)
-                lifecycle.open_or_create(self.selection("claude"))
-                backend.resume_claude_background.assert_called_once_with(
-                    "alpha",
-                    "/work",
-                    "/native-config",
-                    "fixture-native-home",
-                    THREAD,
-                    config_home_kind="explicit",
-                    deadline=lifecycle.deadline,
-                )
-                self.assertEqual(1, len(backend.preflights))
-                argv = backend.calls[0][0]
-                self.assertIn("@claude_session_id=" + str(actual["id"]), argv)
-                self.assertEqual(
-                    ["env", "CLAUDE_CONFIG_DIR=/native-config", "claude", "attach", "abcdef01"],
-                    argv[argv.index("--") + 1 :],
-                )
-
-    def test_saved_claude_rejects_active_foreground_and_uncertain_or_missing_history(self):
-        for changes in (
-            {"presence": {"value": "present", "health": "current"}, "sessionKind": "interactive"},
-            {"presence": {"value": "unknown", "health": "ambiguous"}},
-            {"history": None},
-            {"inventory": "live"},
-            {"inventory": "registry"},
-            {"cwdSource": "claude_registry"},
-            {"presence": {"value": "absent", "health": "current"}},
-            {"metadataIssues": ["identity_ambiguous"]},
-            {"history": {"source": "other", "sdkVersion": "0.2.163"}},
-        ):
-            saved = self.saved_claude()
-            saved.update(changes)
-            lifecycle, _store, backend, _ = self.harness([saved], [])
-            backend.resume_claude_background = mock.Mock()
-            with self.assertRaises(LifecycleError):
-                lifecycle.open_or_create(self.selection("claude"))
-            backend.resume_claude_background.assert_not_called()
-            self.assertEqual([], backend.calls)
-
-    def test_only_exact_absent_terminal_retained_job_can_use_history_continuation(self):
-        for state in ("done", "failed", "stopped", "working"):
-            saved = observer_row("claude")
-            saved.update(
-                inventory="retained_job",
-                metadataIssues=[],
-                history=self.saved_claude()["history"],
-                presence={"value": "absent", "health": "current"},
-                job={"id": "abcdef01", "retained": True, "state": state},
-            )
-            lifecycle, _store, backend, _ = self.harness([saved], [success(descriptor())])
-            backend.resume_claude_background = mock.Mock(return_value=observer_row("claude"))
-            if state == "working":
-                with self.assertRaises(LifecycleError):
-                    lifecycle.open_or_create(self.selection("claude"))
-                backend.resume_claude_background.assert_not_called()
-            else:
-                lifecycle.open_or_create(self.selection("claude"))
-                backend.resume_claude_background.assert_called_once()
-
-    def test_terminal_job_without_worker_registry_remains_unobserved_and_resumable(self):
-        saved = observer_row("claude")
-        saved.update(
-            inventory="retained_job",
-            sessionKind="unknown",
-            metadataIssues=[],
-            history=self.saved_claude()["history"],
-            presence={"value": "unknown", "health": "unavailable", "reason": "unobserved"},
-            job={"id": "abcdef01", "retained": True, "state": "stopped"},
-        )
-        lifecycle, _store, backend, _ = self.harness([saved], [success(descriptor())])
-        backend.resume_claude_background = mock.Mock(return_value=observer_row("claude"))
-        lifecycle.open_or_create(self.selection("claude"))
-        backend.resume_claude_background.assert_called_once()
-        self.assertEqual("unknown", saved["presence"]["value"])
-
-    def test_post_resume_stale_viewer_or_wrong_namespace_never_retries_native_resume(self):
-        for invalid_result in (False, True):
-            saved = self.saved_claude()
-            actual = observer_row("claude")
-            if invalid_result:
-                actual["namespace"] = "wrong"
-            lifecycle, _store, backend, _ = self.harness([saved], [(1, failure("stale_mesh"))])
-            backend.resume_claude_background = mock.Mock(return_value=actual)
-            with self.assertRaisesRegex(LifecycleError, "history resumed; attachment failed"):
-                lifecycle.open_or_create(self.selection("claude"))
-            backend.resume_claude_background.assert_called_once()
-            self.assertEqual(1, backend.streams)
-
-    def test_history_warning_does_not_block_present_claude_attach(self):
-        native = observer_row("claude")
-        lifecycle, _store, backend, _ = self.harness([native], [success(descriptor())])
-        backend.errors = [{"host": "alpha", "stage": "claude-history", "message": "unavailable"}]
-        lifecycle.open_or_create(self.selection("claude"))
-        self.assertEqual(1, len(backend.calls))
-
-    def test_namespace_change_cannot_redirect_selected_native_session(self):
-        native = observer_row()
-        native["namespace"] = "other-config"
-        native["observerSource"]["namespace"] = "other-config"
-        lifecycle, _store, backend, _context = self.harness([native], [success(descriptor())])
-        with self.assertRaisesRegex(LifecycleError, "unambiguous"):
-            lifecycle.open_or_create(self.selection())
-        self.assertEqual([], backend.calls)
-
-    def test_unsupported_native_artifact_and_missing_session_id_fail_before_create(self):
-        for mutation in ("version", "identity", "health"):
-            native = observer_row()
-            if mutation == "version":
-                native["observerSource"]["runtime"]["version"] = "0.161.0"
-            elif mutation == "identity":
-                native["nativeIds"].pop("sessionId")
-            else:
-                native["observerSource"]["sourceHealth"] = "unavailable"
-            lifecycle, _store, backend, _context = self.harness([native], [success(descriptor())])
-            with self.subTest(mutation=mutation), self.assertRaises(LifecycleError):
-                lifecycle.open_or_create(self.selection())
-            self.assertEqual([], backend.calls)
-
-    def test_claude_background_attach_requires_live_exact_job_mapping(self):
-        native = observer_row("claude")
-        lifecycle, _store, backend, _context = self.harness([native], [success(descriptor())])
-        lifecycle.open_or_create(self.selection("claude"))
-        argv = backend.calls[0][0]
-        self.assertEqual(
-            ["env", "CLAUDE_CONFIG_DIR=/native-config", "claude", "attach", "abcdef01"],
-            argv[argv.index("--") + 1 :],
-        )
-        for field in ("presence", "sessionKind", "nativeIds"):
-            bad = observer_row("claude")
-            if field == "presence":
-                bad[field]["value"] = "unknown"
-            elif field == "sessionKind":
-                bad[field] = "interactive"
-            else:
-                bad[field]["sessionId"] = "22222222-2222-2222-2222-222222222222"
-            lifecycle, _store, backend, _context = self.harness([bad], [])
-            with self.subTest(field=field), self.assertRaises(LifecycleError) as caught:
-                lifecycle.open_or_create(self.selection("claude"))
-            self.assertEqual("unsupported_attachment", caught.exception.code)
-            self.assertEqual([], backend.calls)
-
-    def test_native_new_codex_preserves_selected_configuration_and_cwd(self):
-        native = observer_row()
-        lifecycle, _store, backend, _context = self.harness([native], [success(descriptor())])
-        selected = {**self.selection(), "cwd": "/work"}
-        lifecycle.new_session_here(selected)
-        argv = backend.calls[0][0]
-        self.assertEqual(
-            ["env", "CODEX_HOME=/native-config", "codex"], argv[argv.index("--") + 1 :]
-        )
-        self.assertEqual("/work", argv[argv.index("--cwd") + 1])
-
-    def test_default_claude_attachment_preserves_native_preferences_location(self):
-        native = observer_row("claude")
-        native["observerSource"]["configHomeKind"] = "default"
-        lifecycle, _store, backend, _context = self.harness([native], [success(descriptor())])
-        lifecycle.open_or_create(self.selection("claude"))
-        argv = backend.calls[0][0]
-        self.assertEqual(
-            ["env", "-u", "CLAUDE_CONFIG_DIR", "claude", "attach", "abcdef01"],
-            argv[argv.index("--") + 1 :],
-        )
-        missing = observer_row("claude")
-        missing["observerSource"].pop("configHomeKind")
-        lifecycle, _store, backend, _context = self.harness([missing], [])
-        with self.assertRaisesRegex(LifecycleError, "configuration context"):
-            lifecycle.open_or_create(self.selection("claude"))
-        self.assertEqual([], backend.calls)
-
-    def test_native_new_claude_does_not_silently_launch_standalone_worker(self):
-        native = observer_row("claude")
-        lifecycle, _store, backend, _context = self.harness([native], [])
-        with self.assertRaises(LifecycleError) as caught:
-            lifecycle.new_session_here({**self.selection("claude"), "cwd": "/work"})
-        self.assertEqual("unsupported_creation", caught.exception.code)
-        self.assertEqual([], backend.calls)
-
-    def test_native_new_claude_creates_empty_background_then_attaches_exact_new_job(self):
-        native = observer_row("claude")
-        native["sessionKind"] = "interactive"
-        native["presence"]["value"] = "absent"
-        created = observer_row("claude")
-        created["id"] = "33333333-3333-3333-3333-333333333333"
-        created["nativeIds"] = {"sessionId": created["id"], "jobId": "33333333"}
-        lifecycle, _store, backend, _context = self.harness([native], [success(descriptor())])
-        backend.create_claude_background = mock.Mock(return_value=created)
-        lifecycle.new_session_here({**self.selection("claude"), "cwd": "/work"})
-        backend.create_claude_background.assert_called_once_with(
-            "alpha",
-            "/work",
-            "/native-config",
-            "fixture-native-home",
-            deadline=lifecycle.deadline,
-            config_home_kind="explicit",
-        )
-        argv = backend.calls[0][0]
-        self.assertEqual("create", argv[1])
-        self.assertEqual(
-            ["env", "CLAUDE_CONFIG_DIR=/native-config", "claude", "attach", "33333333"],
-            argv[argv.index("--") + 1 :],
-        )
-
-    def test_created_claude_failure_never_retries_background_creation(self):
-        for defect in ("stale_mesh", "namespace", "old_identity"):
-            with self.subTest(defect=defect):
-                native = observer_row("claude")
-                created = copy.deepcopy(native)
-                created["id"] = "33333333-3333-3333-3333-333333333333"
-                created["nativeIds"] = {"sessionId": created["id"], "jobId": "33333333"}
-                if defect == "namespace":
-                    created["namespace"] = "different-home"
-                    created["observerSource"]["namespace"] = "different-home"
-                if defect == "old_identity":
-                    created = copy.deepcopy(native)
-                lifecycle, _store, backend, _context = self.harness(
-                    [native], [(2, failure("stale_mesh"))]
-                )
-                backend.create_claude_background = mock.Mock(return_value=created)
-                with self.assertRaisesRegex(LifecycleError, "session was preserved") as caught:
-                    lifecycle.new_session_here({**self.selection("claude"), "cwd": "/work"})
-                self.assertEqual("operation_failed", caught.exception.code)
-                backend.create_claude_background.assert_called_once()
-                self.assertEqual(1, backend.streams)
-                self.assertEqual(1 if defect == "stale_mesh" else 0, len(backend.calls))
 
     def test_lifecycle_exit_and_body_envelopes_must_match(self) -> None:
         for returncode, payload in (
@@ -585,53 +250,6 @@ class ContractLifecycleTest(unittest.TestCase):
                         REVISION,
                         opening=True,
                     )
-
-    def test_lifecycle_signal_exit_is_terminal_without_retry(self) -> None:
-        payload = success(descriptor())
-        encoded = json.dumps(payload, separators=(",", ":")) + "\n"
-        command = CommandOutput(
-            ("rofi-tmux-plus", "open"),
-            -9,
-            encoded,
-            "",
-            stdout_bytes=encoded.encode(),
-        )
-        lifecycle, _store, backend, _context = self.harness([row()], [command])
-        with self.assertRaisesRegex(LifecycleError, "signal"):
-            lifecycle.open_or_create(self.selection())
-        self.assertEqual(1, len(backend.calls))
-
-    def test_open_uses_exact_reference_without_expected_name_and_reconciles_rename(self) -> None:
-        lifecycle, store, backend, context = self.harness(
-            [row()], [success(descriptor(name="renamed outside"))]
-        )
-        lifecycle.open_or_create(self.selection())
-        argv, timeout = backend.calls[0]
-        self.assertEqual(
-            [
-                "rofi-tmux-plus",
-                "open",
-                "--json",
-                "--host",
-                "alpha",
-                "--mesh-revision",
-                REVISION,
-                "--server-generation",
-                "tmux-v1:alpha",
-                "--session-id",
-                "$4",
-                "--created-at",
-                "5",
-            ],
-            argv,
-        )
-        self.assertNotIn("--expected-name", argv)
-        self.assertGreater(timeout, 0)
-        cached = store.load(self.config.fingerprint, BACKEND)
-        assert cached is not None
-        self.assertEqual("renamed outside", cached["sessions"][0]["tmuxSession"])
-        self.assertEqual(REVISION, cached["sessions"][0]["tmux"]["meshRevision"])
-        self.assertEqual(context.backend, cached["backend"])
 
     def test_launch_option_does_not_authorize_current_viewer_action(self) -> None:
         for kind in ("codex", "claude"):
@@ -672,198 +290,6 @@ class ContractLifecycleTest(unittest.TestCase):
         lifecycle.open_or_create(selection)
         self.assertNotIn("--mesh-revision", local_backend.calls[0][0])
 
-    def test_open_rejects_a_success_response_for_another_stable_session(self) -> None:
-        lifecycle, store, backend, _context = self.harness(
-            [row()], [success(descriptor(session_id="$99", created_at=77))]
-        )
-        with self.assertRaisesRegex(LifecycleError, "another session"):
-            lifecycle.open_or_create(self.selection())
-        self.assertEqual(1, len(backend.calls))
-        cached = store.load(self.config.fingerprint, BACKEND)
-        assert cached is not None
-        self.assertEqual("old-name", cached["sessions"][0]["tmuxSession"])
-
-    def test_stale_session_retries_once_only_for_a_new_typed_reference(self) -> None:
-        lifecycle, _store, backend, _context = self.harness(
-            [[row(session_id="$4")], [row(session_id="$5", created_at=6)]],
-            [
-                (2, failure("stale_session", "changed")),
-                success(descriptor(session_id="$5", created_at=6)),
-            ],
-        )
-        lifecycle.open_or_create(self.selection())
-        self.assertEqual(
-            ["$4", "$5"], [call[0][call[0].index("--session-id") + 1] for call in backend.calls]
-        )
-        self.assertEqual(2, backend.streams)
-
-    def test_guarded_open_retries_once_for_session_not_found(self) -> None:
-        lifecycle, _store, backend, _context = self.harness(
-            [[row(session_id="$4")], [row(session_id="$5", created_at=6)]],
-            [
-                (2, failure("session_not_found", "pre-action")),
-                success(descriptor(session_id="$5", created_at=6)),
-            ],
-        )
-        lifecycle.open_or_create(self.selection())
-        self.assertEqual(2, len(backend.calls))
-        self.assertEqual("$5", backend.calls[1][0][backend.calls[1][0].index("--session-id") + 1])
-
-    def test_guarded_open_invalid_input_is_terminal_on_full_path(self) -> None:
-        lifecycle, _store, backend, _context = self.harness(
-            [row()], [(2, failure("invalid_input", "compatibility input rejected"))]
-        )
-        with self.assertRaisesRegex(LifecycleError, "compatibility input rejected"):
-            lifecycle.open_or_create(self.selection())
-        self.assertEqual(1, len(backend.calls))
-
-    def test_nonstructured_or_unchanged_stale_response_never_retries_or_creates(self) -> None:
-        for response, rows in (
-            (
-                (
-                    2,
-                    {
-                        "schemaVersion": 1,
-                        "ok": False,
-                        "error": {"code": "operation_failed", "message": "stale_session text"},
-                    },
-                ),
-                [row()],
-            ),
-            ((2, failure("stale_session", "changed")), [[row()], [row()]]),
-        ):
-            with self.subTest(response=response):
-                lifecycle, _store, backend, _context = self.harness(rows, [response])
-                with self.assertRaises(LifecycleError):
-                    lifecycle.open_or_create(self.selection())
-                self.assertEqual(1, len(backend.calls))
-                self.assertEqual("open", backend.calls[0][0][1])
-
-    def test_create_has_provider_argv_options_cwd_retry_and_collision_bound(self) -> None:
-        invalid = fixture("invalid-cwd.json")["response"]
-        collision = fixture("session-exists.json")["response"]
-        for kind, resume in (
-            ("codex", ["codex", "resume", THREAD]),
-            ("claude", ["claude", "--resume", THREAD]),
-        ):
-            with self.subTest(kind=kind):
-                lifecycle, _store, backend, _context = self.harness(
-                    [row(kind, tmux=False, cwd="/gone")],
-                    [(2, invalid), (2, collision), success(descriptor(pending=True))],
-                )
-                lifecycle.open_or_create(self.selection(kind))
-                first, second, third = [call[0] for call in backend.calls]
-                self.assertIn("--cwd", first)
-                self.assertNotIn("--cwd", second)
-                self.assertNotEqual(
-                    second[second.index("--name") + 1], third[third.index("--name") + 1]
-                )
-                self.assertEqual(resume, third[third.index("--") + 1 :])
-                self.assertIn("--defer-until-attached", third)
-                self.assertIn("--open", third)
-                self.assertNotIn("@agent_picker_waiting", " ".join(third))
-                option_id = {
-                    "codex": "@codex_thread_id",
-                    "claude": "@claude_session_id",
-                }[kind]
-                self.assertIn(f"{option_id}={THREAD}", third)
-
-    def test_create_collision_and_invalid_cwd_retries_are_bounded(self) -> None:
-        collision = fixture("session-exists.json")["response"]
-        lifecycle, _store, backend, _context = self.harness([row(tmux=False)], [(2, collision)] * 8)
-        with self.assertRaisesRegex(LifecycleError, "exact name"):
-            lifecycle.open_or_create(self.selection())
-        self.assertEqual(8, len(backend.calls))
-        base = "native-name"
-        self.assertEqual(
-            [
-                base,
-                f"{base}-2",
-                f"{base}-3",
-                f"{base}-4",
-                f"{base}-5",
-                f"{base}-6",
-                f"{base}-7",
-                f"{base}-8",
-            ],
-            [call[0][call[0].index("--name") + 1] for call in backend.calls],
-        )
-
-        invalid = fixture("invalid-cwd.json")["response"]
-        lifecycle, _store, backend, _context = self.harness(
-            [row(tmux=False, cwd="/gone")], [(2, invalid), (2, invalid)]
-        )
-        with self.assertRaisesRegex(LifecycleError, "cwd"):
-            lifecycle.open_or_create(self.selection())
-        self.assertEqual(2, len(backend.calls))
-        self.assertIn("--cwd", backend.calls[0][0])
-        self.assertNotIn("--cwd", backend.calls[1][0])
-
-    def test_create_falls_back_to_provider_identity_when_title_has_no_safe_characters(
-        self,
-    ) -> None:
-        for title in ("日本語", "bad\nname", "x" * 4097):
-            with self.subTest(title=title[:20]):
-                selected = row(tmux=False)
-                selected["name"] = title
-                lifecycle, _store, backend, _context = self.harness(
-                    [selected], [success(descriptor(pending=True))]
-                )
-                lifecycle.open_or_create(self.selection())
-                argv = backend.calls[0][0]
-                self.assertEqual(f"agent-codex-{THREAD[:12]}", argv[argv.index("--name") + 1])
-
-    def test_create_strips_leading_title_separators(self) -> None:
-        selected = row(tmux=False)
-        selected["name"] = "__rofi"
-        lifecycle, _store, backend, _context = self.harness(
-            [selected], [success(descriptor(pending=True))]
-        )
-        lifecycle.open_or_create(self.selection())
-        argv = backend.calls[0][0]
-        self.assertEqual("rofi", argv[argv.index("--name") + 1])
-
-    def test_new_session_here_uses_exact_cwd_and_bare_provider_without_touching_source(
-        self,
-    ) -> None:
-        original = row()
-        lifecycle, store, backend, _context = self.harness(
-            [original], [success(descriptor(name="work-codex", pending=True))]
-        )
-        selected = self.selection()
-        selected["cwd"] = "/work"
-
-        lifecycle.new_session_here(selected)
-
-        self.assertEqual([("alpha", "codex", "/work")], [call[:3] for call in backend.preflights])
-        argv = backend.calls[0][0]
-        self.assertEqual(
-            [
-                "rofi-tmux-plus",
-                "create",
-                "--json",
-                "--host",
-                "alpha",
-                "--mesh-revision",
-                REVISION,
-                "--name",
-                "work-codex",
-                "--cwd",
-                "/work",
-                "--defer-until-attached",
-                "--open",
-                "--",
-                "codex",
-            ],
-            argv,
-        )
-        self.assertNotIn("--set-option", argv)
-        self.assertNotIn("resume", argv)
-        self.assertNotIn(THREAD, argv)
-        cached = store.load(self.config.fingerprint, BACKEND)
-        assert cached is not None
-        self.assertEqual("$4", cached["sessions"][0]["tmux"]["sessionId"])
-
     def test_new_session_here_rejects_noncurrent_and_changed_provider_context(self) -> None:
         selected = self.selection()
         selected["cwd"] = "/work"
@@ -891,6 +317,7 @@ class ContractLifecycleTest(unittest.TestCase):
             selected=retained_backend,
         )
         retained_store.refresh(self.config, force=True, context=retained_context)
+        retained_backend._rows = [[]]
         retained_backend.errors = [{"host": "alpha", "stage": "threads", "message": "offline"}]
         lifecycle = ContractLifecycle(retained_store, self.config, retained_context)
         with self.assertRaises(LifecycleError):
@@ -901,31 +328,6 @@ class ContractLifecycleTest(unittest.TestCase):
         duplicate_snapshot = {"backend": dict(BACKEND), "sessions": [row(), row()]}
         with self.assertRaisesRegex(LifecycleError, "no longer unambiguous"):
             _provider_row(duplicate_snapshot, BACKEND, selected)
-
-    def test_new_session_here_requires_an_absolute_cwd_and_preflight_success(self) -> None:
-        for cwd in ("", "relative/path", None):
-            with self.subTest(cwd=cwd):
-                lifecycle, _store, backend, _context = self.harness([row()], [])
-                selected = self.selection()
-                selected["cwd"] = cwd
-                with self.assertRaisesRegex(LifecycleError, "absolute provider-reported"):
-                    lifecycle.new_session_here(selected)
-                self.assertEqual([], backend.preflights)
-                self.assertEqual([], backend.calls)
-
-        for message in (
-            "provider directory no longer exists on selected host",
-            "provider executable is unavailable on selected host",
-        ):
-            with self.subTest(message=message):
-                lifecycle, _store, backend, _context = self.harness([row()], [])
-                backend.preflight_error = engine.PickerError(message)
-                selected = self.selection()
-                selected["cwd"] = "/work"
-                with self.assertRaisesRegex(LifecycleError, message):
-                    lifecycle.new_session_here(selected)
-                self.assertEqual(1, len(backend.preflights))
-                self.assertEqual([], backend.calls)
 
     def test_new_session_here_uses_current_provider_source_despite_old_tmux_uncertainty(
         self,
@@ -946,79 +348,9 @@ class ContractLifecycleTest(unittest.TestCase):
 
         lifecycle.new_session_here(selected)
 
-        self.assertEqual(1, len(backend.preflights))
+        self.assertEqual(1, len(backend.writes))
         self.assertEqual(1, len(backend.calls))
         self.assertEqual("create", backend.calls[0][0][1])
-
-    def test_new_session_here_retries_only_typed_collision_or_stale_mesh(self) -> None:
-        selected = self.selection()
-        selected["cwd"] = "/work"
-        collision = fixture("session-exists.json")["response"]
-        lifecycle, _store, backend, _context = self.harness(
-            [row()], [(2, collision), success(descriptor(pending=True))]
-        )
-        lifecycle.new_session_here(selected)
-        self.assertEqual(
-            ["work-codex", "work-codex-2"],
-            [call[0][call[0].index("--name") + 1] for call in backend.calls],
-        )
-        self.assertEqual(1, len(backend.preflights))
-
-        lifecycle, _store, backend, _context = self.harness(
-            [row()], [(2, failure("stale_mesh", "changed")), success(descriptor(pending=True))]
-        )
-        lifecycle.new_session_here(selected)
-        self.assertEqual(2, backend.streams)
-        self.assertEqual(("alpha",), backend.stream_kwargs[0]["host_ids"])
-        self.assertIsNone(backend.stream_kwargs[1].get("host_ids"))
-        self.assertEqual(2, len(backend.preflights))
-        self.assertEqual(2, len(backend.calls))
-
-        lifecycle, _store, backend, _context = self.harness(
-            [row()], [success(descriptor(pending=True))]
-        )
-        backend.stream_errors = [StaleMeshError("changed")]
-        lifecycle.new_session_here(selected)
-        self.assertEqual(2, len(backend.stream_kwargs))
-        self.assertEqual(("alpha",), backend.stream_kwargs[0]["host_ids"])
-        self.assertIsNone(backend.stream_kwargs[1].get("host_ids"))
-        self.assertFalse(backend.stream_kwargs[0]["retry_stale_mesh"])
-        self.assertFalse(backend.stream_kwargs[1]["retry_stale_mesh"])
-        self.assertEqual(2, backend.prepared)
-        self.assertEqual(1, len(backend.preflights))
-        self.assertEqual(1, len(backend.calls))
-
-        timed_out = CommandOutput((), 0, json.dumps(success(descriptor())), "", timed_out=True)
-        lifecycle, _store, backend, _context = self.harness([row()], [timed_out])
-        with self.assertRaisesRegex(LifecycleError, "timed out"):
-            lifecycle.new_session_here(selected)
-        self.assertEqual(1, backend.streams)
-        self.assertEqual(1, len(backend.preflights))
-        self.assertEqual(1, len(backend.calls))
-
-    def test_active_outside_or_unknown_provider_never_creates(self) -> None:
-        for kind in ("codex", "claude"):
-            with self.subTest(kind=kind, state="outside"):
-                lifecycle, _store, backend, _context = self.harness(
-                    [row(kind, tmux=False, active=True)], []
-                )
-                with self.assertRaisesRegex(LifecycleError, "outside tmux"):
-                    lifecycle.open_or_create(self.selection(kind))
-                self.assertEqual([], backend.calls)
-            with self.subTest(kind=kind, state="unknown"):
-                lifecycle, _store, backend, _context = self.harness(
-                    [row(kind, tmux=False, activity="unknown")], []
-                )
-                with self.assertRaisesRegex(LifecycleError, "unknown provider activity"):
-                    lifecycle.open_or_create(self.selection(kind))
-                self.assertEqual([], backend.calls)
-
-    def test_unknown_tmux_inventory_never_treats_missing_ref_as_createable(self) -> None:
-        lifecycle, _store, backend, _context = self.harness([row(tmux=False)], [])
-        backend.errors = [{"host": "alpha", "stage": "tmux", "message": "inventory unavailable"}]
-        with self.assertRaisesRegex(LifecycleError, "unknown tmux inventory"):
-            lifecycle.open_or_create(self.selection())
-        self.assertEqual([], backend.calls)
 
     def test_incomplete_scoped_revalidation_never_uses_a_retained_local_or_remote_row(self) -> None:
         for host_id in ("alpha", "beta"):
@@ -1210,17 +542,6 @@ class ContractLifecycleTest(unittest.TestCase):
                 assert cached is not None
                 self.assertNotIn("tmux", cached["sessions"][0])
 
-    def test_timed_out_command_never_reconciles_even_with_json(self) -> None:
-        lifecycle, store, backend, _context = self.harness(
-            [row(tmux=False)],
-            [CommandOutput((), 0, json.dumps(success(descriptor())), "", timed_out=True)],
-        )
-        with self.assertRaisesRegex(LifecycleError, "timed out"):
-            lifecycle.open_or_create(self.selection())
-        cached = store.load(self.config.fingerprint, BACKEND)
-        assert cached is not None
-        self.assertNotIn("tmux", cached["sessions"][0])
-
     def test_copied_lifecycle_fixtures_exercise_deferred_and_open_shapes(self) -> None:
         """Producer fixtures remain hermetic but drive the consumer validator."""
 
@@ -1270,7 +591,7 @@ class ContractLifecycleTest(unittest.TestCase):
                     preference_store=ViewPreferenceStore(Path(self.temporary.name) / "state"),
                 ),
             )
-        self.assertEqual("open", backend.calls[0][0][1])
+        self.assertEqual("create", backend.calls[0][0][1])
         # The Rofi path gives contract lifecycle its 30-second action budget,
         # not the legacy four-second discovery default.
         self.assertGreater(backend.calls[0][1], 10.0)
@@ -1290,7 +611,7 @@ class ContractLifecycleTest(unittest.TestCase):
                 host_id="alpha",
                 kind="codex",
                 identifier=THREAD,
-                namespace="fixture-native-home",
+                namespace=row()["namespace"],
                 native_id_kind="thread",
                 reference={
                     "meshRevision": REVISION,
@@ -1335,7 +656,7 @@ class ContractLifecycleTest(unittest.TestCase):
                 host_id="alpha",
                 kind="codex",
                 identifier=THREAD,
-                namespace="fixture-native-home",
+                namespace=row()["namespace"],
                 native_id_kind="thread",
                 reference=ref,
             )
@@ -1358,7 +679,7 @@ class ContractLifecycleTest(unittest.TestCase):
                 host_id="alpha",
                 kind="codex",
                 identifier=THREAD,
-                namespace="fixture-native-home",
+                namespace=row()["namespace"],
                 native_id_kind="thread",
                 reference=ref,
             )

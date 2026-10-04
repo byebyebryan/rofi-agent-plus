@@ -19,6 +19,7 @@ from . import engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig
 from .contract_backend import CommandOutput, StaleMeshError
+from .observer_write import WriteBoundaryError, encoded, request_for
 from .session_identity import logical_identity
 from .wire import WireError, decode_document, validate_string_bounds
 
@@ -26,7 +27,7 @@ _SCHEMA_VERSION = 1
 _CAPABILITY = "host-mesh-v1+tmux-session-v1"
 _MAX_FIELD = 4096
 _MAX_OUTPUT = 256 * 1024
-_LIFECYCLE_SECONDS = 30.0
+_LIFECYCLE_SECONDS = 60.0
 _MAX_CREATE_COLLISIONS = 8
 _SESSION_ID = re.compile(r"\$[0-9]+", re.ASCII)
 _HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
@@ -35,8 +36,8 @@ _GENERATION = re.compile(r"^[^\x00-\x1f\x7f-\x9f]+$", re.ASCII)
 _ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$", re.ASCII)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", re.ASCII)
 _PROVIDER_OPTIONS = {
-    "codex": ("@codex_thread_id", "@codex_name", "codex", "resume"),
-    "claude": ("@claude_session_id", "@claude_name", "claude", "--resume"),
+    "codex": ("@codex_thread_id", "@codex_name"),
+    "claude": ("@claude_session_id", "@claude_name"),
 }
 
 
@@ -239,7 +240,10 @@ def _provider_row(
             for error in errors
             if isinstance(error, Mapping) and error.get("host") == host_id
         }
-        if stale_stages[str(kind)] in host_stages:
+        if stale_stages[str(kind)] in host_stages and not (
+            isinstance(row.get("observerSource"), Mapping)
+            and row.get("sourceObservation") == "current"
+        ):
             raise LifecycleError("operation_failed", "selected session has stale provider state")
         if require_tmux_and_activity_evidence and not isinstance(
             row.get("observerSource"), Mapping
@@ -552,177 +556,6 @@ def _safe_wrapper_name(display_name: object, kind: str, identifier: str, attempt
     return candidate
 
 
-def _resume_argv(kind: str, identifier: str) -> tuple[str, ...]:
-    try:
-        executable, flag = _PROVIDER_OPTIONS[kind][2:]
-    except KeyError as error:
-        raise LifecycleError("operation_failed", "selected provider is invalid") from error
-    return str(executable), str(flag), identifier
-
-
-_NATIVE_ARTIFACTS = {
-    "codex": ("0.160.0", "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad"),
-    "claude": ("2.1.287", "3920489a5109cff5786a1a392c25277408ff22bc796d5edb9c16a60e5a1718f0"),
-}
-
-
-def _native_source_config(row: Mapping[str, object]) -> str:
-    """Validate source identity and artifact independently of attachment."""
-    source = row.get("observerSource")
-    runtime = source.get("runtime") if isinstance(source, Mapping) else None
-    kind = row.get("kind")
-    if not isinstance(kind, str) or kind not in _NATIVE_ARTIFACTS:
-        raise LifecycleError("operation_failed", "selected provider is invalid")
-    if kind == "codex" and (
-        row.get("threadKind") == "child"
-        or any(
-            issue in {"thread_classification_conflict", "thread_classification_unavailable"}
-            for issue in row.get("metadataIssues", ())
-        )
-    ):
-        raise LifecycleError(
-            "unsupported_attachment", "Codex child or ambiguous session cannot be opened"
-        )
-    expected_version, expected_hash = _NATIVE_ARTIFACTS[kind]
-    if (
-        not isinstance(source, Mapping)
-        or source.get("schemaVersion") != 1
-        or source.get("sourceHealth") != "current"
-        or source.get("provider") != kind
-        or source.get("namespace") != row.get("namespace")
-        or not isinstance(runtime, Mapping)
-        or runtime.get("version") != expected_version
-        or runtime.get("binarySha256") != expected_hash
-        or row.get("sourceObservation") != "current"
-        or logical_identity(row) is None
-    ):
-        raise LifecycleError(
-            "operation_failed", "native attachment source is unavailable or unsupported"
-        )
-    config_home = _absolute_provider_cwd(source.get("configHome"))
-    if config_home is None:
-        raise LifecycleError("operation_failed", "native attachment configuration is unavailable")
-    topology = (
-        "native_managed_endpoint" if kind == "codex" else "private_session_registry_and_job_store"
-    )
-    if runtime.get("topology") != topology:
-        raise LifecycleError("operation_failed", "native runtime topology is unsupported")
-    if kind == "claude" and (
-        not isinstance(source.get("configHomeKind"), str)
-        or source["configHomeKind"] not in {"default", "explicit"}
-    ):
-        raise LifecycleError(
-            "operation_failed", "native Claude configuration context is unavailable"
-        )
-    return config_home
-
-
-def _native_resume_argv(row: Mapping[str, object]) -> tuple[str, ...]:
-    """Select a fresh attachment without inferring a current viewer binding."""
-    config_home = _native_source_config(row)
-    kind = row["kind"]
-    native_ids = row.get("nativeIds")
-    if not isinstance(native_ids, Mapping):
-        raise LifecycleError("operation_failed", "native attachment identity is unavailable")
-    if kind == "codex":
-        identifier = native_ids.get("sessionId")
-        if not isinstance(identifier, str) or not engine.UUID_PATTERN.fullmatch(identifier):
-            raise LifecycleError(
-                "operation_failed", "exact native Codex resume identity is unavailable"
-            )
-        # Thread.id and sessionId are distinct protocol fields even when
-        # their values happen to match in a particular native release.
-        return "env", f"CODEX_HOME={config_home}", "codex", "resume", "--all", identifier
-    presence = row.get("presence")
-    job = native_ids.get("jobId")
-    if (
-        row.get("sessionKind") != "bg"
-        or not isinstance(presence, Mapping)
-        or presence.get("value") != "present"
-        or presence.get("health") != "current"
-        or native_ids.get("sessionId") != row.get("id")
-        or not isinstance(job, str)
-        or re.fullmatch(r"[0-9a-f]{8}", job, re.ASCII) is None
-    ):
-        raise LifecycleError(
-            "unsupported_attachment", "this Claude session has no proved native attachment route"
-        )
-    source = row["observerSource"]
-    environment = (
-        ("env", "-u", "CLAUDE_CONFIG_DIR")
-        if source["configHomeKind"] == "default"
-        else ("env", f"CLAUDE_CONFIG_DIR={config_home}")
-    )
-    return *environment, "claude", "attach", job
-
-
-def _native_history_resume_context(row: Mapping[str, object]) -> tuple[str, str]:
-    """Require fresh saved metadata without inventing liveness or work state."""
-    config_home = _native_source_config(row)
-    history = row.get("history")
-    native_ids = row.get("nativeIds")
-    presence = row.get("presence")
-    cwd = _absolute_provider_cwd(row.get("cwd"))
-    identifier = row.get("id")
-    saved = row.get("inventory") == "saved"
-    canonical_saved = (
-        saved
-        and row.get("sessionKind") == "unknown"
-        and isinstance(native_ids, Mapping)
-        and native_ids.get("jobId") is None
-        and row.get("job") is None
-        and row.get("cwdSource") == "claude_history"
-        and all(
-            isinstance(row.get(dimension), Mapping)
-            and row[dimension].get("value") == "unknown"
-            and row[dimension].get("health") == "unavailable"
-            and row[dimension].get("reason") == "unobserved"
-            and row[dimension].get("observedAt") is None
-            and row[dimension].get("source") is None
-            and "lastKnownValue" not in row[dimension]
-            for dimension in ("work", "presence")
-        )
-    )
-    job = row.get("job")
-    terminal_history = (
-        row.get("inventory") == "retained_job"
-        and row.get("sessionKind") in {"bg", "unknown"}
-        and isinstance(presence, Mapping)
-        and (
-            (presence.get("value") == "absent" and presence.get("health") == "current")
-            or (
-                presence.get("value") == "unknown"
-                and presence.get("health") == "unavailable"
-                and presence.get("reason") == "unobserved"
-            )
-        )
-        and isinstance(job, Mapping)
-        and job.get("retained") is True
-        and job.get("state") in {"done", "failed", "stopped"}
-        and isinstance(native_ids, Mapping)
-        and isinstance(job.get("id"), str)
-        and re.fullmatch(r"[0-9a-f]{8}", job["id"], re.ASCII) is not None
-        and native_ids.get("jobId") == job["id"]
-    )
-    if (
-        row.get("kind") != "claude"
-        or not isinstance(history, Mapping)
-        or history.get("source") != "claude_sdk"
-        or history.get("sdkVersion") != "0.2.163"
-        or not isinstance(native_ids, Mapping)
-        or not isinstance(identifier, str)
-        or not engine.UUID_PATTERN.fullmatch(identifier)
-        or native_ids.get("sessionId") != identifier
-        or not (canonical_saved or terminal_history)
-        or row.get("metadataIssues")
-        or cwd is None
-    ):
-        raise LifecycleError(
-            "unsupported_attachment", "saved Claude resume evidence is unavailable or ambiguous"
-        )
-    return config_home, cwd
-
-
 def _display_name(row: Mapping[str, object], identifier: str) -> str:
     value = row.get("name")
     if (
@@ -844,246 +677,52 @@ class ContractLifecycle:
             require_tmux_and_activity_evidence=not source_only,
         )
 
-    def _reconcile(
-        self,
-        selection: Mapping[str, object],
-        reference: StableReference,
-    ) -> None:
-        self.store.reconcile_contract_reference(
-            self.config,
-            self.context,
-            host_id=str(selection["hostId"]),
-            kind=str(selection["kind"]),
-            identifier=str(selection["id"]),
-            namespace=str(selection["namespace"]),
-            native_id_kind=str(selection["nativeIdKind"]),
-            reference=reference.payload(),
-            deadline=self.deadline,
-        )
-
-    def _open(self, selection: Mapping[str, object], reference: StableReference) -> StableReference:
-        return _open_reference(self.backend, reference, self.deadline)
-
-    def _create(
-        self, selection: Mapping[str, object], row: Mapping[str, object]
+    def _create_handoff(
+        self, row: Mapping[str, object], result: Mapping[str, object]
     ) -> StableReference:
-        host_id = str(selection["hostId"])
-        kind = str(selection["kind"])
-        identifier = str(selection["id"])
-        option_id, option_name, _executable, _flag = _PROVIDER_OPTIONS[kind]
-        name_value = _display_name(row, identifier)
-        cwd = row.get("cwd")
-        cwd_value = (
-            cwd
-            if isinstance(cwd, str)
-            and cwd
-            and len(cwd) <= _MAX_FIELD
-            and not any(unicodedata.category(char).startswith("C") for char in cwd)
-            else None
-        )
-        native = isinstance(row.get("observerSource"), Mapping)
-        resume_argv = _native_resume_argv(row) if native else _resume_argv(kind, identifier)
-        invalid_cwd_retry = False
-        for collision in range(_MAX_CREATE_COLLISIONS):
-            wrapper_name = _safe_wrapper_name(row.get("name"), kind, identifier, collision)
-            argv = [
-                self.backend.tmux_command,
-                "create",
-                "--json",
-                "--host",
-                host_id,
-                "--name",
-                wrapper_name,
-            ]
-            revision = self.identity["meshRevision"]
-            if revision is not None:
-                argv[5:5] = ["--mesh-revision", str(revision)]
-            if cwd_value is not None:
-                argv.extend(("--cwd", cwd_value))
-            argv.extend(
-                (
-                    "--set-option",
-                    f"{option_id}={identifier}",
-                    "--set-option",
-                    f"{option_name}={name_value}",
-                    "--defer-until-attached",
-                    "--open",
-                    "--",
-                    *resume_argv,
-                )
-            )
-            try:
-                return _run_json(
-                    self.backend,
-                    argv,
-                    self.deadline,
-                    host_id,
-                    self.identity["meshRevision"],
-                    opening=True,
-                )
-            except LifecycleError as error:
-                if (
-                    error.code == "invalid_cwd"
-                    and cwd_value is not None
-                    and not invalid_cwd_retry
-                    and not native
-                ):
-                    cwd_value = None
-                    invalid_cwd_retry = True
-                    continue
-                if error.code == "session_exists" and collision + 1 < _MAX_CREATE_COLLISIONS:
-                    continue
-                raise
-        raise LifecycleError(
-            "operation_failed", "could not choose a collision-free tmux wrapper name"
-        )
-
-    def _new_session_row(
-        self,
-        selection: Mapping[str, object],
-        *,
-        whole_mesh: bool = False,
-    ) -> tuple[dict[str, object], str]:
-        """Refresh and validate the exact current source for a new session."""
-
-        selected_cwd = _absolute_provider_cwd(selection.get("cwd"))
-        if selected_cwd is None:
-            raise LifecycleError(
-                "operation_failed", "selected session has no absolute provider-reported directory"
-            )
-        row = self._refresh_row(
-            selection,
-            whole_mesh=whole_mesh,
-            propagate_stale_mesh=True,
-            source_only=True,
-        )
-        if row.get("sourceObservation") != "current":
-            raise LifecycleError(
-                "operation_failed", "selected session no longer has current provider evidence"
-            )
-        refreshed_cwd = _absolute_provider_cwd(row.get("cwd"))
-        if refreshed_cwd is None:
-            raise LifecycleError(
-                "operation_failed", "selected session no longer has an absolute provider directory"
-            )
-        if refreshed_cwd != selected_cwd:
-            raise LifecycleError(
-                "operation_failed", "selected session directory changed; choose it again"
-            )
-        return row, refreshed_cwd
-
-    def _preflight_new_session(
-        self,
-        selection: Mapping[str, object],
-        cwd: str,
-    ) -> None:
-        """Check the target directory and bare provider executable pre-action."""
-
-        kind = selection.get("kind")
-        host_id = selection.get("hostId")
-        if kind not in _PROVIDER_OPTIONS or not isinstance(host_id, str):
-            raise LifecycleError("operation_failed", "selected provider session is invalid")
-        executable = _PROVIDER_OPTIONS[str(kind)][2]
-        preflight = getattr(self.backend, "preflight_provider_launch", None)
-        if not callable(preflight):
-            raise LifecycleError("operation_failed", "provider launch preflight is unavailable")
-        try:
-            preflight(host_id, executable, cwd, deadline=self.deadline)
-        except StaleMeshError as error:
-            raise LifecycleError("stale_mesh", str(error)) from error
-        except (engine.PickerError, OSError) as error:
-            raise LifecycleError("operation_failed", str(error)) from error
-
-    def _create_new_session(
-        self,
-        selection: Mapping[str, object],
-        cwd: str,
-    ) -> StableReference:
-        """Create a fresh native provider shell without touching the source row."""
-
-        host_id = str(selection["hostId"])
-        kind = str(selection["kind"])
-        executable = _PROVIDER_OPTIONS[kind][2]
-        launch_argv = (executable,)
-        source = selection.get("observerSource")
-        if isinstance(source, Mapping):
-            config_home = _native_source_config(selection)
-            if kind == "claude":
-                creator = getattr(self.backend, "create_claude_background", None)
-                if not callable(creator):
-                    raise LifecycleError(
-                        "unsupported_creation", "supervised Claude creation is unavailable"
-                    )
-                try:
-                    new_row = creator(
-                        host_id,
-                        cwd,
-                        config_home,
-                        str(selection["namespace"]),
-                        deadline=self.deadline,
-                        config_home_kind=str(source["configHomeKind"]),
-                    )
-                except StaleMeshError as error:
-                    # The backend exposes this only before invoking creation.
-                    raise LifecycleError("stale_mesh", str(error)) from error
-                except (engine.PickerError, OSError) as error:
-                    raise LifecycleError("operation_failed", str(error)) from error
-                try:
-                    if (
-                        not isinstance(new_row, Mapping)
-                        or new_row.get("hostId") != host_id
-                        or new_row.get("kind") != "claude"
-                        or new_row.get("namespace") != selection["namespace"]
-                        or new_row.get("cwd") != cwd
-                        or new_row.get("id") == selection["id"]
-                        or _native_source_config(new_row) != config_home
-                        or new_row["observerSource"].get("configHomeKind")
-                        != source["configHomeKind"]
-                    ):
-                        raise LifecycleError("operation_failed", "new native identity is invalid")
-                    _native_resume_argv(new_row)
-                    return self._create(new_row, new_row)
-                except (LifecycleError, engine.PickerError, OSError) as error:
-                    # Creation has happened. A changed Mesh or failed viewer
-                    # must never dispatch another empty background session.
-                    raise LifecycleError(
-                        "operation_failed",
-                        "Claude session created; fresh attachment failed and the session was preserved",
-                    ) from error
-            launch_argv = ("env", f"CODEX_HOME={config_home}", executable)
+        """Present a validated public TTY plan; never construct provider argv."""
+        plan = result["handoff"]
+        request = plan["request"]
+        host_id, kind, cwd = request["hostScope"], request["provider"], request["cwd"]
+        actual = result["resultingIdentity"]
+        identifier = actual["nativeId"] if actual is not None else None
         revision = self.identity["meshRevision"]
         for collision in range(_MAX_CREATE_COLLISIONS):
-            argv = [
-                self.backend.tmux_command,
-                "create",
-                "--json",
-                "--host",
-                host_id,
-            ]
+            wrapper_name = (
+                _safe_wrapper_name(row.get("name"), kind, identifier, collision)
+                if identifier
+                else _new_session_wrapper_name(cwd, kind, collision)
+            )
+            argv = [self.backend.tmux_command, "create", "--json", "--host", host_id]
             if revision is not None:
                 argv.extend(("--mesh-revision", str(revision)))
+            argv.extend(("--name", wrapper_name, "--cwd", cwd))
+            if identifier is not None:
+                option_id, option_name = _PROVIDER_OPTIONS[kind]
+                argv.extend(
+                    (
+                        "--set-option",
+                        f"{option_id}={identifier}",
+                        "--set-option",
+                        f"{option_name}={_display_name(row, identifier)}",
+                    )
+                )
             argv.extend(
                 (
-                    "--name",
-                    _new_session_wrapper_name(cwd, kind, collision),
-                    "--cwd",
-                    cwd,
                     "--defer-until-attached",
                     "--open",
                     "--",
-                    *launch_argv,
+                    "agent-observer-write",
+                    "enter",
+                    "--plan-json",
+                    encoded(plan).decode(),
                 )
             )
             try:
-                return _run_json(
-                    self.backend,
-                    argv,
-                    self.deadline,
-                    host_id,
-                    revision,
-                    opening=True,
-                )
+                return _run_json(self.backend, argv, self.deadline, host_id, revision, opening=True)
             except LifecycleError as error:
+                # A typed name collision is a pre-create rejection. Only the
+                # viewer attempt repeats, using the same plan and provider effect.
                 if error.code == "session_exists" and collision + 1 < _MAX_CREATE_COLLISIONS:
                     continue
                 raise
@@ -1091,149 +730,72 @@ class ContractLifecycle:
             "operation_failed", "could not choose a collision-free tmux wrapper name"
         )
 
-    def new_session_here(self, selection: Mapping[str, object]) -> None:
-        """Start a fresh provider TUI beside the selected native session.
-
-        Resume's existing fast/open/create lifecycle intentionally stays out
-        of this path.  A new provider process has no provider session ID or
-        provider-specific Tmux option until its own TUI persists one.
-        """
-
-        def attempt(*, whole_mesh: bool) -> None:
-            row, cwd = self._new_session_row(selection, whole_mesh=whole_mesh)
-            self._preflight_new_session(row, cwd)
-            self._create_new_session(row, cwd)
-
+    def _perform(self, row: Mapping[str, object], operation: str) -> None:
+        writer = getattr(self.backend, "observer_write", None)
+        if not callable(writer):
+            raise LifecycleError("operation_failed", "Observer write client is unavailable")
         try:
-            attempt(whole_mesh=False)
-        except LifecycleError as error:
-            if error.code != "stale_mesh":
-                raise
-            # A typed stale-Mesh response is pre-action.  Re-observe the
-            # complete authority exactly once, then prove the same source row
-            # still has current evidence and the same provider-reported cwd.
-            attempt(whole_mesh=True)
-
-    def _resume_saved_claude(self, row: Mapping[str, object]) -> None:
-        config_home, cwd = _native_history_resume_context(row)
-        self._preflight_new_session(row, cwd)
-        resumer = getattr(self.backend, "resume_claude_background", None)
-        if not callable(resumer):
-            raise LifecycleError("unsupported_attachment", "saved Claude resume is unavailable")
-        source = row["observerSource"]
-        try:
-            actual = resumer(
-                str(row["hostId"]),
-                cwd,
-                config_home,
-                str(row["namespace"]),
-                str(row["id"]),
-                config_home_kind=str(source["configHomeKind"]),
-                deadline=self.deadline,
-            )
+            request = request_for(row, operation)
+            result = writer(request, deadline=self.deadline)
         except StaleMeshError as error:
-            # The backend exposes this only before dispatching the native command.
+            # ContractBackend exposes stale authority only during passive
+            # preparation. Provider execution converts all failures to terminal
+            # effects, so this can safely refresh authority before one dispatch.
             raise LifecycleError("stale_mesh", str(error)) from error
-        except (engine.PickerError, OSError) as error:
+        except (engine.PickerError, WriteBoundaryError, OSError) as error:
             raise LifecycleError("operation_failed", str(error)) from error
         try:
-            if (
-                not isinstance(actual, Mapping)
-                or actual.get("hostId") != row["hostId"]
-                or actual.get("kind") != "claude"
-                or actual.get("namespace") != row["namespace"]
-                or actual.get("cwd") != cwd
-                or _native_source_config(actual) != config_home
-                or actual["observerSource"].get("configHomeKind") != source["configHomeKind"]
-            ):
-                raise LifecycleError("operation_failed", "resumed Claude identity is invalid")
-            _native_resume_argv(actual)
-            # A copied result uses its actual identity for the wrapper, never
-            # a historical launch association with the requested source UUID.
-            self._create(actual, actual)
+            self._create_handoff(row, result)
         except (LifecycleError, engine.PickerError, OSError) as error:
-            raise LifecycleError(
-                "operation_failed",
-                "Claude history resumed; attachment failed and the session was preserved",
-            ) from error
-
-    def open_or_create(self, selection: Mapping[str, object]) -> None:
-        # Every migrated provider row is re-read through Observer. Unsupported
-        # current-client binding permits a fresh attachment, never a focus or
-        # close of a historical wrapper that may now display another session.
-        row = self._refresh_row(selection)
-        if isinstance(row.get("observerSource"), Mapping):
-
-            def native_attempt(current: Mapping[str, object]) -> None:
-                if (
-                    current.get("kind") == "claude"
-                    and current.get("history")
-                    and not (
-                        isinstance(current.get("presence"), Mapping)
-                        and current["presence"].get("value") == "present"
-                    )
-                ):
-                    self._resume_saved_claude(current)
-                else:
-                    _native_resume_argv(current)  # fail before any Tmux action
-                    self._create(current, current)
-
-            try:
-                native_attempt(row)
-            except LifecycleError as error:
-                if error.code != "stale_mesh":
-                    raise
-                retry_row = self._refresh_row(selection, source_only=True, whole_mesh=True)
-                native_attempt(retry_row)
-            # Wrapper launch identity does not establish current conversation binding.
-            return
-        host_id = str(selection["hostId"])
-        revision = self.identity["meshRevision"]
-        if revision is not None and not isinstance(revision, str):
-            raise LifecycleError("operation_failed", "contract action has an invalid mesh revision")
-        tmux = row.get("tmux")
-        if tmux is not None:
-            reference = _reference(tmux, host_id, revision)
-            try:
-                result = self._open(selection, reference)
-            except LifecycleError as error:
-                if error.code not in {
-                    "stale_session",
-                    "session_not_found",
-                    "stale_mesh",
-                }:
-                    raise
-                retry_row = self._refresh_row(selection, whole_mesh=error.code == "stale_mesh")
-                retry_revision = self.identity["meshRevision"]
-                retry_reference = _reference(retry_row.get("tmux"), host_id, retry_revision)
-                if retry_reference == reference:
-                    raise
-                result = self._open(selection, retry_reference)
-            self._reconcile(selection, result)
-            return
-
-        if row.get("active") is True:
-            raise LifecycleError(
-                "operation_failed", "selected provider session is active outside tmux"
+            effect = result["effect"]
+            message = (
+                "Session created or resumed; attachment failed and provider work was preserved"
+                if effect == "confirmed"
+                else "Native entry handoff failed; no write retry was attempted"
             )
+            # No outer stale-Mesh recovery after execution or TTY presentation.
+            raise LifecycleError("operation_failed", message) from error
+
+    def _new_session_row(
+        self, selection: Mapping[str, object], *, whole_mesh: bool = False
+    ) -> dict[str, object]:
+        selected_cwd = _absolute_provider_cwd(selection.get("cwd"))
+        if selected_cwd is None:
+            raise LifecycleError("operation_failed", "selected session has no absolute directory")
+        row = self._refresh_row(
+            selection, whole_mesh=whole_mesh, propagate_stale_mesh=True, source_only=True
+        )
+        if (
+            row.get("sourceObservation") != "current"
+            or _absolute_provider_cwd(row.get("cwd")) != selected_cwd
+        ):
+            raise LifecycleError(
+                "operation_failed", "selected directory context changed; choose it again"
+            )
+        return row
+
+    def new_session_here(self, selection: Mapping[str, object]) -> None:
+        def attempt(whole_mesh: bool) -> None:
+            row = self._new_session_row(selection, whole_mesh=whole_mesh)
+            self._perform(row, "new")
+
         try:
-            result = self._create(selection, row)
+            attempt(False)
         except LifecycleError as error:
-            # A producer can reject a pre-action revision before creating
-            # anything.  Re-observe the whole Mesh once, then perform at most
-            # one action against the newly authoritative row.  All transport,
-            # malformed, unknown, and other typed failures remain terminal.
             if error.code != "stale_mesh":
                 raise
-            retry_row = self._refresh_row(selection, whole_mesh=True)
-            retry_tmux = retry_row.get("tmux")
-            if retry_tmux is not None:
-                retry_reference = _reference(retry_tmux, host_id, self.identity["meshRevision"])
-                result = self._open(selection, retry_reference)
-            else:
-                if retry_row.get("active") is True:
-                    raise LifecycleError(
-                        "operation_failed", "selected provider session is active outside tmux"
-                    ) from None
-                result = self._create(selection, retry_row)
-        self._reconcile(selection, result)
+            attempt(True)
+
+    def open_or_create(self, selection: Mapping[str, object]) -> None:
+        def attempt(whole_mesh: bool) -> None:
+            row = self._refresh_row(
+                selection, whole_mesh=whole_mesh, propagate_stale_mesh=True, source_only=True
+            )
+            self._perform(row, "resume")
+
+        try:
+            attempt(False)
+        except LifecycleError as error:
+            if error.code != "stale_mesh":
+                raise
+            attempt(True)

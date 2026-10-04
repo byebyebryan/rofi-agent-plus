@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 2,
+  "streamId": "00000000-0000-0000-0000-000000000001",
+  "revision": 2,
+  "kind": "gap",
+  "sampledAt": 1700000030000,
+  "reason": "source_incomplete",
+  "snapshot": null
+}

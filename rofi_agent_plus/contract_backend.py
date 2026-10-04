@@ -29,19 +29,20 @@ from threading import Event, Lock
 from typing import Any
 
 from . import engine
-from .claude_actions import (
-    MAX_BACKGROUND_STDOUT,
-    ClaudeActionError,
-    background_session,
-    parse_background_job_id,
-    workspace_trust_required,
-)
 from .observer_contract import ObserverContractError, ObserverSnapshot, parse_snapshot
+from .observer_write import (
+    MAX_WRITE_BYTES,
+    WriteBoundaryError,
+    completed,
+    encoded,
+    prepared,
+    rejection_code,
+)
 from .wire import WireError, decode_document, validate_string_bounds
 
 _MAX_STDOUT = 1 << 20
 _MAX_STDERR = 1 << 16
-_MAX_HOST_STDOUT = 512 * 1024
+_MAX_HOST_STDOUT = 8 * 1024 * 1024
 _MAX_INVENTORY_STDOUT = 1 << 20
 _MAX_FIELD = 16 * 1024
 _MAX_HOSTS = 128
@@ -76,37 +77,17 @@ _OPTIONS = (
 _MAX_HOST_WORKERS = 8
 _WHOLE_REFRESH_MIN_SECONDS = 12.0
 _WHOLE_REFRESH_MAX_SECONDS = 30.0
-_NEW_SESSION_EXECUTABLES = frozenset({"codex", "claude"})
-_PREFLIGHT_CWD_MISSING = 11
-_PREFLIGHT_PROVIDER_MISSING = 12
-_PREFLIGHT_PROVIDER_PROGRAM = r"""cwd=$1
-provider=$2
-if [ ! -d "$cwd" ]; then
-  exit 11
-fi
-command -v "$provider" >/dev/null 2>&1 || exit 12
-"""
-_CLAUDE_BACKGROUND_PROGRAM = r"""cwd=$1
-config_home=$2
-config_home_kind=$3
-settings=$4
-resume_id=$5
-cd "$cwd" || exit 11
-if [ -n "$resume_id" ]; then
-  set -- --resume "$resume_id" --bg
-else
-  set -- --bg
-fi
-if [ "$config_home_kind" = default ]; then
-  exec env -u CLAUDE_CONFIG_DIR claude --settings "$settings" "$@"
-fi
-exec env CLAUDE_CONFIG_DIR="$config_home" claude --settings "$settings" "$@"
-"""
-_CLAUDE_BACKGROUND_SETTINGS = '{"worktree":{"bgIsolation":"none"}}'
 
 
 class ContractError(engine.PickerError):
     """Visible public-contract failure; never a fallback trigger."""
+
+
+class WriteOperationError(ContractError):
+    def __init__(self, message: str, *, effect: str, result: dict[str, object] | None = None):
+        super().__init__(message)
+        self.effect = effect
+        self.result = result
 
 
 class StaleMeshError(ContractError):
@@ -149,6 +130,7 @@ def _run_bounded(
     timeout: float,
     stdout_limit: int = _MAX_STDOUT,
     stderr_limit: int = _MAX_STDERR,
+    own_process_group: bool = True,
 ) -> CommandOutput:
     """Run a process without unbounded ``communicate`` capture.
 
@@ -163,9 +145,12 @@ def _run_bounded(
         if process is None or (process.poll() is not None and not force_group):
             return
         try:
-            # The leader can exit while a descendant still holds an output
-            # pipe. A deadline still owns and stops that process group.
-            os.killpg(process.pid, signal.SIGKILL)
+            # Read/transport commands own their process group. A public write
+            # client owns only its launcher; provider descendants survive.
+            if own_process_group:
+                os.killpg(process.pid, signal.SIGKILL)
+            elif process.poll() is None:
+                process.kill()
         except (ProcessLookupError, PermissionError):
             if process.poll() is None:
                 process.kill()
@@ -577,7 +562,7 @@ def _json(
 def _error_envelope_code(
     command: CommandOutput,
     *,
-    limit: int = _MAX_HOST_STDOUT,
+    limit: int = 512 * 1024,
     validate_host_id: bool = False,
 ) -> str | None:
     """Return only a structurally valid v1 error code.
@@ -1320,320 +1305,127 @@ class ContractBackend:
                 unclassified = _bounded_text(output.stderr or f"SSH exited {output.returncode}")
         return None, ContractError(unclassified or f"{label} could not reach host")
 
-    def preflight_provider_launch(
-        self,
-        host_id: str,
-        executable: str,
-        cwd: str,
-        *,
-        deadline: float,
-    ) -> None:
-        """Verify one new-session launch context before any Tmux action.
-
-        This is intentionally a narrow backend operation.  It reuses the
-        selected Host Mesh route protocol for remote hosts and never exposes
-        SSH mechanics to Agent Plus's lifecycle consumer.  The checks prove
-        only that the provider-reported directory still exists and that the
-        requested bare provider command resolves on that same host.
-        """
-
-        if (
-            not isinstance(host_id, str)
-            or not _HOST_ID.fullmatch(host_id)
-            or executable not in _NEW_SESSION_EXECUTABLES
-            or not isinstance(cwd, str)
-            or not cwd.startswith("/")
-            or len(cwd) > _MAX_FIELD
-            or any(unicodedata.category(char).startswith("C") for char in cwd)
-        ):
-            raise ContractError("new-session launch context is invalid")
+    def observer_write(self, request: dict[str, object], *, deadline: float) -> dict[str, object]:
+        """Prepare through public read routing, then execute once on that route."""
         if self.mesh is None:
             raise ContractError("Host Mesh authority is unavailable")
-        host = next((item for item in self.mesh.hosts if item.host_id == host_id), None)
-        if host is None:
-            raise ContractError("selected host is not in the current Host Mesh")
-
-        if host.local:
-            if not os.path.isdir(cwd):
-                raise ContractError("provider directory no longer exists on selected host")
-            if self._which(executable) is None:
-                raise ContractError("provider executable is unavailable on selected host")
-            return
-
-        _route, result = self._remote_command(
-            host,
-            deadline,
-            remote_argv=(
-                "sh",
-                "-c",
-                _PREFLIGHT_PROVIDER_PROGRAM,
-                "rofi-agent-plus-preflight",
-                cwd,
-                executable,
-            ),
-            input_data=None,
-            label="provider launch preflight",
-            stdout_limit=1024,
+        host = next(
+            (item for item in self.mesh.hosts if item.host_id == request["hostScope"]), None
         )
-        if isinstance(result, ContractError):
-            raise result
-        if result.timed_out:
-            raise ContractError("provider launch preflight timed out")
-        if result.returncode == 0:
-            return
-        if result.returncode == _PREFLIGHT_CWD_MISSING:
-            raise ContractError("provider directory no longer exists on selected host")
-        if result.returncode == _PREFLIGHT_PROVIDER_MISSING:
-            raise ContractError("provider executable is unavailable on selected host")
-        raise ContractError("provider launch preflight failed")
-
-    def create_claude_background(
-        self,
-        host_id: str,
-        cwd: str,
-        config_home: str,
-        namespace: str,
-        *,
-        config_home_kind: str,
-        deadline: float,
-    ) -> dict[str, object]:
-        """Create one empty supervised session without a provider retry."""
-        return self._claude_background(
-            host_id,
-            cwd,
-            config_home,
-            namespace,
-            config_home_kind=config_home_kind,
-            deadline=deadline,
-        )
-
-    def resume_claude_background(
-        self,
-        host_id: str,
-        cwd: str,
-        config_home: str,
-        namespace: str,
-        session_id: str,
-        *,
-        config_home_kind: str,
-        deadline: float,
-    ) -> dict[str, object]:
-        """Resume the exact saved UUID once, then resolve its actual job/session.
-
-        Claude may copy history into another UUID. The native command's exact
-        attach cue selects the job; public Observer identity selects the actual
-        session. Neither UUID prefixes nor directory/title matches correlate it.
-        """
-        if not isinstance(session_id, str) or not engine.UUID_PATTERN.fullmatch(session_id):
-            raise ContractError("Claude saved resume identity is invalid")
-        return self._claude_background(
-            host_id,
-            cwd,
-            config_home,
-            namespace,
-            config_home_kind=config_home_kind,
-            deadline=deadline,
-            resume_session_id=session_id,
-        )
-
-    def _claude_background(
-        self,
-        host_id: str,
-        cwd: str,
-        config_home: str,
-        namespace: str,
-        *,
-        config_home_kind: str,
-        deadline: float,
-        resume_session_id: str | None = None,
-    ) -> dict[str, object]:
-        """Invoke one native command with closed stdin and validate its result.
-
-        Remote actions pin one configured route. An uncertain command or
-        transport outcome never falls through to a retry or another route.
-        """
-
-        def absolute_context(value: object) -> bool:
-            return (
-                isinstance(value, str)
-                and bool(value)
-                and value.startswith("/")
-                and not value.startswith("//")
-                and len(value) <= _MAX_FIELD
-                and not any(unicodedata.category(char).startswith("C") for char in value)
-            )
-
-        if (
-            not isinstance(host_id, str)
-            or not _HOST_ID.fullmatch(host_id)
-            or not absolute_context(cwd)
-            or not absolute_context(config_home)
-            or not isinstance(config_home_kind, str)
-            or config_home_kind not in {"default", "explicit"}
-            or not isinstance(namespace, str)
-            or not namespace
-            or len(namespace) > _MAX_FIELD
-            or any(unicodedata.category(char).startswith("C") for char in namespace)
-        ):
-            raise ContractError("Claude background creation context is invalid")
-        if self.mesh is None:
-            raise ContractError("Host Mesh authority is unavailable")
-        host = next((item for item in self.mesh.hosts if item.host_id == host_id), None)
         if host is None:
             raise StaleMeshError("selected host is no longer in the current Host Mesh")
-
-        try:
-            timeout = self._remaining(deadline)
-            remote_action_stderr: bytes | None = None
-            if config_home_kind == "default":
-                claude_argv = [
-                    "env",
-                    "-u",
-                    "CLAUDE_CONFIG_DIR",
-                    "claude",
-                    "--settings",
-                    _CLAUDE_BACKGROUND_SETTINGS,
-                    "--bg",
-                ]
-            else:
-                claude_argv = [
-                    "env",
-                    f"CLAUDE_CONFIG_DIR={config_home}",
-                    "claude",
-                    "--settings",
-                    _CLAUDE_BACKGROUND_SETTINGS,
-                    "--bg",
-                ]
-            if resume_session_id is not None:
-                claude_argv[-1:] = ["--resume", resume_session_id, "--bg"]
-            if host.local:
-                command = self._run(
-                    claude_argv,
-                    cwd=cwd,
-                    input_data=None,
-                    timeout=timeout,
-                    stdout_limit=MAX_BACKGROUND_STDOUT,
-                    stderr_limit=_MAX_STDERR,
-                )
-            else:
-                if not host.routes:
-                    raise ContractError("selected remote host has no configured route")
-                # A non-idempotent provider launch cannot use the discovery
-                # command's route fallback. This one route is authoritative
-                # for the attempt; an uncertain transport result is terminal.
-                route = host.routes[0]
-                nonce = secrets.token_hex(16)
-                command = self._run(
-                    _ssh_argv(
-                        self.mesh,
-                        route,
-                        nonce,
-                        (
-                            "sh",
-                            "-c",
-                            _CLAUDE_BACKGROUND_PROGRAM,
-                            "rofi-agent-plus-claude-background",
-                            cwd,
-                            config_home,
-                            config_home_kind,
-                            _CLAUDE_BACKGROUND_SETTINGS,
-                            resume_session_id or "",
-                        ),
-                    ),
-                    input_data=None,
-                    timeout=min(
-                        float(self.mesh.connect_timeout + 4),
-                        self._remaining(deadline),
-                    ),
-                    stdout_limit=MAX_BACKGROUND_STDOUT,
-                    stderr_limit=_MAX_STDERR,
-                )
-                reached, _stderr = parse_reached_marker(command.stderr, nonce)
-                if not reached:
-                    raise ContractError(
-                        "Claude background launch route was ambiguous; no retry was attempted"
-                    )
-                try:
-                    raw_stderr = _command_bytes(command, "stderr")
-                except (WireError, UnicodeEncodeError):
-                    raw_stderr = b""
-                marker = _marker(nonce).encode("utf-8")
-                if raw_stderr.count(marker) == 1:
-                    remote_action_stderr = raw_stderr.replace(marker, b"", 1)
-            if command.timed_out:
-                raise ContractError("Claude background command failed; no retry was attempted")
-            if command.returncode != 0:
-                try:
-                    stdout = _command_bytes(command, "stdout")
-                    stderr = (
-                        remote_action_stderr
-                        if remote_action_stderr is not None
-                        else _command_bytes(command, "stderr")
-                    )
-                except (WireError, UnicodeEncodeError):
-                    stdout = b"not-empty"
-                    stderr = b""
-                if not stdout and workspace_trust_required(stderr, cwd=cwd):
-                    raise ContractError(
-                        "workspace trust is required; open directory in native Claude first"
-                    )
-                raise ContractError("Claude background command failed; no retry was attempted")
-            try:
-                job_id = parse_background_job_id(_command_bytes(command, "stdout"))
-            except (ClaudeActionError, WireError, UnicodeEncodeError) as error:
-                raise ContractError(
-                    "Claude background output was unsupported; no retry was attempted"
-                ) from error
-        except StaleMeshError:
-            # This can only occur before the native command is invoked.
-            raise
-        except ContractError:
-            # The command may have reached Claude even when the transport or
-            # bounded runner failed. Never convert uncertainty into a retry.
-            raise
-
-        try:
-            while True:
-                self._remaining(deadline)
-                try:
-                    _route, snapshot = self._observer_snapshot(
-                        host, deadline, providers=("claude",)
-                    )
-                except StaleMeshError as error:
-                    raise ContractError(
-                        "Claude background was created; post-action Observer validation failed"
-                    ) from error
-                if not isinstance(snapshot, ContractError):
-                    try:
-                        row = background_session(
-                            snapshot,
-                            host_id=host_id,
-                            cwd=cwd,
-                            config_home=config_home,
-                            config_home_kind=config_home_kind,
-                            namespace=namespace,
-                            job_id=job_id,
-                        )
-                    except ClaudeActionError as error:
-                        raise ContractError(
-                            "Claude background was created; its Observer identity was ambiguous or mismatched"
-                        ) from error
-                    if row is not None:
-                        row.update(
-                            {
-                                "contractMode": True,
-                                "backend": dict(self.identity),
-                                "host": host.display,
-                                "hostId": host.host_id,
-                            }
-                        )
-                        return row
-                time.sleep(min(0.2, self._remaining(deadline)))
-        except ContractError as error:
-            if str(error).startswith("Claude background was created;"):
-                raise
+        prepare_argv = ("agent-observer-write", "prepare", "--request", "-")
+        route: str | None = None
+        if host.local:
+            command = self._run(
+                prepare_argv,
+                input_data=encoded(request),
+                timeout=self._remaining(deadline),
+                stdout_limit=MAX_WRITE_BYTES,
+                stderr_limit=MAX_WRITE_BYTES,
+            )
+        else:
+            route, command = self._remote_command(
+                host,
+                deadline,
+                remote_argv=prepare_argv,
+                input_data=encoded(request),
+                label="Observer write preparation",
+                stdout_limit=MAX_WRITE_BYTES,
+            )
+        if isinstance(command, ContractError):
+            raise command
+        if command.timed_out or command.returncode != 0:
+            code = rejection_code(_command_bytes(command, "stderr"))
             raise ContractError(
-                "Claude background was created; public Observer could not verify it before the deadline"
+                "Observer write preparation rejected (" + (code or "context_unavailable") + ")"
+            )
+        try:
+            plan = prepared(_command_bytes(command, "stdout"), request)
+        except WriteBoundaryError as error:
+            raise ContractError(str(error)) from error
+        # Execution can dispatch provider work. From this point no route,
+        # transport, stale authority or malformed result causes redispatch.
+        dispatched = False
+        try:
+            remaining = self._remaining(deadline)
+            if remaining < 3:
+                raise ContractError("Observer write deadline is exhausted before dispatch")
+            execute_argv = (
+                "agent-observer-write",
+                "execute",
+                "--plan",
+                "-",
+                "--timeout",
+                str(min(30.0, max(1.0, (remaining - 2) / 2))),
+            )
+            if host.local:
+                dispatched = True
+                command = self._run(
+                    execute_argv,
+                    input_data=encoded(plan),
+                    timeout=remaining,
+                    stdout_limit=MAX_WRITE_BYTES,
+                    stderr_limit=MAX_WRITE_BYTES,
+                    own_process_group=False,
+                )
+            else:
+                selected = next((item for item in host.routes if item.destination == route), None)
+                if selected is None:
+                    raise ContractError("Observer write prepared route is unavailable")
+                nonce = secrets.token_hex(16)
+                dispatched = True
+                command = self._run(
+                    _ssh_argv(self.mesh, selected, nonce, execute_argv),
+                    input_data=encoded(plan),
+                    timeout=remaining,
+                    stdout_limit=MAX_WRITE_BYTES,
+                    stderr_limit=_MAX_STDERR,
+                    own_process_group=False,
+                )
+                reached, stderr = parse_reached_marker(command.stderr, nonce)
+                if not reached:
+                    raise ContractError("Observer write route outcome is unknown")
+                command = CommandOutput(
+                    command.argv,
+                    command.returncode,
+                    command.stdout,
+                    stderr,
+                    command.timed_out,
+                    command.stdout_bytes,
+                    stderr.encode(),
+                )
+            if command.timed_out:
+                raise ContractError("Observer write command timed out")
+            if command.returncode == 2:
+                code = rejection_code(_command_bytes(command, "stderr"))
+                if code is not None:
+                    raise WriteOperationError(
+                        "Observer write rejected (" + code + ")", effect="none"
+                    )
+            result = completed(_command_bytes(command, "stdout"), plan)
+            expected_exit = 0 if result["status"] in {"prepared", "ready"} else 3
+            if command.returncode != expected_exit:
+                raise ContractError("Observer write result exit code disagrees")
+            if result["status"] not in {"prepared", "ready"}:
+                raise WriteOperationError(
+                    "Observer write "
+                    + result["status"]
+                    + " ("
+                    + result["reason"]
+                    + "); no retry was attempted",
+                    effect=result["effect"],
+                    result=result,
+                )
+            return result
+        except WriteOperationError:
+            raise
+        except (ContractError, WriteBoundaryError, OSError, WireError) as error:
+            raise WriteOperationError(
+                "Observer write outcome is uncertain; no retry was attempted"
+                if dispatched
+                else "Observer write dispatch unavailable",
+                effect="uncertain" if dispatched else "none",
             ) from error
 
     def _once(
@@ -1799,6 +1591,9 @@ class ContractBackend:
                     "host": host.host_id,
                     "sessions": sessions,
                     "errors": errors,
+                    "incompleteProviders": list(observation.incomplete_providers)
+                    if isinstance(observation, ObserverSnapshot)
+                    else list(config.providers_for(host.host_id)),
                     "backend": self.identity,
                 }
             )

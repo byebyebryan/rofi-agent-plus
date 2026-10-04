@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "operation": "new",
+  "hostScope": "fixture",
+  "provider": "codex",
+  "configHome": "/fixture/codex",
+  "configHomeKind": "explicit",
+  "cwd": "/fixture/project",
+  "reference": null
+}

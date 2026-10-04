@@ -1,0 +1,19 @@
+{
+  "observerVersion": "0.2.0a3",
+  "sourceRevision": "222c5bf",
+  "wheelSha256": "6aa793e6a0ba5ae37403f73999ea6e6d56bc8c21e5e4c7a10ac52cb946a45a3f",
+  "contractVersions": {
+    "snapshot": 2,
+    "watch": 2,
+    "write": 1
+  },
+  "files": {
+    "claude-ready.json": "c7ab9e083e9cd3be235b7db4763b29dbf0f0282f6e67d7ceb7cf52af43241a5d",
+    "gap.json": "dfa9b6de4785be6a9ab2c4c3f9b740be311ddf1127bdbea1a9d25342280bb4d0",
+    "partial.json": "b472262998794f66a097a4dc6c819066c72e90c81a7227ddcdae38a89593df1a",
+    "snapshot.json": "e2703cbfbeab886efda4cb0247f122e83ea26471434a21bd8da04f155d9eda84",
+    "write-plan.json": "4909b4a9df77beecfeb8c90fb0c21fa22137cbf42f1be668bc8c375ebb975476",
+    "write-request.json": "a9f82fad99b263c311627993074061ea68aa9fbfb97b1e9ae6133cfdd2f7c433",
+    "write-result.json": "1396cef274574e3cb1db689743272b778b50aeb08de3850372790115f842d486"
+  }
+}

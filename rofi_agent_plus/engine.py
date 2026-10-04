@@ -9,7 +9,7 @@ import re
 
 DEFAULT_LIMIT = 40
 DEFAULT_TIMEOUT = 4.0
-VERSION = "0.13.0a3"
+VERSION = "0.14.0a1"
 UUID_PATTERN = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"

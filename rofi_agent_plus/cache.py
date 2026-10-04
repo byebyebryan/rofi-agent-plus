@@ -20,14 +20,14 @@ from typing import TYPE_CHECKING, Any
 
 from . import engine
 from .config import PickerConfig
+from .observer_contract import retain_row, session_sort_key
 
 if TYPE_CHECKING:
     from .viewer_state import ViewerStateStore
 
-# v5 marks the current provider set. Older private snapshots may contain
-# retired rows and stage history, so they are invalidated as a whole instead
-# of being reinterpreted under the current contract.
-CACHE_VERSION = 6
+# v7 cuts over to store-scoped Observer v2 references and phase/activity
+# semantics. Older private snapshots are invalidated as a whole.
+CACHE_VERSION = 7
 DEFAULT_CACHE_DIR = Path("rofi-agent-plus")
 SNAPSHOT_NAME = "snapshot.json"
 LOCK_NAME = "refresh.lock"
@@ -322,10 +322,18 @@ def _merge_host_snapshot(
         row = dict(item)
         if not _valid_provider_session(row):
             continue
-        row["sourceObservation"] = _source_from_current_event(row.get("sourceObservation"))
+        if (
+            isinstance(row.get("observerSource"), Mapping)
+            and row.get("sourceObservation") == "retained"
+        ):
+            retain_row(row)
+        else:
+            row["sourceObservation"] = _source_from_current_event(row.get("sourceObservation"))
         current_sessions.append(row)
     current_errors = [dict(item) for item in current.get("errors", []) if isinstance(item, dict)]
     failed_stages = {str(error.get("stage")) for error in current_errors if error.get("stage")}
+    incomplete = current.get("incompleteProviders", ())
+    incomplete = set(incomplete) if isinstance(incomplete, (list, tuple)) else set()
     current_by_key = {_as_session_key(item): item for item in current_sessions}
     tmux_failed = "tmux" in failed_stages
 
@@ -373,12 +381,18 @@ def _merge_host_snapshot(
             # A synthetic activity-only row has no provider-native metadata to
             # retain.  Keeping it through a later provider failure would make
             # an old process probe look like a current session listing.
-            preserve = old.get("sourceObservation") != "activity-only" and any(
-                _PROVIDER_FOR_STAGE.get(stage) == provider for stage in failed_stages
+            preserve = old.get("sourceObservation") != "activity-only" and (
+                provider in incomplete
+                or any(_PROVIDER_FOR_STAGE.get(stage) == provider for stage in failed_stages)
             )
             fresh = current_by_key.get(key)
             current_had_tmux = fresh is not None and "tmux" in fresh
-            if preserve and fresh is not None:
+            if preserve and fresh is not None and isinstance(fresh.get("observerSource"), Mapping):
+                # Public rows already reconcile their independent evidence.
+                # A partial/history failure must not overlay old provider facts
+                # onto a healthy current row from the same collection.
+                pass
+            elif preserve and fresh is not None:
                 # The provider's list/details stage failed, but activity is a
                 # fresh independent observation.  Start from old provider
                 # metadata and overlay only current identity/activity and
@@ -413,6 +427,8 @@ def _merge_host_snapshot(
             elif preserve and fresh is None:
                 fresh = dict(old)
                 fresh["sourceObservation"] = "retained"
+                if isinstance(fresh.get("observerSource"), Mapping):
+                    retain_row(fresh)
                 current_sessions.append(fresh)
                 current_by_key[key] = fresh
             if "active" in failed_stages and key in current_by_key:
@@ -434,10 +450,7 @@ def _merge_host_snapshot(
             ):
                 retain_tmux(old, current_by_key[key], current_had_tmux=current_had_tmux)
 
-    current_sessions.sort(
-        key=lambda item: (int(item.get("recencyAt") or 0), str(item.get("id") or "")),
-        reverse=True,
-    )
+    current_sessions.sort(key=session_sort_key)
     result = {
         "generatedAt": int(current.get("generatedAt") or time.time()),
         "sessions": current_sessions,
@@ -566,6 +579,11 @@ def _failed_contract_snapshot(
         else {}
     )
     catalog = _host_catalog(prior.get("hostCatalog")) if isinstance(prior, Mapping) else None
+    if not retain_unselected_hosts:
+        for host in hosts.values():
+            for row in host.get("sessions", []):
+                if isinstance(row.get("observerSource"), Mapping):
+                    retain_row(row)
     prior_refresh = _prior_last_refresh(prior)
     if retain_unselected_hosts:
         # A lifecycle revalidation is deliberately narrower than the picker
@@ -604,10 +622,7 @@ def _flatten_hosts(hosts: Mapping[str, Mapping[str, Any]], limit: int) -> list[d
                 continue
             seen.add(key)
             sessions.append(dict(item))
-    sessions.sort(
-        key=lambda item: (int(item.get("recencyAt") or 0), str(item.get("id") or "")),
-        reverse=True,
-    )
+    sessions.sort(key=session_sort_key)
     return sessions[:limit]
 
 
@@ -788,6 +803,7 @@ def build_snapshot(
                     ),
                     "sessions": event.get("sessions", []),
                     "errors": event.get("errors", []),
+                    "incompleteProviders": event.get("incompleteProviders", []),
                 }
                 hosts[key] = _merge_host_snapshot(hosts.get(key), current)
                 completed_hosts.add(key)

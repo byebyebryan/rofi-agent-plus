@@ -2,39 +2,36 @@
 
 `rofi-agent-plus` meshes Codex and Claude Code sessions across Host Mesh hosts.
 Agent Observer owns passive host-local discovery and work-state observation;
-Agent Plus owns the picker, presentation, fresh action validation, and native
-attachment requests. Tmux Plus owns terminal and viewer lifecycle. OpenCode is
+Agent Plus owns the picker, presentation and host/selection validation, and
+calls Observer's separate write client for native entry. Tmux Plus owns terminal and viewer lifecycle. OpenCode is
 no longer a supported provider in this migration candidate.
 
-Version `0.13.0a3` is an unreleased migration candidate for Python 3.11+ with no
-runtime package dependencies. This checkout replaces the earlier foreground
+Version `0.14.0a1` is an unreleased migration candidate for Python 3.11+ with the pinned
+`agent-observer==0.2.0a3` public contract library. This checkout replaces the earlier foreground
 process-correlation implementation. Historical study and acceptance documents
 remain evidence for their stated versions; they do not certify this runtime.
 
 ## Runtime boundary
 
-Each observed host needs the independently installed `agent-observer` command.
-Agent Plus invokes its public `snapshot --host-scope HOST_ID` JSON contract,
-locally or through the routes supplied by SSH Plus. It never imports Observer
-or reads provider databases, registries, transcripts, or process command lines.
-Observation never launches a provider or starts a missing daemon.
+Each observed host needs independently installed `agent-observer` and
+`agent-observer-write` commands from the accepted `0.2.0a3` artifact. Plus invokes
+public snapshot v2 and write request/plan/result v1 contracts locally or through
+SSH Plus routes. Its pinned Python dependency provides only pure public contract
+validation; the frontend does not import collectors or provider action internals.
+No provider databases, registries, transcripts or process command lines are read
+by Plus. Observation never starts a missing daemon or provider session.
 
 `rofi-tmux-plus` is mandatory. SSH Plus supplies Host Mesh identity, routes and
-SSH policy when installed; an absent SSH Plus permits the existing local-only
-identity. A malformed installed contract is a visible failure. The exact
-released Host Mesh v1 and Tmux Session v1 bundles are independently validated
-in this repository; their provenance is unchanged by this migration.
+SSH policy; an absent SSH Plus permits the existing local-only identity. Invalid
+installed contracts fail visibly. The released Host Mesh v1 and Tmux Session v1
+bundles retain their independent validation and provenance.
 
-The initial native artifacts are Codex daemon `0.160.0` and Claude Code
-`2.1.287`, checked by exact binary hashes and topology. A newer provider or an
-unavailable source remains unsupported until independently accepted. Codex is
-the primary multi-host target. Claude support is initially exercised on Snap.
-A missing Claude installation on another host does not hide healthy Codex rows.
-
-Identity includes the logical host, provider, native namespace, native ID kind,
-and native ID. Saved history, loaded server threads, worker processes, and
-terminal clients remain separate. Provider-owned titles and working directories
-are display metadata, never identity joins.
+Observer owns native artifact/topology acceptance. The accepted matrix is Codex
+0.160.0 on Snap and Starship and Claude Code 2.1.287 on Snap. Missing or unsupported
+sources remain explicit, preserving healthy sibling providers. Identity contains
+logical host, provider, store namespace, native ID kind and full native ID.
+Runtime, worker, phase, outcome, attachment and saved history stay separate.
+Titles, paths and project metadata never join native identities.
 
 ## Run
 
@@ -56,56 +53,48 @@ Tab and Shift+Tab cycle Resume, Close and New. Enter applies the displayed
 action. Alt+R requests a finite refresh. Escape and Ctrl+G close through Rofi's
 native cancel path. Page changes read the cache and preserve the filter.
 
-The mixed history list orders rows using explicit native history timestamps
-when available. Work and presence have independent evidence clocks. The
-Active page uses uncapped per-host rows with current provider presence: Codex
-means a loaded server thread; Claude means a verified registered worker.
-Active does not mean currently doing work. Rows separately show Working,
-Waiting, Settled, Interrupted, Error or Work unknown when supported. Missing,
-stale or unsupported work evidence is never displayed as idle.
+The list orders current phase by attention: **Blocked, Waiting, Working**, then
+unknown. Within each group it orders by actual conversation activity when that
+source is available; unknown activity age is displayed as unknown. Creation,
+provider metadata modification and liveness never become conversation age.
+Configured workspace roots display a root key and relative path; raw cwd and
+Git/project metadata remain available in diagnostic JSON.
+
+The Active page uses uncapped per-host rows with current running runtime evidence:
+loaded Codex threads or verified registered Claude workers. Running does not mean
+working. A completed Claude background context with a current worker can be
+Waiting with a separate Completed outcome. Saved-only rows retain unknown runtime;
+missing observations do not imply parked. Confirmed children of either provider
+are hidden; unknown classifications stay visible.
 
 ## Native actions and current limits
 
-Resume re-observes the selected host and requires the complete same identity,
-a current accepted source and an exact native attachment route. Codex launches
-`env CODEX_HOME=... codex resume --all SESSION_ID`, using the explicit native
-session ID independently of the thread ID. Claude attaches a current supervised
-background worker with `claude attach JOB_ID`. Default configuration clears
-`CLAUDE_CONFIG_DIR` to preserve the native preference location; explicit roots
-supply that variable only when Observer identifies the explicit context.
-Saved Claude rows with fresh Observer history metadata have a separate Resume
-route: `claude --resume FULL_UUID --bg` with closed stdin, then an exact native
-job cue and public Observer lookup before attaching. If Claude creates a copy,
-the viewer uses its actual new session UUID. Post-command uncertainty never
-retries the provider action. Active foreground sessions keep attachment
-unsupported. Saved history does not imply an absent or idle worker.
+Resume refreshes the owning host, resolves the same complete store/native reference
+and calls `agent-observer-write prepare`, then `execute`. Observer selects and
+validates the exact native route, executable, config, cwd and runtime. Plus pins
+the prepared remote route for execution and never repeats an uncertain write.
+Results preserve requested and actual copied identities and confirmed effects
+when presentation fails. The frontend does not construct provider argv or parse
+Claude launch cues.
 
-Observer retains native child classification; Agent Plus excludes confirmed
-Codex children from ordinary picker rows and rejects child or conflicting
-identity actions. Unknown older classifications remain visible. Claude history
-comes from Observer's bounded official SDK list, which excludes nested subagent
-transcripts. History warnings remain separate from healthy live observations.
+Tmux Plus receives only `agent-observer-write enter --plan-json PLAN` through its
+public deferred create/open interface. Observer revalidates at native TTY entry.
+Tmux owns the viewer; the provider owns work. A typed name collision can retry the
+viewer with the same plan. Post-write authority, transport or presentation failure
+never dispatches another New/Resume operation.
 
-Tmux wraps the individual attachment client. The native provider runtime owns
-work. Historical provider options on old tmux wrappers do not prove which
-conversation a client displays after native `/new` or `/resume` navigation.
-Current client-to-conversation binding is unsupported for both providers.
-Resume therefore creates a fresh validated attachment rather than focusing a
-historical wrapper. Provider-native permission and trust dialogs still apply.
+New uses the refreshed selected row only to choose provider, owning host,
+configuration and an unchanged absolute directory. Its write request contains no
+old session reference. Observer's independent New client also works with zero rows.
+Codex resolves new identity after native entry. Claude can create a background
+context before attachment; viewer failure preserves confirmed provider work.
+Native permissions and trust prompts remain provider-owned.
 
-New revalidates the source identity and exact provider-reported directory.
-Codex starts a fresh individual TUI in the same native configuration. Claude's
-accepted supervised entry is an empty `claude --bg` followed by attach to the
-new exact job, with stdin closed and without inventing a task or prompt. A
-per-launch `worktree.bgIsolation=none` overlay preserves the selected directory. The implementation and
-installed callback acceptance of that path are tracked in the execution
-ledger. Merely enabling Agent View does not supervise a bare foreground TUI.
-
-Conversation-specific Open, Close and group Resume/Close require a proved
-current viewer binding. Native Observer rows are excluded while that binding
-is unsupported. The generic Tmux Plus picker remains available for explicit
-viewer management. Closing a viewer is distinct from ending provider work;
-Agent Plus does not rename, kill, approve, deny or interrupt native sessions.
+Current client-to-conversation binding is unsupported. Resume creates a fresh
+validated attachment; historical tmux launch options do not authorize focus,
+Close, conversation-specific Open or group viewer actions. Generic Tmux Plus
+viewer management remains available. Plus does not rename, kill, approve, deny
+or interrupt native sessions.
 
 ## Configuration and retained state
 
@@ -134,7 +123,9 @@ The private cache is under `$XDG_CACHE_HOME/rofi-agent-plus/` with directory
 mode 0700 and files mode 0600. A refresh publishes an authority-scoped snapshot
 atomically. Provider failures retain last-known rows with bounded diagnostics;
 healthy providers remain usable. A liveness refresh never renews old work-state
-or history timestamps. The migration cache version rejects old correlations.
+or history timestamps. Cache version 7 rejects prior identity/state interpretations. Partial inventories
+retain missing rows with stale dimensions and original evidence clocks; current
+rows keep their independently validated facts.
 
 Picker preferences at `$XDG_STATE_HOME/rofi-agent-plus/view.json` remember the
 page and a successfully used complete native identity. Search begins empty and
@@ -148,6 +139,12 @@ Unknown or ambiguous identity never selects a session by title or directory.
 ./scripts/check-contract-sync /path/to/rofi-ssh-plus /path/to/rofi-tmux-plus
 ```
 
+Before development checks, install the accepted Observer wheel into the chosen
+Python environment, then install `.[dev]`. The prerelease dependency is not yet
+published; use the independently validated local artifact described in the
+[execution record](docs/observer-v2-execution.md). Hosted CI needs that dependency
+published before its normal package install can run.
+
 The main gate runs meaningful contract, identity, cache, UI and action checks,
 Ruff, shell and text checks, and released bundle verification. Synthetic tests
 do not establish native or visual acceptance. Package installation, source/hash
@@ -156,5 +153,5 @@ are separate delivery gates.
 
 See [suite ownership](docs/SUITE_INTEGRATION.md),
 [configuration](examples/config.toml) and [icon provenance](ASSETS.md).
-The implementation and native evidence are coordinated in
-[Agent Observer's execution ledger](../agent-observer/docs/execution-status.md).
+The separate [consumer execution record](docs/observer-v2-execution.md) tracks
+source, packaged and native gates after Observer's independent acceptance.

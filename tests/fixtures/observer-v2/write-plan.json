@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "request": {
+    "schemaVersion": 1,
+    "operation": "new",
+    "hostScope": "fixture",
+    "provider": "codex",
+    "configHome": "/fixture/codex",
+    "configHomeKind": "explicit",
+    "cwd": "/fixture/project",
+    "reference": null
+  },
+  "route": "codex_new",
+  "createdAt": 1700000000000,
+  "guard": {
+    "uid": 1000,
+    "cwd": {
+      "device": 1,
+      "inode": 2
+    },
+    "config": {
+      "device": 1,
+      "inode": 3
+    },
+    "binary": {
+      "device": 1,
+      "inode": 4
+    },
+    "binarySha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "settingsSha256": null,
+    "runtimeToken": null
+  }
+}

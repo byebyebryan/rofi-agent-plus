@@ -20,6 +20,7 @@ from . import batch, engine
 from .cache import CacheStore, PresentationContext
 from .config import PickerConfig, load_config
 from .contract_lifecycle import ContractLifecycle, LifecycleError, fast_open_selection
+from .observer_contract import session_sort_key
 from .session_identity import SessionIdentity, logical_identity
 from .view_preferences import (
     ViewPreference,
@@ -340,6 +341,16 @@ def _shorten_cwd(value: object, width: int = 42) -> str:
     return "…" + cwd[-(width - 1) :]
 
 
+def _workspace_label(session: Mapping[str, Any]) -> str:
+    workspace = session.get("workspace")
+    if isinstance(workspace, Mapping) and workspace.get("health") == "current":
+        root = workspace.get("rootKey")
+        relative = workspace.get("relativePath")
+        if isinstance(root, str) and isinstance(relative, str):
+            return _shorten_cwd(root + ":" + relative)
+    return _shorten_cwd(session.get("cwd"))
+
+
 def _age(timestamp: object, now: float | None = None) -> str:
     try:
         numeric_timestamp = float(timestamp)
@@ -406,6 +417,9 @@ def _recency_timestamp(value: object) -> float | None:
 
 def _session_sort_key(session: Mapping[str, Any]) -> tuple[object, ...]:
     """Sort sessions newest-first with deterministic, human-friendly ties."""
+
+    if isinstance(session.get("observerSource"), Mapping):
+        return session_sort_key(session)
 
     timestamp = _recency_timestamp(session.get("recencyAt"))
     name = sanitize(session.get("name") or session.get("id") or "Agent")
@@ -943,7 +957,7 @@ def _row_text(
     provider = PROVIDER_LABELS.get(kind, kind.title() or "Agent")
     name = sanitize(session.get("name") or session.get("id") or "Agent")
     host = sanitize(session.get("host") or session.get("hostId") or "local")
-    cwd = _shorten_cwd(session.get("cwd"))
+    cwd = _workspace_label(session)
     age = _age(session.get("recencyAt"), now)
     activity = _activity_label(session, snapshot=snapshot)
     return f"{name}  ·  {provider}  ·  {host}  ·  {cwd}  ·  {age}  ·  {activity}"
@@ -955,17 +969,13 @@ def _activity_parts(
     """Return plain activity label fragments and their semantic treatments."""
 
     if isinstance(session.get("observerSource"), Mapping):
-        work = session.get("work")
-        label = "Work unknown"
-        if isinstance(work, Mapping) and work.get("health") == "current":
-            label = {
-                "working": "Working",
-                "needs_input": "Waiting",
-                "settled": "Settled",
-                "interrupted": "Interrupted",
-                "error": "Error",
-            }.get(str(work.get("value")), "Work unknown")
-        return ((label, "neutral" if label in {"Working", "Waiting"} else None),)
+        phase = session.get("phase")
+        label = "Phase unknown"
+        if isinstance(phase, Mapping) and phase.get("health") == "current":
+            label = {"working": "Working", "blocked": "Blocked", "waiting": "Waiting"}.get(
+                str(phase.get("value")), "Phase unknown"
+            )
+        return ((label, "neutral" if label in {"Working", "Blocked", "Waiting"} else None),)
     if (
         session.get("sourceObservation") == "retained"
         or session.get("activityState") == "unknown"
@@ -1130,7 +1140,7 @@ def _row_display(
 
     name = sanitize(session.get("name") or session.get("id") or "Agent")
     host = sanitize(session.get("host") or session.get("hostId") or "local")
-    cwd = _shorten_cwd(session.get("cwd"))
+    cwd = _workspace_label(session)
     age = _age(session.get("recencyAt"), now)
     activity = _activity_markup(session, snapshot=snapshot)
     secondary_parts = [_pango_escape(part) for part in (host, cwd, age)]
