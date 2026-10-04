@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+import importlib.metadata
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from rofi_agent_plus.cache import CacheStore, PresentationContext
+from rofi_agent_plus.config import PickerConfig
+from rofi_agent_plus.contract_backend import (
+    ContractBackend,
+    _run_bounded,
+)
+from rofi_agent_plus.contract_lifecycle import ContractLifecycle, LifecycleError
+
+ROOT = Path(sys.argv[1])
+HOST = "snap"
+MODE = sys.argv[2]
+OBSERVER = Path("/home/bryan/.local/share/agent-observer/0.2.0a3-6aa793e6a0ba5ae3")
+PLUS = Path("/home/bryan/.local/share/rofi-agent-plus/0.14.0a1-8ba19a0eba87944a")
+PEER = Path(json.loads((ROOT / "peer.json").read_text())["root"])
+for distribution, version in (("rofi-agent-plus", "0.14.0a1"), ("agent-observer", "0.2.0a3")):
+    installed = importlib.metadata.distribution(distribution)
+    assert installed.version == version
+    assert Path(installed.locate_file("")).resolve().is_relative_to(PLUS)
+base = ROOT / "native-snap"
+os.chdir(base / "workspace")
+
+out = {
+    "hostScope": "snap",
+    "mode": MODE,
+    "consumerSource": "90e5b4f",
+    "observerVersion": "0.2.0a3",
+    "actualTmux": True,
+    "actualSsh": MODE == "initial",
+    "meshAuthority": "copied_configured_host_mesh_with_owned_namespace_transport",
+    "terminalAdapter": "owned_pty_and_private_user_scope_adapter",
+    "ordinaryProviderPathsMasked": True,
+    "cases": {},
+}
+writes = []
+handoffs = []
+
+
+def runner(argv, **kwargs):
+    if argv[0] == "agent-observer-write":
+        writes.append(("snap", argv[1]))
+    elif argv[0].endswith("/ssh"):
+        if "agent-observer-write prepare" in argv[-1]:
+            writes.append(("starship", "prepare"))
+        if "agent-observer-write execute" in argv[-1]:
+            writes.append(("starship", "execute"))
+    if argv[0] == "rofi-tmux-plus" and argv[1] == "create":
+        native = argv[argv.index("--") + 1 :]
+        assert native[:3] == ["agent-observer-write", "enter", "--plan-json"]
+        handoffs.append(json.loads(native[-1]))
+    return _run_bounded(argv, **kwargs)
+
+
+backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=runner)
+backend.prepare()
+assert backend.mesh.local.host_id == "snap"
+assert any(
+    h.host_id == "starship" and h.routes[0].destination == "starship" for h in backend.mesh.hosts
+)
+config = PickerConfig(host_providers=(("starship", ("codex",)),))
+store = CacheStore(base / ("real-plus-cache-" + MODE), backend_selector=lambda: backend)
+context = PresentationContext(config.fingerprint, backend.identity, selected=backend)
+
+
+def lifecycle():
+    return ContractLifecycle(store, config, context, timeout=75)
+
+
+def control(request):
+    value = subprocess.run(
+        ["python3", "-I", str(ROOT / "native-fixture"), "control", str(ROOT), json.dumps(request)],
+        capture_output=True,
+        timeout=8,
+    )
+    if value.returncode:
+        raise RuntimeError("terminal_control_failed")
+
+
+def wait_ui(seconds):
+    time.sleep(seconds)
+
+
+def projected(provider, host="snap", reference=None):
+    target = next(h for h in backend.mesh.hosts if h.host_id == host)
+    _, value = backend._observer_snapshot(target, time.monotonic() + 30, providers=(provider,))
+    if not hasattr(value, "sessions"):
+        raise RuntimeError("public_snapshot_failed")
+    rows = [
+        dict(row)
+        for row in value.sessions
+        if reference is None or row["observerIdentity"] == reference
+    ]
+    for row in rows:
+        row.update(hostId=host, host=host, contractMode=True, backend=backend.identity)
+    return rows
+
+
+def new(provider, host="snap"):
+    owning = ROOT if host == "snap" else PEER
+    request = {
+        "schemaVersion": 1,
+        "operation": "new",
+        "hostScope": host,
+        "provider": provider,
+        "configHome": str(owning / ("native-" + host) / provider),
+        "configHomeKind": "explicit",
+        "cwd": str(owning / ("native-" + host) / "workspace"),
+        "reference": None,
+    }
+    result = backend.observer_write(request, deadline=time.monotonic() + 75)
+    lifecycle()._create_handoff({"name": "Owned real Tmux proof"}, result)
+    return result
+
+
+def stop_viewer():
+    control({"close": True})
+    time.sleep(0.8)
+
+
+try:
+    if MODE == "saved":
+        reference = json.loads((base / "claude-target.json").read_text())
+        rows = projected("claude", reference=reference)
+        assert (
+            len(rows) == 1
+            and rows[0]["inventory"] == "saved"
+            and rows[0]["runtime"]["value"] == "unknown"
+        )
+        before = len(writes)
+        lifecycle().open_or_create(rows[0])
+        wait_ui(5)
+        actual = handoffs[-1]["request"]["reference"]
+        matched = projected("claude", reference=actual)
+        assert len(matched) == 1 and matched[0]["worker"]["value"] == "present"
+        out["cases"]["claudeSavedResume"] = {
+            "status": "accepted",
+            "historyOnlyPreflight": True,
+            "actualFullReferenceResolved": True,
+            "copiedIdentity": actual != reference,
+            "publicWriteOnce": writes[before:] == [("snap", "prepare"), ("snap", "execute")],
+            "realTmuxNativeEntry": True,
+        }
+        stop_viewer()
+    else:
+        for host in ("snap", "starship"):
+            old = {
+                json.dumps(row["observerIdentity"], sort_keys=True)
+                for row in projected("codex", host)
+            }
+            before = len(writes)
+            result = new("codex", host)
+            wait_ui(6)
+            rows = [
+                row
+                for row in projected("codex", host)
+                if json.dumps(row["observerIdentity"], sort_keys=True) not in old
+                and row["runtime"]["value"] == "running"
+            ]
+            assert len(rows) == 1
+            reference = rows[0]["observerIdentity"]
+            out["cases"][host + "CodexNew"] = {
+                "status": "accepted",
+                "identityPendingBeforeEntry": result["identityPending"],
+                "actualFullReferenceResolved": True,
+                "publicWriteOnce": writes[before:] == [(host, "prepare"), (host, "execute")],
+                "realTmuxNativeEntry": True,
+                "realSsh": host == "starship",
+            }
+            control({"write": "Reply with OK.\r"})
+            time.sleep(1)
+            control({"write": "\r"})
+            wait_ui(12)
+            stop_viewer()
+            before = len(writes)
+            lifecycle().open_or_create(projected("codex", host, reference)[0])
+            wait_ui(5)
+            assert len(projected("codex", host, reference)) == 1
+            out["cases"][host + "CodexResume"] = {
+                "status": "accepted",
+                "sameFullReference": True,
+                "publicWriteOnce": writes[before:] == [(host, "prepare"), (host, "execute")],
+                "realTmuxNativeEntry": True,
+                "realSsh": host == "starship",
+            }
+            stop_viewer()
+        before = len(writes)
+        result = new("claude")
+        wait_ui(6)
+        reference = result["resultingIdentity"]
+        rows = projected("claude", reference=reference)
+        assert len(rows) == 1 and rows[0]["worker"]["value"] == "present"
+        (base / "claude-target.json").write_text(json.dumps(reference))
+        out["cases"]["claudeNew"] = {
+            "status": "accepted",
+            "effect": result["effect"],
+            "actualFullReferenceResolved": True,
+            "publicWriteOnce": writes[before:] == [("snap", "prepare"), ("snap", "execute")],
+            "realTmuxNativeEntry": True,
+            "privateTrustFixture": True,
+        }
+        control({"write": "Reply with OK.\r"})
+        time.sleep(1)
+        control({"write": "\r"})
+        deadline = time.monotonic() + 35
+        while time.monotonic() < deadline:
+            rows = projected("claude", reference=reference)
+            if (
+                rows
+                and rows[0]["phase"]["value"] == "waiting"
+                and rows[0]["outcome"]["value"] == "completed"
+            ):
+                break
+            time.sleep(0.4)
+        assert rows[0]["phase"]["value"] == "waiting" and rows[0]["outcome"]["value"] == "completed"
+        clock = rows[0]["phase"]["observedAt"]
+        time.sleep(1)
+        assert projected("claude", reference=reference)[0]["phase"]["observedAt"] == clock
+        stop_viewer()
+        before = len(writes)
+        lifecycle().open_or_create(projected("claude", reference=reference)[0])
+        wait_ui(5)
+        rows = projected("claude", reference=reference)
+        assert rows[0]["worker"]["value"] == "present"
+        out["cases"]["claudeLiveResume"] = {
+            "status": "accepted",
+            "sameFullReference": True,
+            "publicWriteOnce": writes[before:] == [("snap", "prepare"), ("snap", "execute")],
+            "realTmuxNativeEntry": True,
+            "phase": rows[0]["phase"]["value"],
+            "outcome": rows[0]["outcome"]["value"],
+            "nativePhaseClockPreserved": True,
+        }
+        stop_viewer()
+    assert out["cases"] and all(case["publicWriteOnce"] for case in out["cases"].values())
+    out["status"] = "accepted"
+except Exception as exc:
+    out["status"] = "pending"
+    out["reason"] = type(exc).__name__
+    if isinstance(exc, LifecycleError):
+        out["consumerReason"] = str(exc)[:240]
+finally:
+    (ROOT / ("real-consumer-" + MODE + ".json")).write_text(json.dumps(out, indent=2) + "\n")
+    print(json.dumps(out), flush=True)
+if out["status"] != "accepted":
+    raise SystemExit(1)

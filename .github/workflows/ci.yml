@@ -12,5 +12,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install --disable-pip-version-check ".[dev]"
+      - name: Supply accepted Observer artifact
+        env:
+          OBSERVER_WHEEL_URL: ${{ vars.AGENT_OBSERVER_0_2_0A3_WHEEL_URL }}
+        run: |
+          test -n "$OBSERVER_WHEEL_URL" || { echo 'Observer artifact input/publication pending'; exit 1; }
+          curl --fail --location "$OBSERVER_WHEEL_URL" --output /tmp/agent_observer-0.2.0a3-py3-none-any.whl
+          python scripts/bootstrap-dev --observer-wheel /tmp/agent_observer-0.2.0a3-py3-none-any.whl
       - run: ./scripts/check

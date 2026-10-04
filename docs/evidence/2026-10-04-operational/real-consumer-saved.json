@@ -1,0 +1,22 @@
+{
+  "hostScope": "snap",
+  "mode": "saved",
+  "consumerSource": "90e5b4f",
+  "observerVersion": "0.2.0a3",
+  "actualTmux": true,
+  "actualSsh": false,
+  "meshAuthority": "copied_configured_host_mesh_with_owned_namespace_transport",
+  "terminalAdapter": "owned_pty_and_private_user_scope_adapter",
+  "ordinaryProviderPathsMasked": true,
+  "cases": {
+    "claudeSavedResume": {
+      "status": "accepted",
+      "historyOnlyPreflight": true,
+      "actualFullReferenceResolved": true,
+      "copiedIdentity": false,
+      "publicWriteOnce": true,
+      "realTmuxNativeEntry": true
+    }
+  },
+  "status": "accepted"
+}

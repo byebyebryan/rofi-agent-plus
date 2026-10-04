@@ -1,0 +1,61 @@
+{
+  "hostScope": "snap",
+  "mode": "initial",
+  "consumerSource": "90e5b4f",
+  "observerVersion": "0.2.0a3",
+  "actualTmux": true,
+  "actualSsh": true,
+  "meshAuthority": "copied_configured_host_mesh_with_owned_namespace_transport",
+  "terminalAdapter": "owned_pty_and_private_user_scope_adapter",
+  "ordinaryProviderPathsMasked": true,
+  "cases": {
+    "snapCodexNew": {
+      "status": "accepted",
+      "identityPendingBeforeEntry": true,
+      "actualFullReferenceResolved": true,
+      "publicWriteOnce": true,
+      "realTmuxNativeEntry": true,
+      "realSsh": false
+    },
+    "snapCodexResume": {
+      "status": "accepted",
+      "sameFullReference": true,
+      "publicWriteOnce": true,
+      "realTmuxNativeEntry": true,
+      "realSsh": false
+    },
+    "starshipCodexNew": {
+      "status": "accepted",
+      "identityPendingBeforeEntry": true,
+      "actualFullReferenceResolved": true,
+      "publicWriteOnce": true,
+      "realTmuxNativeEntry": true,
+      "realSsh": true
+    },
+    "starshipCodexResume": {
+      "status": "accepted",
+      "sameFullReference": true,
+      "publicWriteOnce": true,
+      "realTmuxNativeEntry": true,
+      "realSsh": true
+    },
+    "claudeNew": {
+      "status": "accepted",
+      "effect": "confirmed",
+      "actualFullReferenceResolved": true,
+      "publicWriteOnce": true,
+      "realTmuxNativeEntry": true,
+      "privateTrustFixture": true
+    },
+    "claudeLiveResume": {
+      "status": "accepted",
+      "sameFullReference": true,
+      "publicWriteOnce": true,
+      "realTmuxNativeEntry": true,
+      "phase": "waiting",
+      "outcome": "completed",
+      "nativePhaseClockPreserved": true
+    }
+  },
+  "status": "accepted"
+}
