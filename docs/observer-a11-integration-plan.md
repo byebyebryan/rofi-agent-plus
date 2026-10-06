@@ -7,6 +7,11 @@ current native action acceptance, repaired watch integration and rollout wait
 for the relevant independently accepted Observer repair. The evidence below
 retains its original sampling time and image bounds.
 
+The later support decision uses required native contracts and observed
+capabilities instead of provider release/hash allowlists. The handoff and
+Observer's `docs/provider-contract-compatibility-plan.md` define this change;
+the provider versions in this plan are evidence provenance, not ongoing pins.
+
 Date: 2026-10-06. Status: planning and read-only baseline validated; implementation
 and rollout remain separate checkpoints. This continues the existing
 [v2 integration](observer-v2-execution.md) and

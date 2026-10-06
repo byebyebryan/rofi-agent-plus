@@ -46,6 +46,12 @@ logical host, provider, store namespace, native ID kind and full native ID.
 Runtime, worker, phase, outcome, attachment and saved history stay separate.
 Titles, paths and project metadata never join native identities.
 
+The next Observer checkpoint replaces provider release/hash allowlists with
+required protocol/metadata/CLI contract compatibility. Plus consumes that
+capability boundary without provider version pins. Observed versions/hashes
+remain diagnostics and write-context guards; routine compatible upgrades should
+not require frontend changes or a new cache/schema version.
+
 ## Run
 
 ```sh

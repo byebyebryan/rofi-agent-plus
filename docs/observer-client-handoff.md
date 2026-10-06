@@ -6,6 +6,13 @@ this pass. Read this before the earlier
 [a11 consumer execution plan](observer-a11-integration-plan.md); that plan's
 healthy provider baseline predates the upgrades found below.
 
+The subsequent user decision sets native support by required provider contracts
+and observed capabilities. Observer's
+`docs/provider-contract-compatibility-plan.md` governs replacement of its current
+release/hash allowlists. Provider versions remain diagnostic/test provenance.
+Plus must consume contract/capability outcomes without imposing its own provider
+release pins or requiring daily release registration.
+
 ## Start with the current producer boundary
 
 Observer's `docs/discovery-monitoring-contract-review.md`, in the adjacent
@@ -54,7 +61,7 @@ write-result validation also needs cross-object identity checks. The independent
 native reference needs explicit unsupported-worker/duplicate-context diagnostics.
 Read the linked review before interpreting a comparison script's exit code.
 
-Producer repair, renewed current-image G2 acceptance and compatible artifact
+Producer repair, contract-based adapter/write G2 acceptance and compatible artifact
 selection are separate checkpoints. Fixture-based Plus UI/cache/error work can
 proceed against a11. Native action acceptance on current images, reliance on
 repaired watch behavior, and rollout wait for the relevant Observer gate.
@@ -93,6 +100,14 @@ the installed image is unaccepted. Check coverage and per-dimension health;
 capability lists alone are not current-image or native action readiness proof.
 Claude runtime-only helper ancestry also remains unknown, so the producer does
 not guarantee exclusion of every Claude helper context.
+
+After the Observer compatibility repair, a changed provider version/hash with
+unchanged required contracts must remain usable. A genuinely incompatible
+required method, field or semantic predicate affects the relevant capability,
+with a visible reason and healthy sibling preservation. Executable replacement
+between write prepare and enter still invalidates the old plan; a fresh compatible
+plan is allowed. Native provider release changes do not themselves require a
+Plus cache/schema reset. Observer wire changes retain their versioned reader gate.
 
 ## Read transport and environment
 
@@ -158,7 +173,7 @@ no selected-conversation authority. Generic Tmux Plus management stays separate.
    distinction and child/cache reconciliation. Exercise partial provider and host
    failures, stale recovery, selection retention and active/history caps with
    metadata-only public fixtures. Reuse the earlier plan's bounded F1 ownership.
-3. After current-image Observer acceptance, reproduce single New/Resume through
+3. After contract-based Observer acceptance, reproduce single New/Resume through
    the complete local/remote public writer/Tmux/deferred-TTY path. Cover native
    trust, changed handoff guards, uncertain effects and visible terminal failures.
    No double dispatch and no cleanup of provider work after viewer failure.
