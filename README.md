@@ -14,11 +14,17 @@ remain evidence for their stated versions; they do not certify this runtime.
 The [operational proof](docs/native-operational-proof.md) records independent
 Observer acceptance, installed real Tmux/SSH entry, selected headless gates and
 the remaining desktop/release checks.
+The [client handoff](docs/observer-client-handoff.md) records the current Observer
+review, provider upgrade blocks, pinned interface and separate client ownership.
+The earlier [a11 consumer plan](docs/observer-a11-integration-plan.md) supplies
+presentation/cache/action checkpoints within its recorded baseline bounds.
 
 ## Runtime boundary
 
 Each observed host needs independently installed `agent-observer` and
-`agent-observer-write` commands from the accepted `0.2.0a3` artifact. Plus invokes
+`agent-observer-write` commands from an independently accepted producer artifact;
+the current Snap/Starship pilot selects `0.2.0a11` separately from Plus's frozen
+`0.2.0a3` pure validator dependency. Plus invokes
 public snapshot v2 and write request/plan/result v1 contracts locally or through
 SSH Plus routes. Its pinned Python dependency provides only pure public contract
 validation; the frontend does not import collectors or provider action internals.
@@ -30,8 +36,11 @@ SSH policy; an absent SSH Plus permits the existing local-only identity. Invalid
 installed contracts fail visibly. The released Host Mesh v1 and Tmux Session v1
 bundles retain their independent validation and provenance.
 
-Observer owns native artifact/topology acceptance. The accepted matrix is Codex
-0.160.0 on Snap and Starship and Claude Code 2.1.287 on Snap. Missing or unsupported
+Observer owns native artifact/topology acceptance. Its selected a11 matrix accepts
+Codex 0.160.0 entry and exact 0.160.1 managed images on Snap/Starship, and Claude
+2.1.289 on Snap, with separately bounded surviving 2.1.287 worker support.
+The new consumer pass revalidates end-to-end actions against that producer;
+prior consumer evidence retains its recorded image bounds. Missing or unsupported
 sources remain explicit, preserving healthy sibling providers. Identity contains
 logical host, provider, store namespace, native ID kind and full native ID.
 Runtime, worker, phase, outcome, attachment and saved history stay separate.
