@@ -45,8 +45,9 @@ or Plus release pins. Actual executable replacement invalidates old write plans.
 - Preserve full host/provider/store-namespace/native-kind/native-ID identity.
   Match returned host authority to the reached route. Titles/UUID alone/cwd/PID
   and project keys never merge conversations.
-- Display bounded native user titles or UUID fallback. Equal titles are valid;
-  AI previews/nicknames are not promised. Hide only confirmed children; unknown
+- Display bounded native provider titles or UUID fallback. Equal titles are valid;
+  Codex can settle its name after a completion callback. Observer-generated
+  previews and separate Claude AI-title/nickname fields are not promised. Hide only confirmed children; unknown
   stays visible. Fresh exclusions must precede cache retention.
 - Distinguish running, parked and unknown. Working/blocked/waiting are phase,
   with approval/question blocked reasons. Completed outcome, worker presence and
