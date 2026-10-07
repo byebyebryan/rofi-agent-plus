@@ -14,6 +14,9 @@ remain evidence for their stated versions; they do not certify this runtime.
 The [operational proof](docs/native-operational-proof.md) records independent
 Observer acceptance, installed real Tmux/SSH entry, selected headless gates and
 the remaining desktop/release checks.
+Observer now selects a7/API v1 wire 3 and a shared user service on both hosts.
+This Plus pilot still binds wire 2 and requires a separate reader/cache/transport
+migration; its prior installed acceptance does not establish current compatibility.
 The [client handoff](docs/observer-client-handoff.md) records the current Observer
 review, provider upgrade blocks, pinned interface and separate client ownership.
 The earlier [a11 consumer plan](docs/observer-a11-integration-plan.md) supplies

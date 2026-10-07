@@ -1,44 +1,62 @@
 # Observer API v1 client handoff
 
-Date: 2026-10-06. Observer's independent producer gate is accepted. This pass
+Date: 2026-10-07. Observer's independent producer gate is accepted. This pass
 updates handoff documentation only; another agent owns Plus implementation,
 consumer acceptance and rollout. Producer defects reopen an Observer checkpoint.
 Do not edit its collectors/contracts to make frontend work pass.
 
 ## Accepted producer and selected baseline
 
+Updated: 2026-10-07 after Observer-only operational acceptance. Another agent
+owns Plus implementation. No frontend code or provider policy is changed here.
+
 | Component | Tuple |
 | --- | --- |
-| Accepted Observer candidate | `0.3.0a2`; source `7ffbe246e6bac2c9d320328ce639b833b3a73bfa`; SHA256 `98ce1f9203f97c13adc2d19cb11bf8f13a0dc3889fc899debc94da1bf0b1430d` |
-| Candidate prefix, both hosts | `/home/bryan/.local/share/agent-observer/0.3.0a2-98ce1f9203f97c13` |
-| Public versions | API 1; snapshot/watch wire 3; write request/plan/result wire 1 |
-| Normal selected Observer | `0.2.0a11`; SHA256 `999d45171adfc4c4e62fe57b417614c0814de2a556693a6d23bb97b45a0a8b65`; wire 2 |
+| Accepted/selected Observer | `0.4.0a7`; source `8ca7a789899066cd6c2399f8c6fad60e06e869e7`; SHA256 `09f41f33e6c22fe019e518af3deae067b58b42f571b84d6c45aebe706079865a` |
+| Prefix, both hosts | `/home/bryan/.local/share/agent-observer/0.4.0a7-09f41f33e6c22fe0` |
+| Public versions | API 1; snapshot/watch 3; write 1; separately prerelease service protocol 1 |
+| Normal operations | Read/write/service links select a7; `agent-observer.service` is enabled on both hosts |
 | Selected Plus | `0.14.0a1`; source `90e5b4fa49bace6d4d1d09be833f88faadea0246`; SHA256 `8ba19a0eba87944aec2848542fb3ddcb91f3ccc33790ba42565928e18daa497b` |
-| Existing Plus reader/cache | Observer `0.2.0a3`, wire 2; cache 7. This reader cannot consume wire 3. |
+| Existing Plus reader/cache | Observer `0.2.0a3`, wire 2; cache 7. It cannot consume the new wire. Its private venv can shadow the selected CLI/writer. |
 | Native targets | Snap Codex/Claude; Starship Codex. Codex leads; Claude remains required; OpenCode stays removed. |
 
-In the adjacent `../agent-observer` checkout read `docs/api-v1.md`,
-`docs/api-v1-client-handoff.md`, `docs/public-contract-v3.md`,
-`docs/write-client-contract.md`, `artifacts/observer-0.3.0a2.json` and
-`docs/evidence/2026-10-06-stable-api/REPORT.md`. Public fixtures are
+In `../agent-observer`, read `docs/api-v1.md`,
+`docs/shared-observation-service-handoff.md`,
+`docs/shared-observation-service-client.md`, `docs/service-protocol-v1.md`,
+`docs/write-client-contract.md`, `artifacts/observer-0.4.0a7.json` and
+`docs/evidence/2026-10-07-observer-operations/REPORT.md`. Public fixtures are
 `tests/fixtures/contract-v3` and `write-v1`; `scripts/check-public-api` is an
-independent jsonschema/CLI consumer. The pure supported Python facade is
-`agent_observer.public`; internal collector/worker modules are not client APIs.
-The a2 wheel is archived under `~/.local/share/agent-observer/artifacts` on both
-hosts. Hosted dependency availability/public release are separate gates.
+independent jsonschema/CLI consumer. Pure public/service codecs and the bounded
+local service transport are consumer APIs; collectors and private proof helpers
+are not. Wheels/manifests are archived on both hosts under
+`~/.local/share/agent-observer/artifacts/0.4.0a7-09f41f33e6c22fe0`.
+Hosted publication and downstream installation have separate gates.
 
-A2 repairs review R1-R8: contract-based native support, stale age, child/watch
-reconciliation, row/byte/node retention bounds, row fault isolation, write-result
-identity semantics, independent reference coverage and compatibility policy.
-Native New/Resume/recovery, held Claude approval/question, stop-to-parked and
-partial sibling cases pass. A1 failed a Claude local-command housekeeping-age
-case; use a2. This does not establish Plus GUI or native-route acceptance.
+Observer-only acceptance covers bounded startup workspace mappings,
+installed/schema/native comparisons, exact user-unit arguments, restart/crash
+watch reconnection and six-target rollback/reselection. Both normal units passed
+30-minute three-reader checks plus a non-reading peer and 100 cached CLI requests.
+Snap's 30/120-second runtime/history cadence measured 102-ms read p95 and 4.48%
+of one core; Starship's 20/60 seconds measured 79 ms and 1.81%. Push distributes
+poll results; it does not remove native sampling latency or provide durable events.
 
-Normal a11 still contains old provider release/hash gates. A2 is separately
-installed; no normal links/provider settings/hooks/sessions were changed.
-Do not infer native capability from the selected a11 path during client testing.
-Provider versions are diagnostic; compatible daily updates need no registration
-or Plus release pins. Actual executable replacement invalidates old write plans.
+Two direct and two cached/native rounds match supported fields for Snap's 50
+Codex identities, 30 Claude conversations and four live Claude workers, and
+Starship's 92 Codex identities/four live contexts. One known setup-only Claude
+candidate remains omitted. Old unproved classifications/states stay unknown.
+
+Native entry proof is context bounded. A fresh Codex CLI 0.160.1/server 0.161.0
+pair rejects a default feature mismatch; disposable entry proof disables
+`api_key_model_discovery` only there. Ordinary default cold entry is not accepted.
+The writer explicitly rejects sampled live foreground Claude Resume with
+`unsupported_resume_route`; background attach and saved Resume have their own
+proof. Make deferred errors visible and never redispatch an uncertain write.
+Foreground question detection, physical wake, event-assisted latency and
+terminal-specific binding remain separate gates.
+
+Provider compatibility follows required protocol/metadata/CLI contracts, not
+version/hash allowlists. Versions and executable replacement remain diagnostic
+and action-context guards. Compatible daily upgrades require no registration.
 
 ## Migration semantics
 
@@ -82,16 +100,26 @@ explicitly, including inside deferred TTY commands: Plus's venv contains old
 Observer scripts and can silently shadow the intended executable in PATH.
 
 ```sh
-observer_candidate=/home/bryan/.local/share/agent-observer/0.3.0a2-98ce1f9203f97c13
+observer_candidate=/home/bryan/.local/share/agent-observer/0.4.0a7-09f41f33e6c22fe0
 "$observer_candidate/bin/agent-observer" api
 "$observer_candidate/bin/agent-observer" snapshot --host-scope snap --provider codex --provider claude
-ssh starship /home/bryan/.local/share/agent-observer/0.3.0a2-98ce1f9203f97c13/bin/agent-observer snapshot --host-scope starship --provider codex
+ssh starship /home/bryan/.local/share/agent-observer/0.4.0a7-09f41f33e6c22fe0/bin/agent-observer snapshot --host-scope starship --provider codex
 ```
 
-Start with snapshot refresh and private cache/UI-state roots. Watch may follow:
-replace views on initial/change/resync, retain on heartbeat, mark gaps, track
-stream UUID/revision continuity and reconnect with a new epoch. It is sampled
-push, without native completion replay or cross-host ordering.
+Start with envelope/fixture conformance and private cache/UI-state roots, then
+use `service snapshot/list/watch` on the owning host's selected publisher.
+Direct API watch 3 cannot parse service envelopes. Validate host/UID/boot/time
+scope and component leases before using the embedded snapshot. Use one service
+stream guard per connection; sequence starts at one and is distinct from shared
+view revision. New service IDs, EOF, silence and gaps invalidate current claims;
+reconnect creates a new guard and gap/resync replaces the view. Null warming
+views are pending discovery, not complete empty discovery. A healthy heartbeat
+cannot renew cached history or work evidence. Recompute display ages locally.
+
+Local BOOTTIME values cannot be compared across hosts. Host Mesh retains route
+validation and must conservatively translate remote freshness and transport loss.
+There is no direct collection fallback, client-triggered refresh or native
+completion replay. Keep this transport acceptance separate from UI and actions.
 
 Use owning-host `agent-observer-write prepare/execute/enter`. Pass opaque guarded
 plans unchanged; re-prepare changed context. Status/effect/requested/resulting
