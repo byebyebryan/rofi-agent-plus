@@ -43,6 +43,34 @@ The integration boundaries are versioned process contracts:
 Agent Plus does not import another repository's Python modules or read its
 private configuration, history, health, or cache files.
 
+## Lessons retained from DMS Agent Picker
+
+The earlier [DMS Agent Picker runtime and launch notes](https://github.com/byebyebryan/dms-agent-picker/blob/09cb232992e62ad5dcef605b272dafd223ab15d3/README.md)
+contain three principles that still apply under the current suite ownership:
+
+- Saved conversation metadata, a running provider process, and a tmux
+  association are separate evidence. A metadata query's short-lived Codex
+  app-server does not prove that an interactive conversation is running.
+  Shared daemons and supervised runtimes require their own correlation model;
+  the supported runtime and known identity limits remain in
+  [Agent Plus retains](#agent-plus-retains).
+- Provider startup needs the attached terminal for capability and color
+  probes. Agent Plus requests `--defer-until-attached` through the public
+  create command; Tmux Plus owns the bounded wait and pending-session
+  mechanics in [Tmux Session v1](https://github.com/byebyebryan/rofi-tmux-plus/blob/main/docs/TMUX_SESSION_V1.md#create).
+  Picker lifetime and terminal ownership are handled by Tmux Plus's
+  [process lifecycle](https://github.com/byebyebryan/rofi-tmux-plus/blob/main/docs/DESIGN.md#process-ownership-and-errors).
+- Cached history should remain usable during a bounded refresh, while
+  current activity requires current observation evidence. The old plugin's
+  per-host streaming publication is historical; Agent Plus publishes a
+  complete authority-scoped snapshot and keeps observation labels separate
+  from operation authority, as described in [P9 locked CLI contracts](#p9-locked-cli-contracts)
+  and [Discovery flow](#discovery-flow).
+
+DMS launcher rows, badges, plugin settings, direct launch plumbing, and old
+live observations stay with the retired plugin. The current Rofi interaction,
+process contracts, and suite acceptance records govern this implementation.
+
 ## P8 flat-scope navigation
 
 P8 removed Agent Plus's `Hosts` and `Providers` browsing roots and all group
