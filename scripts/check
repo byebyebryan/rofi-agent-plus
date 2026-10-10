@@ -175,3 +175,5 @@ python3 scripts/check-installed-artifact --self-test
 
 ruff check scripts/check-installed scripts/check-public-contract scripts/check-installed-artifact scripts/managed-selection-rollback
 ruff format --check scripts/check-installed scripts/check-public-contract scripts/check-installed-artifact scripts/managed-selection-rollback
+
+python3 scripts/check-installed --self-test --legacy-profile
