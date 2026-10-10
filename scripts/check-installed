@@ -1309,8 +1309,6 @@ def main():
     )
     args = parser.parse_args()
     if args.legacy_profile:
-        if not args.live:
-            parser.error("--legacy-profile requires --live")
         AGENT_SNAPSHOT_VERSION = 4
         AGENT_OBSERVATION_STAGES = ("codex", "claude", "opencode", "activity", "tmux")
     if args.lifecycle and (OWNER_COMMAND != "rofi-tmux-plus" or not args.live):
