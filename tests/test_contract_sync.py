@@ -123,7 +123,7 @@ class ContractSyncTests(unittest.TestCase):
                 text=True,
                 env=environment,
             ).stdout.strip()
-            self.git(ssh, "update-ref", "refs/heads/main", commit)
+            self.git(ssh, "update-ref", "HEAD", commit)
             result = self.run_sync(ssh, tmux, agent)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not descend", result.stderr)

@@ -1,0 +1,1328 @@
+#!/usr/bin/env python3
+"""Owner-scoped installed contract checks for rofi-agent-plus."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+COMMAND_NAMES = ("rofi-ssh-plus", "rofi-tmux-plus", "rofi-agent-plus")
+COMMAND_TIMEOUT_SECONDS = 10
+AGENT_REFRESH_TIMEOUT_SECONDS = 30
+AGENT_SNAPSHOT_VERSION = 7
+AGENT_CONTRACT_CAPABILITY = "host-mesh-v1+tmux-session-v1"
+AGENT_REFRESH_OUTCOMES = {"complete", "partial", "failed"}
+AGENT_OBSERVATION_STAGES = ("codex", "claude", "activity", "tmux")
+AGENT_OBSERVATION_OUTCOMES = {"ok", "failed", "unknown"}
+AGENT_SOURCE_OBSERVATIONS = {"current", "retained", "activity-only"}
+HISTORY_MAX_BYTES = 1_000_000
+HOST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+SESSION_ID_RE = re.compile(r"\$[0-9]+\Z")
+MAX_DIAGNOSTIC_LENGTH = 400
+MAX_REFERENCE_TEXT_LENGTH = 1024
+SESSION_NAME_PREFIX = "rofi-plus-accept-"
+SESSION_NAME_MAX_LENGTH = 128
+ROFI_CALLBACK_VARS = ("ROFI_RETV", "ROFI_INFO", "ROFI_INPUT", "ROFI_DATA", "ROFI_OUTSIDE")
+COMMAND_EXTENSION_DIRS = {
+    "rofi-ssh-plus": "ssh-plus",
+    "rofi-tmux-plus": "tmux-plus",
+    "rofi-agent-plus": "agent-plus",
+}
+
+
+CommandRunner = Callable[[str, Sequence[str], Mapping[str, str]], subprocess.CompletedProcess[str]]
+
+
+OWNER_COMMAND = "rofi-agent-plus"
+
+
+class CheckError(RuntimeError):
+    """A bounded, user-facing acceptance-gate failure."""
+
+
+@dataclass(frozen=True)
+class HistorySnapshot:
+    """Semantic SSH usage history, with missing state kept distinct."""
+
+    present: bool
+    semantic: str | None
+
+
+def _compact(value: object) -> str:
+    text = " ".join(str(value).split())
+    return text[:MAX_DIAGNOSTIC_LENGTH] or "no diagnostic"
+
+
+def _safe_host_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > SESSION_NAME_MAX_LENGTH
+        or not HOST_ID_RE.fullmatch(value)
+    ):
+        raise CheckError("Host Mesh contains an invalid host ID")
+    return value
+
+
+def _safe_token(value: object, label: str, *, maximum: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or value.strip() != value
+        or any(not char.isprintable() or char.isspace() for char in value)
+    ):
+        raise CheckError(f"{label} is missing or contains unsafe text")
+    return value
+
+
+def _safe_revision(value: object) -> str:
+    try:
+        return _safe_token(value, "Host Mesh meshRevision", maximum=MAX_REFERENCE_TEXT_LENGTH)
+    except CheckError as error:
+        raise CheckError("Host Mesh has no safe nonempty meshRevision") from error
+
+
+def _history_path() -> Path:
+    state_home = os.environ.get("XDG_STATE_HOME") or "~/.local/state"
+    return Path(state_home).expanduser() / "rofi-ssh-plus" / "history.json"
+
+
+def _validate_history_payload(payload: object) -> None:
+    if not isinstance(payload, Mapping) or payload.get("version") != 1:
+        raise CheckError("SSH usage history is not version 1 JSON")
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, list):
+        raise CheckError("SSH usage history has no hosts list")
+    seen: set[str] = set()
+    for raw_host in hosts:
+        if not isinstance(raw_host, Mapping):
+            raise CheckError("SSH usage history contains a malformed host")
+        host = raw_host.get("host")
+        if (
+            not isinstance(host, str)
+            or not host
+            or len(host) > MAX_REFERENCE_TEXT_LENGTH
+            or host.strip() != host
+            or host.startswith("-")
+            or any(not char.isprintable() or char.isspace() for char in host)
+        ):
+            raise CheckError("SSH usage history contains an unsafe host")
+        folded = host.casefold()
+        if folded in seen:
+            raise CheckError("SSH usage history contains duplicate hosts")
+        seen.add(folded)
+        count = raw_host.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise CheckError("SSH usage history contains an invalid count")
+        last_connected = raw_host.get("lastConnected")
+        if (
+            isinstance(last_connected, bool)
+            or not isinstance(last_connected, int)
+            or last_connected < 0
+        ):
+            raise CheckError("SSH usage history contains an invalid lastConnected")
+
+
+def _history_snapshot(path: Path | None = None) -> HistorySnapshot:
+    path = path or _history_path()
+    try:
+        if path.stat().st_size > HISTORY_MAX_BYTES:
+            raise CheckError("SSH usage history exceeds the bounded snapshot size")
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return HistorySnapshot(False, None)
+    except CheckError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise CheckError(f"could not read SSH usage history: {_compact(error)}") from error
+    if len(text.encode("utf-8")) > HISTORY_MAX_BYTES:
+        raise CheckError("SSH usage history exceeds the bounded snapshot size")
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise CheckError(f"SSH usage history is not valid JSON: {_compact(error)}") from error
+    _validate_history_payload(payload)
+    # ``sortMode`` is a schema-v1 compatibility field, not durable user data.
+    # Normalize it for the semantic history guard so the first picker render
+    # may rewrite legacy/missing/invalid values to recency without appearing
+    # to mutate usage records.
+    semantic_payload = dict(payload)
+    semantic_payload["sortMode"] = "recency"
+    try:
+        semantic = json.dumps(
+            semantic_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as error:
+        raise CheckError(f"SSH usage history is not canonical JSON: {_compact(error)}") from error
+    return HistorySnapshot(True, semantic)
+
+
+def _assert_history_unchanged(before: HistorySnapshot, path: Path | None = None) -> None:
+    after = _history_snapshot(path)
+    if after != before:
+        before_state = "present" if before.present else "missing"
+        after_state = "present" if after.present else "missing"
+        raise CheckError(
+            f"SSH usage history changed during acceptance gate ({before_state} -> {after_state})"
+        )
+
+
+def _resolve(name: str) -> str:
+    found = shutil.which(name)
+    if found is None:
+        raise CheckError(f"{name} is not installed on PATH")
+    path = Path(found)
+    if not path.is_absolute():
+        raise CheckError(f"{name} did not resolve to an absolute executable path")
+    try:
+        target = path.resolve(strict=True)
+    except OSError as error:
+        raise CheckError(
+            f"{name} did not resolve to an installed target: {_compact(error)}"
+        ) from error
+    if name == "rofi-ssh-plus" and target == Path.home() / ".local/bin/rofi-ssh-plus":
+        expected = '#!/bin/sh\n# Chezmoi pins the shared authority independently of the picker.\nexport PYTHONPATH="$HOME/.local/share/mesh-plus/python${PYTHONPATH:+:$PYTHONPATH}"\nexec "$HOME/.local/share/rofi/extensions/ssh-plus/bin/rofi-ssh-plus" "$@"\n'
+        if not target.is_file() or not os.access(target, os.X_OK) or target.read_text() != expected:
+            raise CheckError("rofi-ssh-plus managed authority wrapper is invalid")
+        return str(target)
+    extension = COMMAND_EXTENSION_DIRS[name]
+    extension_root = Path.home() / ".local" / "share" / "rofi" / "extensions" / extension
+    try:
+        target.relative_to(extension_root.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise CheckError(f"{name} resolved outside its installed extension ({target})") from error
+    if not target.is_file() or not os.access(target, os.X_OK):
+        raise CheckError(f"{name} did not resolve to an executable installed target")
+    return str(target)
+
+
+def _clean_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in ROFI_CALLBACK_VARS:
+        environment.pop(name, None)
+    return environment
+
+
+def _run(
+    executable: str,
+    args: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    argv = [executable, *args]
+    try:
+        return subprocess.run(
+            argv,
+            env=dict(environment),
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise CheckError(f"{Path(executable).name} timed out after {timeout:g}s") from error
+    except OSError as error:
+        raise CheckError(f"could not run {Path(executable).name}: {_compact(error)}") from error
+
+
+def _invoke(
+    executable: str,
+    args: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    runner: CommandRunner | None = None,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    if runner is None:
+        return _run(executable, args, environment=environment, timeout=timeout)
+    try:
+        result = runner(executable, tuple(args), environment)
+    except CheckError:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError) as error:  # noqa: BLE001 - keep fake and live boundaries bounded
+        raise CheckError(f"could not run {Path(executable).name}: {_compact(error)}") from error
+    if not isinstance(result, subprocess.CompletedProcess):
+        raise CheckError("command runner returned an invalid result")
+    return result
+
+
+def _require_success(
+    executable: str,
+    args: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    runner: CommandRunner | None = None,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    result = _invoke(
+        executable,
+        args,
+        environment=environment,
+        runner=runner,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr or result.stdout
+        raise CheckError(
+            f"{Path(executable).name} exited {result.returncode}: {_compact(diagnostic)}"
+        )
+    return result
+
+
+def _json_document(result: subprocess.CompletedProcess[str], label: str) -> object:
+    try:
+        value = json.loads(result.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise CheckError(f"{label} did not emit one JSON document: {_compact(error)}") from error
+    return value
+
+
+def _mesh_hosts(payload: object) -> tuple[tuple[str, ...], str, str]:
+    if not isinstance(payload, Mapping) or payload.get("schemaVersion") != 1:
+        raise CheckError("Host Mesh response is not schemaVersion 1")
+    revision = _safe_revision(payload.get("meshRevision"))
+    local_id = _safe_host_id(payload.get("localHostId"))
+    raw_hosts = payload.get("hosts")
+    if not isinstance(raw_hosts, list) or not raw_hosts:
+        raise CheckError("Host Mesh response has no advertised hosts")
+
+    host_ids: set[str] = set()
+    local_hosts: list[str] = []
+    for raw_host in raw_hosts:
+        if not isinstance(raw_host, Mapping):
+            raise CheckError("Host Mesh response contains a malformed host")
+        host_id = _safe_host_id(raw_host.get("id"))
+        folded_id = host_id.casefold()
+        if folded_id in host_ids:
+            raise CheckError("Host Mesh response contains duplicate host IDs")
+        host_ids.add(folded_id)
+        if raw_host.get("local") is True:
+            local_hosts.append(host_id)
+    if len(local_hosts) != 1 or local_hosts[0].casefold() != local_id.casefold():
+        raise CheckError("Host Mesh response must have exactly one local host matching localHostId")
+    return (
+        tuple(raw_host["id"] for raw_host in raw_hosts if isinstance(raw_host, Mapping)),
+        local_id,
+        revision,
+    )
+
+
+def _check_mesh(
+    ssh_executable: str, environment: Mapping[str, str]
+) -> tuple[tuple[str, ...], str, str]:
+    result = _require_success(
+        ssh_executable,
+        ("mesh", "list", "--json"),
+        environment=environment,
+    )
+    payload = _json_document(result, "Host Mesh list")
+    return _mesh_hosts(payload)
+
+
+def _agent_text(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_REFERENCE_TEXT_LENGTH
+        or any(not char.isprintable() and not char.isspace() for char in value)
+    ):
+        raise CheckError(f"Agent Plus snapshot has invalid {label}")
+    return value
+
+
+def _agent_nonnegative_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CheckError(f"Agent Plus snapshot has an invalid {label}")
+    return value
+
+
+def _validate_agent_last_refresh(value: object) -> None:
+    """Validate v4's private transaction-level observation summary."""
+
+    if not isinstance(value, Mapping) or value.get("outcome") not in AGENT_REFRESH_OUTCOMES:
+        raise CheckError("Agent Plus snapshot has an invalid lastRefresh")
+    attempted_at = _agent_nonnegative_int(value.get("attemptedAt"), "lastRefresh attemptedAt")
+    completed_at = value.get("completedAt")
+    if value["outcome"] == "failed":
+        if completed_at is not None:
+            raise CheckError("Agent Plus snapshot has an invalid failed lastRefresh")
+        return
+    if (
+        isinstance(completed_at, bool)
+        or not isinstance(completed_at, int)
+        or completed_at < attempted_at
+    ):
+        raise CheckError("Agent Plus snapshot has an invalid completed lastRefresh")
+
+
+def _validate_agent_observations(value: object) -> None:
+    """Validate v4 per-host observation shape without interpreting authority."""
+
+    if not isinstance(value, Mapping):
+        raise CheckError("Agent Plus refresh host has no observations")
+    for stage in AGENT_OBSERVATION_STAGES:
+        observation = value.get(stage)
+        if not isinstance(observation, Mapping):
+            raise CheckError(f"Agent Plus refresh host has no {stage} observation")
+        if observation.get("outcome") not in AGENT_OBSERVATION_OUTCOMES:
+            raise CheckError(f"Agent Plus refresh host has an invalid {stage} observation outcome")
+        _agent_nonnegative_int(
+            observation.get("lastAttemptAt"),
+            f"{stage} observation lastAttemptAt",
+        )
+        _agent_nonnegative_int(
+            observation.get("lastSuccessAt"),
+            f"{stage} observation lastSuccessAt",
+        )
+
+
+def _validate_agent_row_provenance(session: Mapping[str, object], label: str) -> None:
+    """Require a v4 display provenance label, not a selection/lifecycle claim."""
+
+    if session.get("sourceObservation") not in AGENT_SOURCE_OBSERVATIONS:
+        raise CheckError(f"Agent Plus snapshot has an invalid {label} sourceObservation")
+
+
+def _agent_contract_snapshot(
+    payload: object,
+    revision: str,
+    expected_host_ids: Sequence[str] | None = None,
+) -> int:
+    if not isinstance(payload, Mapping) or payload.get("version") != AGENT_SNAPSHOT_VERSION:
+        raise CheckError(
+            f"Agent Plus refresh is not a versioned schema {AGENT_SNAPSHOT_VERSION} snapshot"
+        )
+    _agent_text(payload.get("fingerprint"), "fingerprint")
+    backend = payload.get("backend")
+    if not isinstance(backend, Mapping):
+        raise CheckError("Agent Plus refresh omitted backend identity")
+    if backend.get("kind") != "contract" or backend.get("capability") != AGENT_CONTRACT_CAPABILITY:
+        raise CheckError("Agent Plus refresh did not select the contract backend")
+    echoed_revision = _safe_revision(backend.get("meshRevision"))
+    if echoed_revision != revision:
+        raise CheckError("Agent Plus refresh backend has a different meshRevision")
+    generated_at = payload.get("generatedAt")
+    if isinstance(generated_at, bool) or not isinstance(generated_at, int) or generated_at < 0:
+        raise CheckError("Agent Plus refresh snapshot has an invalid generatedAt")
+    _validate_agent_last_refresh(payload.get("lastRefresh"))
+    catalog = payload.get("hostCatalog")
+    if not isinstance(catalog, list) or not catalog:
+        raise CheckError("Agent Plus refresh snapshot has no ordered host catalog")
+    catalog_ids: list[str] = []
+    local_indexes: list[int] = []
+    seen_catalog_ids: set[str] = set()
+    for index, raw_host in enumerate(catalog):
+        if not isinstance(raw_host, Mapping):
+            raise CheckError("Agent Plus refresh host catalog contains a malformed host")
+        host_id = _safe_host_id(raw_host.get("hostId"))
+        folded_id = host_id.casefold()
+        if folded_id in seen_catalog_ids:
+            raise CheckError("Agent Plus refresh host catalog contains duplicate host IDs")
+        seen_catalog_ids.add(folded_id)
+        _agent_text(raw_host.get("display"), "host display")
+        if not isinstance(raw_host.get("local"), bool):
+            raise CheckError("Agent Plus refresh host catalog has an invalid local marker")
+        if raw_host["local"]:
+            local_indexes.append(index)
+        catalog_ids.append(host_id)
+    if local_indexes != [0]:
+        raise CheckError("Agent Plus refresh host catalog must put its only local host first")
+    if expected_host_ids is not None and tuple(
+        host_id.casefold() for host_id in catalog_ids
+    ) != tuple(host_id.casefold() for host_id in expected_host_ids):
+        raise CheckError("Agent Plus refresh host catalog differs from Host Mesh order")
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, Mapping):
+        raise CheckError("Agent Plus refresh snapshot has no hosts mapping")
+    for host_id, host in hosts.items():
+        _safe_host_id(host_id)
+        if not isinstance(host, Mapping):
+            raise CheckError("Agent Plus refresh snapshot contains a malformed host")
+        sessions = host.get("sessions")
+        errors = host.get("errors", [])
+        if not isinstance(sessions, list) or not isinstance(errors, list):
+            raise CheckError("Agent Plus refresh snapshot has malformed host lists")
+        _validate_agent_observations(host.get("observations"))
+        for session in sessions:
+            if not isinstance(session, Mapping):
+                raise CheckError("Agent Plus refresh snapshot contains a malformed session")
+            _validate_agent_row_provenance(session, "host session")
+        for error in errors:
+            if not isinstance(error, Mapping):
+                raise CheckError("Agent Plus refresh snapshot contains a malformed error")
+            _agent_text(error.get("host"), "error host")
+            _agent_text(error.get("stage"), "error stage")
+            _agent_text(error.get("message"), "error message")
+    sessions = payload.get("sessions")
+    errors = payload.get("errors")
+    if not isinstance(sessions, list) or not isinstance(errors, list):
+        raise CheckError("Agent Plus refresh snapshot has malformed flattened lists")
+    for session in sessions:
+        if not isinstance(session, Mapping):
+            raise CheckError("Agent Plus refresh snapshot has a malformed flattened session")
+        _validate_agent_row_provenance(session, "flattened session")
+    for error in errors:
+        if not isinstance(error, Mapping):
+            raise CheckError("Agent Plus refresh snapshot has a malformed flattened error")
+        _agent_text(error.get("host"), "flattened error host")
+        _agent_text(error.get("stage"), "flattened error stage")
+        _agent_text(error.get("message"), "flattened error message")
+    return len(errors)
+
+
+def _check_agent_contract(
+    agent_executable: str,
+    revision: str,
+    environment: Mapping[str, str],
+    *,
+    host_ids: Sequence[str] | None = None,
+    runner: CommandRunner | None = None,
+) -> int:
+    refresh_environment = dict(environment)
+    refresh_environment.pop("ROFI_RETV", None)
+    result = _require_success(
+        agent_executable,
+        ("refresh",),
+        environment=refresh_environment,
+        runner=runner,
+        timeout=AGENT_REFRESH_TIMEOUT_SECONDS,
+    )
+    payload = _json_document(result, "Agent Plus refresh")
+    return _agent_contract_snapshot(payload, revision, host_ids)
+
+
+def _validate_rofi_protocol(output: object, label: str) -> None:
+    if not isinstance(output, str) or not output:
+        raise CheckError(f"{label} emitted empty Rofi script output")
+    if not re.search(r"\x00[^\x00\r\n]{1,128}\x1f", output):
+        raise CheckError(f"{label} emitted no valid NUL protocol header")
+
+
+def _rofi_header(output: str, key: str) -> str | None:
+    marker = f"\x00{key}\x1f"
+    offset = output.find(marker)
+    if offset < 0:
+        return None
+    value = output[offset + len(marker) :]
+    boundaries = [
+        index for separator in ("\n", "\t", "\x1e") if (index := value.find(separator)) >= 0
+    ]
+    return value[: min(boundaries)] if boundaries else value
+
+
+def _agent_default_selection(output: str) -> str:
+    """The leading active-group row must not displace a conversation."""
+    for match in re.finditer(r"\x00info\x1f([^\x00\x1f\t\r\n\x1e]+)", output):
+        try:
+            payload = json.loads(match.group(1))
+        except (ValueError, TypeError):
+            continue
+        if (
+            isinstance(payload, Mapping)
+            and isinstance(payload.get("kind"), str)
+            and payload.get("kind") in {"codex", "claude", "opencode"}
+            and isinstance(payload.get("id"), str)
+        ):
+            return "1"
+    return "0"
+
+
+def _render_callback(
+    executable: str,
+    retv: int,
+    environment: Mapping[str, str],
+    *,
+    data: str | None = None,
+    info: str | None = None,
+    runner: CommandRunner | None = None,
+) -> str:
+    callback_environment = dict(environment)
+    for name in ROFI_CALLBACK_VARS:
+        callback_environment.pop(name, None)
+    callback_environment["ROFI_RETV"] = str(retv)
+    if data is not None:
+        callback_environment["ROFI_DATA"] = data
+    if info is not None:
+        callback_environment["ROFI_INFO"] = info
+    result = _require_success(
+        executable,
+        (),
+        environment=callback_environment,
+        runner=runner,
+    )
+    combined = f"{result.stdout}\n{result.stderr}".casefold()
+    if "invalid_input" in combined:
+        raise CheckError(f"{Path(executable).name} callback reported invalid_input")
+    _validate_rofi_protocol(result.stdout, f"{Path(executable).name} ROFI_RETV={retv}")
+    return result.stdout
+
+
+def _check_view_navigation(
+    name: str,
+    executable: str,
+    environment: Mapping[str, str],
+    *,
+    runner: CommandRunner | None = None,
+) -> None:
+    initial = _render_callback(executable, 0, environment, runner=runner)
+    initial_prompt = _rofi_header(initial, "prompt")
+    if not initial_prompt:
+        raise CheckError(f"{name} initial render omitted its prompt")
+    initial_data = _rofi_header(initial, "data")
+    if name == "rofi-tmux-plus" and not initial_data:
+        raise CheckError("rofi-tmux-plus initial render omitted its snapshot continuation")
+
+    right = _render_callback(
+        executable,
+        11,
+        environment,
+        data=initial_data,
+        runner=runner,
+    )
+    right_data = _rofi_header(right, "data")
+    left = _render_callback(
+        executable,
+        12,
+        environment,
+        data=right_data,
+        runner=runner,
+    )
+
+    right_prompt = _rofi_header(right, "prompt")
+    left_prompt = _rofi_header(left, "prompt")
+    if not right_prompt or right_prompt == initial_prompt:
+        raise CheckError(f"{name} Right did not enter a different peer view")
+    if left_prompt != initial_prompt:
+        raise CheckError(f"{name} Left did not return to its initial peer view")
+    for direction, output in (("Right", right), ("Left", left)):
+        if _rofi_header(output, "keep-filter") != "true":
+            raise CheckError(f"{name} {direction} did not preserve the filter")
+        if name == "rofi-agent-plus":
+            if _rofi_header(output, "keep-selection") != "true":
+                raise CheckError(f"{name} {direction} did not re-arm selection preservation")
+            if _rofi_header(output, "new-selection") != _agent_default_selection(output):
+                raise CheckError(f"{name} {direction} did not select its first conversation")
+        else:
+            if _rofi_header(output, "keep-selection") != "true":
+                raise CheckError(f"{name} {direction} did not re-arm selection preservation")
+            if _rofi_header(output, "new-selection") != "0":
+                raise CheckError(f"{name} {direction} did not reset selection explicitly")
+
+
+def _check_agent_active_page(
+    executable: str,
+    environment: Mapping[str, str],
+    *,
+    runner: CommandRunner | None = None,
+) -> None:
+    """Check overlapping Active/Open pages and endpoint-local restoration."""
+
+    initial = _render_callback(executable, 0, environment, runner=runner)
+    initial_prompt = _rofi_header(initial, "prompt")
+    if initial_prompt not in {"Agents › All", "Agents › Local"}:
+        raise CheckError("Agent navigation check did not start on All or Local")
+    opened = _render_callback(
+        executable, 12, environment, data=_rofi_header(initial, "data"), runner=runner
+    )
+    if _rofi_header(opened, "prompt") != "Agents › Open":
+        raise CheckError("Agent Left from its default page did not enter Open")
+    if "All open sessions (" not in opened:
+        raise CheckError("Agent Open page omitted its distinct open-group target")
+    if _rofi_header(opened, "keep-filter") != "true" or _rofi_header(
+        opened, "new-selection"
+    ) != _agent_default_selection(opened):
+        raise CheckError("Agent Open page did not preserve search and reset selection")
+    reopened_open = _render_callback(executable, 0, environment, runner=runner)
+    if _rofi_header(reopened_open, "prompt") != "Agents › Open":
+        raise CheckError("Agent new dialog did not restore its Open page")
+    active = _render_callback(
+        executable, 12, environment, data=_rofi_header(reopened_open, "data"), runner=runner
+    )
+    if _rofi_header(active, "prompt") != "Agents › Active":
+        raise CheckError("Agent Left from Open did not enter Active")
+    if _rofi_header(active, "keep-filter") != "true" or _rofi_header(
+        active, "new-selection"
+    ) != _agent_default_selection(active):
+        raise CheckError("Agent Active page did not preserve search and reset selection")
+    reopened = _render_callback(executable, 0, environment, runner=runner)
+    if _rofi_header(reopened, "prompt") != "Agents › Active":
+        raise CheckError("Agent new dialog did not restore its Active page")
+    if not (_rofi_header(reopened, "message") or "").startswith(
+        _expected_action_line("rofi-agent-plus", "Resume")
+    ):
+        raise CheckError("Agent restored Active page did not start with Resume")
+    restored = _render_callback(
+        executable, 11, environment, data=_rofi_header(reopened, "data"), runner=runner
+    )
+    if _rofi_header(restored, "prompt") != "Agents › Open":
+        raise CheckError("Agent Right from Active did not enter Open")
+    restored = _render_callback(
+        executable, 11, environment, data=_rofi_header(restored, "data"), runner=runner
+    )
+    if _rofi_header(restored, "prompt") != initial_prompt:
+        raise CheckError("Agent Right from Open did not return to its default page")
+
+
+def _check_agent_group_target(
+    executable: str,
+    environment: Mapping[str, str],
+    *,
+    runner: CommandRunner | None = None,
+) -> None:
+    """Select the group and reject New without preparing or confirming a job."""
+
+    initial = _render_callback(executable, 0, environment, runner=runner)
+    if "All active sessions (" not in initial:
+        raise CheckError("Agent initial render omitted its active-group target")
+
+    group = _render_callback(
+        executable, 13, environment, data=_rofi_header(initial, "data"), runner=runner
+    )
+    message = _rofi_header(group, "message") or ""
+    if not message.startswith(_expected_action_line("rofi-agent-plus", "Resume")):
+        raise CheckError("Agent Alt+A changed the shared action cycle")
+    if _rofi_header(group, "new-selection") != "0" or _rofi_header(group, "keep-filter") == "true":
+        raise CheckError("Agent Alt+A did not select its group target and clear search")
+
+    group_info = None
+    for match in re.finditer(r"\x00info\x1f([^\x00\x1f\t\r\n\x1e]+)", group):
+        payload = json.loads(match.group(1))
+        if isinstance(payload, Mapping) and payload.get("type") == "batch":
+            group_info = match.group(1)
+            break
+    if group_info is None:
+        raise CheckError("Agent group target omitted its typed row identity")
+
+    forward = _render_callback(
+        executable,
+        16,
+        environment,
+        data=_rofi_header(group, "data"),
+        info=group_info,
+        runner=runner,
+    )
+    backward = _render_callback(
+        executable,
+        17,
+        environment,
+        data=_rofi_header(forward, "data"),
+        info=group_info,
+        runner=runner,
+    )
+    for label, output in (("group", group), ("forward", forward), ("backward", backward)):
+        if _rofi_header(output, "keep-selection") != "true":
+            raise CheckError(f"Agent {label} did not re-arm selection preservation")
+        if _rofi_header(output, "prompt") != _rofi_header(initial, "prompt"):
+            raise CheckError(f"Agent {label} replaced the main page with a submenu")
+    if not (_rofi_header(forward, "message") or "").startswith(
+        _expected_action_line("rofi-agent-plus", "Close")
+    ):
+        raise CheckError("Agent group Tab did not select shared Close")
+    if not (_rofi_header(backward, "message") or "").startswith(
+        _expected_action_line("rofi-agent-plus", "Resume")
+    ):
+        raise CheckError("Agent group Shift+Tab did not select shared Resume")
+
+    new_action = _render_callback(
+        executable,
+        17,
+        environment,
+        data=_rofi_header(backward, "data"),
+        info=group_info,
+        runner=runner,
+    )
+    warning = _render_callback(
+        executable,
+        1,
+        environment,
+        data=_rofi_header(new_action, "data"),
+        info=group_info,
+        runner=runner,
+    )
+    for output in (new_action, warning):
+        if not (_rofi_header(output, "message") or "").startswith(
+            _expected_action_line("rofi-agent-plus", "New")
+        ):
+            raise CheckError("Agent group New did not preserve the shared action")
+    if "Select a conversation" not in warning:
+        raise CheckError("Agent group New omitted its no-operation warning")
+    if _rofi_header(warning, "new-selection") != "0":
+        raise CheckError("Agent group New warning displaced the group target")
+    selected_again = _render_callback(
+        executable, 13, environment, data=_rofi_header(warning, "data"), runner=runner
+    )
+    if _rofi_header(selected_again, "new-selection") != "0" or not (
+        _rofi_header(selected_again, "message") or ""
+    ).startswith(_expected_action_line("rofi-agent-plus", "New")):
+        raise CheckError("Agent repeated Alt+A toggled context or changed the action")
+
+
+def _expected_action_line(name: str, action: str) -> str:
+    order = {
+        "rofi-ssh-plus": ("Connect", "Forget recent history"),
+        "rofi-tmux-plus": ("Open", "Kill"),
+        "rofi-agent-plus": ("Resume", "Close", "New"),
+    }[name]
+    labels = []
+    for candidate in order:
+        label = candidate
+        if candidate == action:
+            color = (
+                "#ef5350"
+                if candidate == "Kill"
+                else "#ffb74d"
+                if candidate == "Forget recent history"
+                else "#42a5f5"
+            )
+            label = f'<span foreground="{color}" weight="bold">[{label}]</span>'
+        labels.append(label)
+    hint = "Tab: Cycle  │  Alt+A: All" if name == "rofi-agent-plus" else "Tab: Cycle actions"
+    return f"Enter: {' · '.join(labels)}  │  {hint}"
+
+
+def _check_action_cycle(
+    name: str,
+    executable: str,
+    environment: Mapping[str, str],
+    *,
+    runner: CommandRunner | None = None,
+) -> None:
+    labels = {
+        "rofi-tmux-plus": ("Open", "Kill"),
+        "rofi-agent-plus": ("Resume", "Close", "New"),
+    }
+    order = labels[name]
+    primary, secondary = order[:2]
+    initial = _render_callback(executable, 0, environment, runner=runner)
+    selected = _render_callback(
+        executable, 16, environment, data=_rofi_header(initial, "data"), runner=runner
+    )
+    restored = _render_callback(
+        executable, 17, environment, data=_rofi_header(selected, "data"), runner=runner
+    )
+    initial_prompt = _rofi_header(initial, "prompt")
+    if not initial_prompt:
+        raise CheckError(f"{name} did not render its host-scope prompt")
+    observations = [
+        ("initial", initial, primary),
+        ("Tab", selected, secondary),
+        ("Shift+Tab", restored, primary),
+    ]
+    if len(order) > 2:
+        previous = restored
+        for direction, retv, actions in (
+            ("Tab", 16, (*order[1:], primary)),
+            ("Shift+Tab", 17, (*reversed(order[1:]), primary)),
+        ):
+            for action in actions:
+                previous = _render_callback(
+                    executable,
+                    retv,
+                    environment,
+                    data=_rofi_header(previous, "data"),
+                    runner=runner,
+                )
+                observations.append((direction, previous, action))
+    for direction, output, action in observations:
+        if _rofi_header(output, "prompt") != initial_prompt:
+            raise CheckError(f"{name} {direction} changed the host-scope prompt")
+        message = _rofi_header(output, "message") or ""
+        if not message.startswith(_expected_action_line(name, action)):
+            raise CheckError(f"{name} {direction} did not display its action line")
+        if "Shift+Tab:" in message:
+            raise CheckError(f"{name} {direction} repeated the action hint")
+    for direction, output, _action in observations[1:]:
+        if _rofi_header(output, "keep-filter") != "true":
+            raise CheckError(f"{name} {direction} did not preserve the filter")
+        if _rofi_header(output, "keep-selection") != "true":
+            raise CheckError(f"{name} {direction} did not preserve selection")
+
+
+def _fake_result(
+    executable: str,
+    args: Sequence[str],
+    payload: Mapping[str, object],
+    *,
+    returncode: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        [executable, *args],
+        returncode,
+        json.dumps(payload, separators=(",", ":")),
+        "",
+    )
+
+
+class _FakeAgentRunner:
+    """Scripted Agent Plus refresh response used only by ``--self-test``."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...], Mapping[str, str]]] = []
+        self.payload: dict[str, object] = {
+            "version": AGENT_SNAPSHOT_VERSION,
+            "fingerprint": "self-test",
+            "generatedAt": 1,
+            "lastRefresh": {
+                "attemptedAt": 1,
+                "completedAt": 1,
+                "outcome": "partial",
+            },
+            "backend": {
+                "kind": "contract",
+                "capability": AGENT_CONTRACT_CAPABILITY,
+                "meshRevision": "sha256:selftest",
+            },
+            "hostCatalog": [
+                {"hostId": "alpha", "display": "Alpha", "local": True},
+                {"hostId": "beta", "display": "Beta", "local": False},
+            ],
+            "hosts": {
+                "alpha": {
+                    "generatedAt": 1,
+                    "sessions": [
+                        {
+                            "id": "synthetic-provider-row",
+                            "kind": "codex",
+                            "sourceObservation": "retained",
+                        }
+                    ],
+                    "errors": [
+                        {
+                            "host": "alpha",
+                            "stage": "codex",
+                            "message": "synthetic provider-stage evidence",
+                        }
+                    ],
+                    "observations": {
+                        "codex": {
+                            "lastAttemptAt": 1,
+                            "lastSuccessAt": 0,
+                            "outcome": "failed",
+                        },
+                        "claude": {
+                            "lastAttemptAt": 1,
+                            "lastSuccessAt": 1,
+                            "outcome": "ok",
+                        },
+                        "opencode": {
+                            "lastAttemptAt": 1,
+                            "lastSuccessAt": 1,
+                            "outcome": "ok",
+                        },
+                        "activity": {
+                            "lastAttemptAt": 1,
+                            "lastSuccessAt": 1,
+                            "outcome": "ok",
+                        },
+                        "tmux": {
+                            "lastAttemptAt": 1,
+                            "lastSuccessAt": 1,
+                            "outcome": "ok",
+                        },
+                    },
+                }
+            },
+            "sessions": [
+                {
+                    "id": "synthetic-provider-row",
+                    "kind": "codex",
+                    "sourceObservation": "retained",
+                }
+            ],
+            "errors": [
+                {
+                    "host": "alpha",
+                    "stage": "codex",
+                    "message": "synthetic provider-stage evidence",
+                }
+            ],
+        }
+
+    def __call__(
+        self,
+        executable: str,
+        args: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append((executable, tuple(args), dict(environment)))
+        return _fake_result(executable, args, self.payload)
+
+
+class _FakeCallbackRunner:
+    """Scripted callback output used only by ``--self-test``."""
+
+    def __init__(self, *, invalid_input: bool = False) -> None:
+        self.calls: list[tuple[str, tuple[str, ...], Mapping[str, str]]] = []
+        self.invalid_input = invalid_input
+
+    def __call__(
+        self,
+        executable: str,
+        args: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append((executable, tuple(args), dict(environment)))
+        name = Path(executable).name
+        retv = environment.get("ROFI_RETV")
+        labels = {
+            "rofi-tmux-plus": ("Tmux › All", "Tmux › Local", "Open", "Kill"),
+            "rofi-agent-plus": ("Agents › All", "Agents › Local", "Resume", "Close"),
+        }
+        initial, peer, primary, secondary = labels.get(
+            name, ("SSH", "SSH", "Connect", "Forget recent history")
+        )
+        action = primary
+        if name == "rofi-ssh-plus" and retv in {"16", "17"}:
+            prompt = initial
+            action = secondary if retv == "16" else primary
+            data = "action:forget" if retv == "16" else "action:connect"
+            preservation = "\x00keep-filter\x1ftrue\x1e\x00keep-selection\x1ftrue\x1e"
+        elif name == "rofi-ssh-plus" and retv in {"10", "11", "12"}:
+            prompt = initial
+            data = "action:connect"
+            preservation = "\x00keep-filter\x1ftrue\x1e\x00keep-selection\x1ftrue\x1e"
+        elif name != "rofi-ssh-plus" and retv in {"16", "17"}:
+            prompt = initial
+            if name == "rofi-agent-plus":
+                order = ("Resume", "Close", "New")
+                previous = environment.get("ROFI_DATA", "")
+                index = (
+                    int(previous.removeprefix("state:action:"))
+                    if previous.startswith("state:action:")
+                    else 0
+                )
+                index = (index + (1 if retv == "16" else -1)) % len(order)
+                action = order[index]
+                data = f"state:action:{index}"
+            else:
+                action = secondary if retv == "16" else primary
+                data = "state:secondary" if retv == "16" else "state:primary"
+            preservation = "\x00keep-filter\x1ftrue\x1e\x00keep-selection\x1ftrue\x1e"
+        elif retv == "11":
+            prompt = peer
+            data = "state:right"
+            preservation = "\x00keep-filter\x1ftrue\x1e"
+            if name in {"rofi-agent-plus", "rofi-tmux-plus"}:
+                preservation += "\x00keep-selection\x1ftrue\x1e\x00new-selection\x1f0\x1e"
+        elif retv == "12":
+            prompt = initial
+            data = "state:left"
+            preservation = "\x00keep-filter\x1ftrue\x1e"
+            if name in {"rofi-agent-plus", "rofi-tmux-plus"}:
+                preservation += "\x00keep-selection\x1ftrue\x1e\x00new-selection\x1f0\x1e"
+        else:
+            prompt = initial
+            data = "state:initial"
+            preservation = ""
+        no_custom = "\x00no-custom\x1ftrue\x1e" if name == "rofi-ssh-plus" else ""
+        message = f"\x00message\x1f{_expected_action_line(name, action)}\x1e"
+        if name == "rofi-ssh-plus" and retv == "0":
+            initial_output = (
+                f"\x00prompt\x1f{prompt}\n"
+                f"\x00message\x1f{_expected_action_line(name, action)}\n"
+                "\x00no-custom\x1ftrue\n"
+                f"\x00data\x1f{data}\n"
+                "\x00delim\x1f\\t\n"
+                'row\x00info\x1f{"version":1,"kind":"host","id":"row"}'
+                "\x00meta\x1frow\x00display\x1frow\nrecent\t"
+            )
+        else:
+            initial_output = (
+                f"\x00prompt\x1f{prompt}\x1e{message}{no_custom}"
+                f"\x00data\x1f{data}\x1e{preservation}row\x1e"
+            )
+        return subprocess.CompletedProcess(
+            [executable, *args],
+            0,
+            initial_output,
+            "invalid_input" if self.invalid_input else "",
+        )
+
+
+class _FakeActivePageRunner:
+    """Model explicit page writes separately from initial dialog reads."""
+
+    def __init__(self, *, remembers: bool = True) -> None:
+        self.remembers = remembers
+        self.page = "All"
+
+    def __call__(
+        self,
+        executable: str,
+        args: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        retv = environment.get("ROFI_RETV")
+        if retv in {"11", "12"}:
+            ring = ("Active", "Open", "All", "Local")
+            current = environment.get("ROFI_DATA", f"page:{self.page}").removeprefix("page:")
+            direction = 1 if retv == "11" else -1
+            page = ring[(ring.index(current) + direction) % len(ring)]
+        else:
+            page = self.page
+        if self.remembers and retv in {"11", "12"}:
+            self.page = page
+        preservation = (
+            "\x00keep-filter\x1ftrue\x1e\x00new-selection\x1f0\x1e" if retv in {"11", "12"} else ""
+        )
+        output = (
+            f"\x00prompt\x1fAgents › {page}\x1e"
+            f"\x00message\x1f{_expected_action_line('rofi-agent-plus', 'Resume')}\x1e"
+            f"\x00data\x1fpage:{page}\x1e{preservation}row\x1e"
+            + ("All open sessions (0)\x1e" if page == "Open" else "")
+        )
+        return subprocess.CompletedProcess([executable, *args], 0, output, "")
+
+
+def _self_test_require(condition: bool, message: str) -> None:
+    if not condition:
+        raise CheckError("self-test assertion failed: " + message)
+
+
+def _self_test_no_forbidden_agent_commands(
+    calls: Sequence[tuple[str, Sequence[str], Mapping[str, str]]],
+    expected_executable: str,
+) -> None:
+    forbidden = {"open", "--open", "--defer-until-attached", "--cwd", "--command"}
+    providers = {"codex", "claude", "opencode", "provider"}
+    for executable, args, environment in calls:
+        _self_test_require(
+            executable == expected_executable, "fake used an installed Agent executable"
+        )
+        _self_test_require(tuple(args) == ("refresh",), "Agent refresh used an unexpected argv")
+        _self_test_require(not forbidden.intersection(args), "forbidden Agent argument appeared")
+        _self_test_require(
+            not providers.intersection(token.casefold() for token in args),
+            "provider command appeared in Agent argv",
+        )
+        _self_test_require("ROFI_RETV" not in environment, "Agent refresh inherited ROFI_RETV")
+
+
+def _self_test() -> int:
+    mesh = {
+        "schemaVersion": 1,
+        "meshRevision": "sha256:selftest",
+        "localHostId": "alpha",
+        "hosts": [
+            {"id": "alpha", "local": True},
+            {"id": "beta", "local": False},
+        ],
+    }
+    host_ids, local_id, revision = _mesh_hosts(mesh)
+    _self_test_require(host_ids == ("alpha", "beta"), "mesh host order was not retained")
+    _self_test_require(
+        local_id == "alpha" and revision == "sha256:selftest", "mesh metadata changed"
+    )
+
+    with TemporaryDirectory(prefix="rofi-plus-history-selftest-") as directory:
+        history_path = Path(directory) / "history.json"
+        history_payload = {
+            "version": 1,
+            "sortMode": "recency",
+            "hosts": [{"host": "alpha", "lastConnected": 10, "count": 2}],
+        }
+        history_path.write_text(json.dumps(history_payload, indent=2), encoding="utf-8")
+        history_before = _history_snapshot(history_path)
+        history_path.write_text(
+            json.dumps(
+                {"hosts": history_payload["hosts"], "sortMode": "recency", "version": 1},
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        _assert_history_unchanged(history_before, history_path)
+        changed = dict(history_payload)
+        changed["hosts"] = [{"host": "alpha", "lastConnected": 10, "count": 3}]
+        history_path.write_text(json.dumps(changed), encoding="utf-8")
+        try:
+            _assert_history_unchanged(history_before, history_path)
+        except CheckError as error:
+            _self_test_require("history changed" in str(error), "history mutation was not detected")
+        else:
+            raise CheckError("self-test assertion failed: history mutation was accepted")
+        missing_path = Path(directory) / "missing.json"
+        missing = _history_snapshot(missing_path)
+        _self_test_require(not missing.present, "missing history was not represented distinctly")
+        missing_path.write_text(json.dumps(history_payload), encoding="utf-8")
+        try:
+            _assert_history_unchanged(missing, missing_path)
+        except CheckError:
+            pass
+        else:
+            raise CheckError("self-test assertion failed: missing history matched present history")
+    print("[ok] SSH usage history comparison is semantic and distinguishes missing state")
+
+    agent_runner = _FakeAgentRunner()
+    agent_errors = _check_agent_contract(
+        "/fake/rofi-agent-plus",
+        revision,
+        {"ROFI_RETV": "15", "PATH": "/fake"},
+        host_ids=host_ids,
+        runner=agent_runner,
+    )
+    _self_test_require(agent_errors == 1, "provider-stage evidence was not retained")
+    _self_test_no_forbidden_agent_commands(agent_runner.calls, "/fake/rofi-agent-plus")
+    wrong_backend = dict(agent_runner.payload)
+    wrong_backend["backend"] = {
+        "kind": "legacy",
+        "capability": "legacy-v1",
+        "meshRevision": None,
+    }
+    try:
+        _agent_contract_snapshot(wrong_backend, revision)
+    except CheckError:
+        pass
+    else:
+        raise CheckError("self-test assertion failed: legacy Agent identity was accepted")
+    malformed_last_refresh = json.loads(json.dumps(agent_runner.payload))
+    malformed_last_refresh["lastRefresh"] = {
+        "attemptedAt": 1,
+        "completedAt": None,
+        "outcome": "partial",
+    }
+    try:
+        _agent_contract_snapshot(malformed_last_refresh, revision)
+    except CheckError as error:
+        _self_test_require(
+            "lastRefresh" in str(error),
+            "malformed Agent lastRefresh was not rejected",
+        )
+    else:
+        raise CheckError("self-test assertion failed: malformed Agent lastRefresh was accepted")
+    malformed_observations = json.loads(json.dumps(agent_runner.payload))
+    malformed_observations["hosts"]["alpha"]["observations"]["tmux"] = {
+        "lastAttemptAt": 1,
+        "lastSuccessAt": 1,
+        "outcome": "invented",
+    }
+    try:
+        _agent_contract_snapshot(malformed_observations, revision)
+    except CheckError as error:
+        _self_test_require(
+            "tmux observation" in str(error),
+            "malformed Agent observation was not rejected",
+        )
+    else:
+        raise CheckError("self-test assertion failed: malformed Agent observation was accepted")
+    malformed_provenance = json.loads(json.dumps(agent_runner.payload))
+    malformed_provenance["sessions"][0]["sourceObservation"] = "unproven"
+    try:
+        _agent_contract_snapshot(malformed_provenance, revision)
+    except CheckError as error:
+        _self_test_require(
+            "sourceObservation" in str(error),
+            "malformed Agent provenance was not rejected",
+        )
+    else:
+        raise CheckError("self-test assertion failed: malformed Agent provenance was accepted")
+    print(
+        "[ok] Agent refresh proves contract identity and validates selected observation provenance"
+    )
+
+    callbacks = _FakeCallbackRunner()
+    environment = {
+        "ROFI_RETV": "7",
+        "ROFI_INFO": "stale",
+        "ROFI_INPUT": "stale",
+        "ROFI_DATA": "stale",
+        "ROFI_OUTSIDE": "stale",
+    }
+    _check_view_navigation(
+        "rofi-agent-plus", "/fake/rofi-agent-plus", environment, runner=callbacks
+    )
+    _check_action_cycle("rofi-agent-plus", "/fake/rofi-agent-plus", environment, runner=callbacks)
+    for _executable, args, environment in callbacks.calls:
+        _self_test_require(not args, "callback probe passed unexpected argv")
+        allowed = (
+            {"ROFI_RETV"} if environment.get("ROFI_RETV") == "0" else {"ROFI_RETV", "ROFI_DATA"}
+        )
+        _self_test_require(
+            set(environment).isdisjoint(set(ROFI_CALLBACK_VARS) - allowed),
+            "stale callback variables retained",
+        )
+    _check_agent_active_page("/fake/rofi-agent-plus", {}, runner=_FakeActivePageRunner())
+    try:
+        _check_agent_active_page(
+            "/fake/rofi-agent-plus", {}, runner=_FakeActivePageRunner(remembers=False)
+        )
+    except CheckError:
+        pass
+    else:
+        raise CheckError("missing page restoration was accepted")
+    print("[ok] owner contract and guard self-test")
+    return 0
+
+
+def _live(lifecycle=False, legacy_callbacks=False):
+    before = _history_snapshot(_history_path())
+    try:
+        environment = _clean_environment()
+        ssh = _resolve("rofi-ssh-plus")
+        host_ids, local_id, revision = _check_mesh(ssh, environment)
+        executable = _resolve(OWNER_COMMAND)
+        with TemporaryDirectory(prefix="owner-picker-state-") as state:
+            environment = dict(environment, XDG_STATE_HOME=state, XDG_CACHE_HOME=state + "/cache")
+            _check_agent_contract(executable, revision, environment, host_ids=host_ids)
+            _check_view_navigation(OWNER_COMMAND, executable, environment)
+            _check_action_cycle(OWNER_COMMAND, executable, environment)
+            if legacy_callbacks:
+                _check_agent_active_page(executable, environment)
+                _check_agent_group_target(executable, environment)
+    finally:
+        _assert_history_unchanged(before, _history_path())
+    print("[ok] installed owner contract checks; graphical/provider acceptance is separate")
+    return 0
+
+
+def main():
+    global AGENT_SNAPSHOT_VERSION, AGENT_OBSERVATION_STAGES
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--self-test", action="store_true")
+    mode.add_argument("--live", action="store_true")
+    parser.add_argument(
+        "--lifecycle",
+        action="store_true",
+        help="Tmux only: explicitly exercise owned disposable native sessions",
+    )
+    parser.add_argument(
+        "--legacy-callbacks",
+        action="store_true",
+        help="Agent only: exercise the historical viewer/group contract",
+    )
+    parser.add_argument(
+        "--legacy-profile", action="store_true", help="explicit Carbon/foreground cache-v4 profile"
+    )
+    args = parser.parse_args()
+    if args.legacy_profile:
+        if not args.live:
+            parser.error("--legacy-profile requires --live")
+        AGENT_SNAPSHOT_VERSION = 4
+        AGENT_OBSERVATION_STAGES = ("codex", "claude", "opencode", "activity", "tmux")
+    if args.lifecycle and (OWNER_COMMAND != "rofi-tmux-plus" or not args.live):
+        parser.error("--lifecycle requires Tmux --live")
+    if args.legacy_callbacks and (OWNER_COMMAND != "rofi-agent-plus" or not args.live):
+        parser.error("--legacy-callbacks requires Agent --live")
+    try:
+        return _self_test() if args.self_test else _live(args.lifecycle, args.legacy_callbacks)
+    except (CheckError, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"[error] {_compact(error)}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

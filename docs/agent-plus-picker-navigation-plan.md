@@ -3,7 +3,7 @@
 Date: 2026-09-30
 
 Status: implemented in `0.7.0`. Current deployment and manual acceptance are
-recorded in the [managed suite status ledger](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md).
+recorded in the [historical suite ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md).
 This plan covers a global Active page and remembered picker context. It
 supersedes the earlier Active-only toggle proposal. Version `0.6.5` is the
 preceding picker with host pages and no remembered context.

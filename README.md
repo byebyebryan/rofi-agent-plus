@@ -367,7 +367,7 @@ Spotlight launcher.
 The [picker navigation design](docs/agent-plus-picker-navigation-plan.md)
 records the Active page, remembered context, implementation order, and
 acceptance requirements. Installed and manual acceptance remain recorded in
-the managed suite status ledger.
+the historical suite ledger.
 
 The [batch session actions plan](docs/agent-plus-batch-session-actions-plan.md)
 records the Close/Resume safeguards and release boundaries; Kill all remains
@@ -386,3 +386,7 @@ The former DMS Agent Picker repository is retained for compatibility and
 history, but is deprecated; new picker behavior belongs here.  Project
 scoping and synthetic-session cleanup remain out of scope until they have a
 separately reviewed design.
+
+Project-owned artifact, cache-profile and selector rollback checks are in
+[managed operations](docs/managed-operations.md). Historical deployment records
+retain their original release scope.

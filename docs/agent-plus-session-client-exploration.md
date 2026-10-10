@@ -9,7 +9,7 @@ interaction. Herdr remains a credible alternative and reference. This is a
 preference, not a final architecture or implementation decision.
 
 This note captures the discussion about Herdr, an Agent Plus integration, and
-a dedicated session client. The [current status ledger](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md)
+a dedicated session client. The [historical status ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md)
 continues to describe the deployed product. No runtime, public contract,
 dependency, or deployment change follows from this note. Carbon appears below
 as a workflow example, not as a newly accepted deployment target.
@@ -51,7 +51,7 @@ The current Resume and New session here actions remain useful. Starting a
 completely new project is infrequent enough to do outside the picker. Starting
 another conversation in an existing session's directory is useful; the
 existing conversation remains untouched. See the
-[action cycle record](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-action-cycle-plan.md).
+[action cycle record](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-action-cycle-plan.md).
 
 The next pressure is the presentation model of one session per terminal
 window:
@@ -77,7 +77,7 @@ remembering the last page and successfully used conversation. The
 [picker navigation plan](agent-plus-picker-navigation-plan.md) records that
 direction and replaces the initial Active-only toggle proposal. These picker
 improvements are implemented in `0.7.0`; deployment and acceptance are tracked
-in the managed suite status ledger. The operator subsequently selected
+in the historical suite ledger. The operator subsequently selected
 Close/Resume batches as a simpler machine-switching direction; the proposed
 [batch session actions plan](agent-plus-batch-session-actions-plan.md) records
 the design and implementation gates, with specialized Kill all separate.
@@ -286,7 +286,7 @@ attachment switched on demand was discussed; keeping multiple attachment
 clients alive is still an implementation choice.
 
 Existing provider discovery must remain a single maintained capability. The
-current [P9 boundary](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-p9-cli-contracts.md#agent-plus) deliberately
+current [P9 boundary](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-p9-cli-contracts.md#agent-plus) deliberately
 excludes publishing provider discovery or the private Rofi cache as a consumer
 contract. A new client requires an explicit contract design; it must not
 silently depend on private caches, cross-package Python imports, or copied
