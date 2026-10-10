@@ -5,7 +5,7 @@ Date: 2026-10-02
 Status: approved on 2026-10-02 and implemented in Agent Plus `0.12.0` with
 worker-goal-loop. This is the Rofi picker layout and styling pass, following
 the `0.11.3` baseline. Deployment and native visual acceptance are recorded
-separately in the [managed suite status ledger](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md).
+separately in the [historical suite ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md).
 
 The existing [navigation](agent-plus-picker-navigation-plan.md),
 [batch actions](agent-plus-batch-session-actions-plan.md), and

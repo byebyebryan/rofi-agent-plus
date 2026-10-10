@@ -355,7 +355,7 @@ and process. Native Rofi Alt+A with no search matches opened the menu, Close
 built a read-only preview, and native Ctrl+G cancelled with unchanged isolated
 preferences and no job. Source gates passed 191 Tmux tests and 259 Agent tests.
 The current coordinated deployment and installed acceptance are recorded in
-the [managed fleet status](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md).
+the [managed fleet status](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md).
 
 ## Acceptance and limits
 

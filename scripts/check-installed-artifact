@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Explicit unpublished Observer v2 / Plus v7 artifact and selected-live gate."""
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import zipfile
+from importlib.machinery import SourceFileLoader
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def require(ok, code):
+    if not ok:
+        raise ValueError(code)
+
+
+def run(argv, env=None, timeout=30):
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=timeout, check=False)
+    require(
+        result.returncode == 0 and len(result.stdout) <= 16 * 1024 * 1024,
+        "command_failed",
+    )
+    return result.stdout
+
+
+def load_live():
+    spec = importlib.util.spec_from_loader(
+        "pilot_suite_live",
+        SourceFileLoader("pilot_suite_live", str(ROOT / "scripts/check-installed")),
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    module.AGENT_SNAPSHOT_VERSION = 7
+    module.AGENT_OBSERVATION_STAGES = ("codex", "claude", "activity", "tmux")
+    return module
+
+
+def identity(row, host):
+    ref = row.get("observerIdentity")
+    require(
+        isinstance(ref, dict)
+        and set(ref) == {"hostScope", "provider", "namespace", "nativeIdKind", "nativeId"},
+        "identity_shape",
+    )
+    require(
+        ref["hostScope"] == host and ref["provider"] in {"codex", "claude"},
+        "identity_scope",
+    )
+    require(
+        ref["nativeIdKind"] == ("thread" if ref["provider"] == "codex" else "session"),
+        "identity_kind",
+    )
+    require(
+        isinstance(ref["namespace"], str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", ref["namespace"]),
+        "identity_namespace",
+    )
+    require(
+        isinstance(ref["nativeId"], str)
+        and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", ref["nativeId"]),
+        "identity_native_id",
+    )
+    require(
+        row.get("kind") == ref["provider"] and row.get("id") == ref["nativeId"],
+        "identity_projection",
+    )
+    return tuple(ref[k] for k in ("hostScope", "provider", "namespace", "nativeIdKind", "nativeId"))
+
+
+def v7(payload, revision, hosts, suite):
+    errors = suite._agent_contract_snapshot(payload, revision, hosts)
+    found = set()
+    for host_id, host in payload["hosts"].items():
+        require(host_id in hosts, "unexpected_host")
+        for row in host["sessions"]:
+            key = identity(row, host_id)
+            require(key not in found, "duplicate_identity")
+            found.add(key)
+            for dimension, values in (
+                ("runtime", {"running", "parked", "unknown"}),
+                ("phase", {"blocked", "waiting", "working", "unknown"}),
+            ):
+                value = row.get(dimension)
+                require(
+                    isinstance(value, dict)
+                    and value.get("value") in values
+                    and value.get("health")
+                    in {"current", "stale", "unavailable", "unsupported", "ambiguous"},
+                    "evidence_shape",
+                )
+    flattened = [identity(row, row.get("hostId")) for row in payload["sessions"]]
+    require(
+        len(flattened) == len(set(flattened)) and set(flattened) <= found,
+        "flattened_identity",
+    )
+    return {"sessions": len(found), "providerStageErrors": errors, "cacheVersion": 7}
+
+
+def wheel(prefix, artifact, package, home, expected_sdk, observer_version):
+    path = home / ".local/share" / package / "artifacts" / artifact["wheel"]
+    require(
+        hashlib.sha256(path.read_bytes()).hexdigest() == artifact["wheelSha256"],
+        "wheel_hash",
+    )
+    require(
+        prefix.resolve(strict=True) == prefix and prefix.stat().st_uid == os.getuid(),
+        "prefix_owner",
+    )
+    code = """import importlib.metadata,json,sysconfig
+from pathlib import Path
+try:
+ d=importlib.metadata.distribution('claude-agent-sdk');sdk=d.version;b=Path(d.locate_file('claude_agent_sdk/_bundled'));bundled=any(p.name!='.gitignore' for p in b.rglob('*'))
+except importlib.metadata.PackageNotFoundError:sdk=None;bundled=False
+print(json.dumps({'site':sysconfig.get_path('purelib'),'sdk':sdk,'bundled':bundled,'observer':importlib.metadata.version('agent-observer')}))"""
+    meta = json.loads(run([str(prefix / "bin/python"), "-I", "-B", "-c", code]))
+    site = Path(meta["site"])
+    require(
+        site.is_relative_to(prefix)
+        and meta["sdk"] == expected_sdk
+        and not meta["bundled"]
+        and meta["observer"] == observer_version,
+        "dependency_profile",
+    )
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        require(len(names) == len(set(names)) and len(names) <= 4096, "wheel_entries")
+        for entry in archive.infolist():
+            relative = PurePosixPath(entry.filename)
+            require(
+                not relative.is_absolute()
+                and ".." not in relative.parts
+                and ".data" not in entry.filename,
+                "wheel_path",
+            )
+            if entry.is_dir() or entry.filename.endswith(".dist-info/RECORD"):
+                continue
+            target = site / entry.filename
+            require(
+                target.is_file()
+                and not target.is_symlink()
+                and target.read_bytes() == archive.read(entry),
+                "installed_wheel_bytes",
+            )
+    for entry in artifact["entries"]:
+        path = prefix / "bin" / entry
+        first = path.read_bytes().splitlines()[0].decode()
+        interpreter = Path(first[2:])
+        require(
+            os.access(path, os.X_OK)
+            and interpreter.parent == prefix / "bin"
+            and re.fullmatch(r"python(?:3(?:\.\d+)?)?", interpreter.name)
+            and (
+                interpreter.samefile(prefix / "bin/python")
+                or interpreter.read_bytes() == (prefix / "bin/python").read_bytes()
+            ),
+            "entry_interpreter",
+        )
+    return {"installedWheelBytesVerified": True, "wheelSha256": artifact["wheelSha256"]}
+
+
+def self_test():
+    good = {
+        "kind": "codex",
+        "id": "11111111-1111-1111-1111-111111111111",
+        "observerIdentity": {
+            "hostScope": "snap",
+            "provider": "codex",
+            "namespace": "sha256:" + "a" * 64,
+            "nativeIdKind": "thread",
+            "nativeId": "11111111-1111-1111-1111-111111111111",
+        },
+    }
+    identity(good, "snap")
+    for field, value in (
+        ("namespace", "sha256:short"),
+        ("hostScope", "starship"),
+        ("provider", "opencode"),
+        ("nativeIdKind", "session"),
+    ):
+        bad = {**good, "observerIdentity": {**good["observerIdentity"], field: value}}
+        try:
+            identity(bad, "snap")
+        except ValueError:
+            continue
+        raise AssertionError("malformed reference accepted")
+    print(json.dumps({"selfTest": "accepted", "cases": 5}))
+
+
+def artifacts(manifest, host, home):
+    require(manifest["manifestVersion"] == 1 and host in manifest["hosts"], "selection_scope")
+    require(
+        manifest["schemas"] == {"snapshot": 2, "watch": 2, "write": 1, "plusCache": 7}, "schemas"
+    )
+    plus = home / manifest["plus"]["prefix"]
+    dependency = manifest["plusObserverDependency"]
+    result = {
+        "plus": wheel(plus, manifest["plus"], "rofi-agent-plus", home, None, dependency["version"]),
+        "dependency": wheel(plus, dependency, "agent-observer", home, None, dependency["version"]),
+    }
+    for kind, entry, version in (
+        ("snapshot", "agent-observer", 2),
+        ("watch", "agent-observer", 2),
+        ("request", "agent-observer-write", 1),
+        ("plan", "agent-observer-write", 1),
+        ("result", "agent-observer-write", 1),
+    ):
+        schema = json.loads(run([str(plus / "bin" / entry), "schema", "--kind", kind]))
+        require(schema["properties"]["schemaVersion"] == {"const": version}, "dependency_schema")
+    for entry in manifest["plus"]["entries"]:
+        link = home / ".local/bin" / entry
+        require(
+            link.is_symlink() and link.resolve(strict=True) == plus / "bin" / entry, "selected_plus"
+        )
+    link = home / ".config/rofi/scripts/agent-plus"
+    require(
+        link.is_symlink() and link.resolve(strict=True) == plus / "bin/rofi-agent-plus",
+        "selected_picker",
+    )
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--selection", type=Path)
+    parser.add_argument("--host", choices=("snap", "starship"))
+    parser.add_argument(
+        "--snapshot", type=Path, help="validate an explicitly captured cache-v7 JSON document"
+    )
+    parser.add_argument("--mesh-revision", help="expected authority revision for --snapshot")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    require(
+        args.selection is not None and args.host is not None, "explicit_selection_host_required"
+    )
+    manifest = json.loads(args.selection.resolve(strict=True).read_text())
+    report = {
+        "status": "accepted",
+        "artifacts": artifacts(manifest, args.host, Path.home()),
+        "providerOperations": 0,
+    }
+    if args.snapshot is not None:
+        require(args.mesh_revision is not None, "explicit_mesh_revision_required")
+        report["snapshot"] = v7(
+            json.loads(args.snapshot.read_text()),
+            args.mesh_revision,
+            manifest["hosts"],
+            load_live(),
+        )
+    print(json.dumps(report))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(
+            json.dumps({"status": "failed", "reason": type(exc).__name__, "code": str(exc)[:160]}),
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None

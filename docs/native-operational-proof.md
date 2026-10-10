@@ -45,3 +45,5 @@ It verifies the exact producer hash before installation. CI requires the
 repository variable `AGENT_OBSERVER_0_2_0A3_WHEEL_URL` to supply those exact bytes;
 that input/publication and hosted CI remain pending. This operational pass does
 not publish either package or change the pinned public dependency.
+
+Current artifact and selector tooling is documented in [managed operations](managed-operations.md).

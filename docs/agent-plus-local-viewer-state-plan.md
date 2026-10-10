@@ -21,7 +21,7 @@ through explicit user actions.
 ## Baseline behavior and evidence
 
 The selected baseline is Agent Plus `0.10.3` and Tmux Plus `0.4.0`. Current
-deployment evidence remains in the managed `docs/rofi-plus-status.md`.
+Historical deployment evidence remains in the [immutable managed ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md).
 
 - Agent activity comes from provider process observations, with `waiting`
   added for a pending tmux launch. Local viewer presence is absent from ordinary

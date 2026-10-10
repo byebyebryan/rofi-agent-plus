@@ -5,7 +5,7 @@ Date: 2026-09-25
 Status: study completed; see the [decision record](agent-plus-session-client-spike-results.md).
 This remains before any client implementation plan. The
 [exploration note](agent-plus-session-client-exploration.md) records the
-workflow and source review. The [Rofi Plus status ledger](https://github.com/byebyebryan/dotfiles/blob/main/docs/rofi-plus-status.md)
+workflow and source review. The [Rofi Plus status ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md)
 remains the authority for the deployed pickers. This spike publishes no new
 CLI contract and changes no installed workflow.
 

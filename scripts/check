@@ -4,6 +4,14 @@ set -eu
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
+# Source checks use private configuration, cache and preferences.
+check_state=$(mktemp -d)
+trap 'rm -rf -- "$check_state"' EXIT
+export XDG_CONFIG_HOME="$check_state/config"
+export XDG_CACHE_HOME="$check_state/cache"
+export XDG_STATE_HOME="$check_state/state"
+export PYTHONDONTWRITEBYTECODE=1
+
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ruff check .
 ruff format --check .
@@ -160,3 +168,10 @@ if find . -type d -name __pycache__ -print -quit | grep -q .; then
     echo "unexpected __pycache__ directory" >&2
     exit 1
 fi
+
+python3 scripts/check-installed --self-test
+python3 scripts/check-public-contract --self-test
+python3 scripts/check-installed-artifact --self-test
+
+ruff check scripts/check-installed scripts/check-public-contract scripts/check-installed-artifact scripts/managed-selection-rollback
+ruff format --check scripts/check-installed scripts/check-public-contract scripts/check-installed-artifact scripts/managed-selection-rollback

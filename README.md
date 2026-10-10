@@ -177,3 +177,7 @@ See [suite ownership](docs/SUITE_INTEGRATION.md),
 [configuration](examples/config.toml) and [icon provenance](ASSETS.md).
 The separate [consumer execution record](docs/observer-v2-execution.md) tracks
 source, packaged and native gates after Observer's independent acceptance.
+
+Project-owned artifact, cache-profile and selector rollback checks are in
+[managed operations](docs/managed-operations.md). Historical deployment records
+retain their original release scope.

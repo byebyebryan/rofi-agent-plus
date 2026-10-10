@@ -1,0 +1,36 @@
+{
+  "manifestVersion": 1,
+  "selection": "unpublished_provisional_pilot",
+  "hosts": [
+    "snap",
+    "starship"
+  ],
+  "plus": {
+    "version": "0.14.0a1",
+    "sourceRevision": "90e5b4fa49bace6d4d1d09be833f88faadea0246",
+    "wheel": "rofi_agent_plus-0.14.0a1-py3-none-any.whl",
+    "wheelSha256": "8ba19a0eba87944aec2848542fb3ddcb91f3ccc33790ba42565928e18daa497b",
+    "prefix": ".local/share/rofi-agent-plus/0.14.0a1-8ba19a0eba87944a",
+    "entries": [
+      "rofi-agent-plus",
+      "rofi-agent-plus-rofi"
+    ]
+  },
+  "plusObserverDependency": {
+    "version": "0.2.0a3",
+    "sourceRevision": "222c5bfab3c9740292a98ea6a7adc28ce8a7d8f1",
+    "wheel": "agent_observer-0.2.0a3-py3-none-any.whl",
+    "wheelSha256": "6aa793e6a0ba5ae37403f73999ea6e6d56bc8c21e5e4c7a10ac52cb946a45a3f",
+    "prefix": ".local/share/agent-observer/0.2.0a3-6aa793e6a0ba5ae3",
+    "entries": [
+      "agent-observer",
+      "agent-observer-write"
+    ]
+  },
+  "schemas": {
+    "snapshot": 2,
+    "watch": 2,
+    "write": 1,
+    "plusCache": 7
+  }
+}
