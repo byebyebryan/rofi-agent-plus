@@ -189,7 +189,7 @@ class CacheStoreTests(unittest.TestCase):
             mesh_revision="sha256:" + "a" * 64,
         )
         rows = build_rows(self.store.load())
-        self.assertTrue(any("Claude Code missing" in row.display for row in rows))
+        self.assertTrue(any("Claude missing" in row.display for row in rows))
         self.assertTrue(any("inventory partial" in row.display for row in rows))
 
     def test_per_host_callback_publishes_before_the_fleet_finishes(self):
@@ -328,7 +328,7 @@ class PickerRowsTests(unittest.TestCase):
             claude_row = next(
                 row for row in rows if row.target and row.target.key.provider == "claude"
             )
-            self.assertEqual(claude_row.display, "Starship · Claude Code · Default")
+            self.assertEqual(claude_row.display, "Starship · Claude · Default")
         record, window = self.live_record()
         rows = build_rows(
             self.snapshot_store.load(),

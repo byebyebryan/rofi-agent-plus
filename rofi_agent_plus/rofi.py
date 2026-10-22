@@ -41,7 +41,7 @@ ACTION_ADDITIONAL = "additional"
 _HEX_64 = re.compile(r"[a-f0-9]{64}\Z", re.ASCII)
 _HEX_32 = re.compile(r"[a-f0-9]{32}\Z", re.ASCII)
 _ACTIONS = {ACTION_OPEN, ACTION_ADDITIONAL}
-_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude Code"}
+_PROVIDER_NAMES = {"codex": "Codex", "claude": "Claude"}
 _ACTIVE_STATES = {"reserved", "dispatching", "opening", "live", "uncertain"}
 _STALE_FOCUS_CODES = {
     "instance_missing",
