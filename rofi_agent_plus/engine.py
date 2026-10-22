@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "0.15.0a7"
+VERSION = "0.15.0a8"
 
 
 class PickerError(RuntimeError):

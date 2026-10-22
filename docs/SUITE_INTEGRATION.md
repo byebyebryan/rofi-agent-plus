@@ -99,7 +99,7 @@ reused window ID cannot retarget an action.
 Open on an instance revalidates and focuses that exact instance without a host
 or provider probe. If the row is stale, it reports and refreshes; it never
 launches as a fallback. Open on a target validates a fresh EntryReference and
-dispatches one TUI. Tab selects **Open another window**, which creates a
+dispatches one TUI. Tab selects **New window**, which creates a
 separate native manager client with its own terminal state. One callback replay
 uses one request ID and resolves to the same instance; a deliberate new action
 gets a new ID. Dispatch intent is durable before spawning. Uncertain dispatch
@@ -110,7 +110,7 @@ the picker has no Close, batch or conversation action.
 | --- | --- |
 | Up / Down | Select a row |
 | Enter | Open a target or focus the exact selected window |
-| Tab / Shift+Tab | Cycle Open / Open another window |
+| Tab / Shift+Tab | Cycle Open / New window |
 | Alt+R | Refresh the bounded catalog before redraw |
 | Left / Right, Ctrl+B / Ctrl+F | Edit the search text using native Rofi cursor bindings |
 | Escape / Ctrl+G | Cancel and close the picker |
@@ -190,7 +190,7 @@ direct environment picker or has direct-window coverage:
 | Observer snapshot, provider-private readers, native action plans and write execution | Obsolete. `host.py` exposes passive capability/status inventory plus fresh native entry; `test_direct_host.py` and `test_direct_transport.py` cover host, self-identity, validation, route and shell-quoting boundaries. |
 | Observer/session runtime identity and conversation-to-window association | Replaced by `TargetKey`, `EntryReference`, random instance ID, desktop generation and process-birth/window validation; `test_direct_host.py`, `test_direct_desktop_registry.py` and `test_direct_actions.py` cover these identities and stale/replay cases. Conversation binding remains unsupported. |
 | Tmux ownership, deferred attach, viewer launch and cleanup | Obsolete. `desktop.py`, `viewer.py`, `actions.py` and `registry.py` own one direct Kitty client and retire it when its foreground provider client exits. `test_direct_desktop_registry.py` and `test_direct_actions.py` cover lifetime, dispatch gaps and exact focus. |
-| Batch open/resume/close and batch workers | Obsolete. Each explicit Open another window is an independent user request; no batch command or worker remains. Rofi dispatch/replay and row behavior are covered in `test_direct_ui.py` and `test_direct_actions.py`. |
+| Batch open/resume/close and batch workers | Obsolete. Each explicit New window is an independent user request; no batch command or worker remains. Rofi dispatch/replay and row behavior are covered in `test_direct_ui.py` and `test_direct_actions.py`. |
 | Old cache schemas, Viewer preferences and asynchronous session refresh workers | Not migrated. New bounded direct-v1 cache/preferences and finite dialog-owned refresh are covered by `test_direct_ui.py`; `test_direct_bounds.py` covers oversized, timed-out and descendant-held process output. |
 
 `test_direct_host.py`, `test_direct_transport.py`,

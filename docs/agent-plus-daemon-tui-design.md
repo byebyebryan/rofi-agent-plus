@@ -225,7 +225,7 @@ used when meaningful, otherwise the label is `Window N`. Control characters
 and markup are escaped. A title is presentation text, not a claimed current
 conversation binding.
 
-| Selected row | Open | Open another window |
+| Selected row | Open | New window |
 | --- | --- | --- |
 | Existing TUI instance | Revalidate and focus that exact window | Launch another TUI for the same target |
 | Opening instance | Focus its window if available; otherwise show opening status | Launch another instance for the same target |
@@ -233,7 +233,7 @@ conversation binding.
 | Known target on an unavailable host | Existing windows remain focusable; a new launch requires fresh route/target validation | Same fresh validation |
 | Target whose launch contract is unsupported | Existing windows remain focusable; show the reason for a refused launch | Show the reason |
 
-Open another window creates a native client, not a new agent conversation.
+New window creates a native client, not a new agent conversation.
 The user chooses conversations in the native manager. Each desktop's list
 contains only its own windows, including windows connected to remote targets.
 Two desktops opening the same target receive separate native TUIs.
@@ -242,7 +242,7 @@ Two desktops opening the same target receive separate native TUIs.
 | --- | --- |
 | Up / Down | Select a row |
 | Enter | Run the visible action on that row |
-| Tab / Shift+Tab | Cycle Open and Open another window |
+| Tab / Shift+Tab | Cycle Open and New window |
 | Alt+R | Request a bounded inventory and window refresh |
 | Left / Right, Ctrl+B / Ctrl+F | Edit the search text through Rofi's native bindings |
 | Escape / Ctrl+G | Close the picker |
@@ -491,7 +491,7 @@ configuration, desktop binding or provider service.
 ## Review questions
 
 Product defaults proposed here are Niri/Kitty first, one all-host list, Open and
-Open another window as the two actions, normal terminal controls for closure,
+New window as the two actions, normal terminal controls for closure,
 and configured stopped environments remaining available for explicit launch.
 These complete the agreed direct-TUI and individual-row model for review.
 

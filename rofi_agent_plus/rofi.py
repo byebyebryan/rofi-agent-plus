@@ -564,7 +564,7 @@ def _selected_index(rows: tuple[PickerRow, ...], key: str | None) -> int | None:
 
 def _action_message(state: PickerState) -> str:
     labels = []
-    for action, text in ((ACTION_OPEN, "Open"), (ACTION_ADDITIONAL, "Open another window")):
+    for action, text in ((ACTION_OPEN, "Open"), (ACTION_ADDITIONAL, "New window")):
         label = html.escape(text, quote=False)
         if action == state.action:
             label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
@@ -584,7 +584,7 @@ def _render(
     select: bool,
     polling: bool = False,
 ) -> str:
-    prompt = "Open another window" if state.action == ACTION_ADDITIONAL else "Open"
+    prompt = "New window" if state.action == ACTION_ADDITIONAL else "Open"
     signatures = [(row.key, row.selectable, row.display, row.meta) for row in rows]
     revision = hashlib.sha256(json.dumps(signatures).encode()).hexdigest()
     index = _selected_index(rows, state.selected_key)

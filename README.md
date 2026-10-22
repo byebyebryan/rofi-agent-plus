@@ -154,12 +154,12 @@ has one launcher row. Provider and host status rows are not selectable.
 | --- | --- |
 | Up / Down | Select a row |
 | Enter | Open the selected target or focus the exact selected window |
-| Tab / Shift+Tab | Cycle between **Open** and **Open another window** |
+| Tab / Shift+Tab | Cycle between **Open** and **New window** |
 | Alt+R | Refresh the bounded host catalog before redraw |
 | Left / Right, Ctrl+B / Ctrl+F | Edit the search field using Rofi's native cursor bindings |
 | Escape / Ctrl+G | Close the picker |
 
-The action bar lists Open and Open another window, highlights the active action
+The action bar lists Open and New window, highlights the active action
 in blue and shows Enter/Tab hints, matching SSH Plus and Tmux Plus. Notices appear
 below it; quiet refreshes leave the action bar in place.
 
@@ -169,7 +169,7 @@ executable action. A title is not conversation identity. A missing/changed
 instance on Open produces a stale-selection notice and refresh; it never turns
 into a launch of another target. Focusing an existing row checks local Niri,
 process-generation and Kitty layout evidence and does not probe SSH or provider
-status. Open another window is the explicit action that creates another native
+status. New window is the explicit action that creates another native
 client for that target. Normal terminal controls close it; the provider daemon
 and worker lifetime are independent.
 
