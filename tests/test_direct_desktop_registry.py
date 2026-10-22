@@ -317,21 +317,39 @@ class DesktopTests(unittest.TestCase):
     def test_private_layout_requires_expected_foreground_and_single_pane(self):
         with tempfile.TemporaryDirectory() as directory:
             control = Path(directory) / "control.sock"
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            with (
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server,
+                patch(
+                    "rofi_agent_plus.desktop.kitty_control_command",
+                    return_value=["/fixture/kitten", "@", "ls"],
+                ),
+            ):
                 server.bind(str(control))
                 process = observe_process(os.getpid())
                 pane = {"pid": process.pid, "foreground_processes": [{"pid": process.pid}]}
                 layout = [{"tabs": [{"windows": [pane]}]}]
                 with patch("rofi_agent_plus.desktop.run_json", return_value=layout):
                     validate_kitty_layout(control, process, process)
-                for invalid in (
-                    [{"tabs": [{"windows": [pane, pane]}]}],
-                    [{"tabs": [{"windows": [pane]}, {"windows": [pane]}]}],
-                    [{"tabs": [{"windows": [{"pid": process.pid, "foreground_processes": []}]}]}],
+                for invalid, reason in (
+                    ([{"tabs": [{"windows": [pane, pane]}]}], "ambiguous_terminal_layout"),
+                    (
+                        [{"tabs": [{"windows": [pane]}, {"windows": [pane]}]}],
+                        "ambiguous_terminal_layout",
+                    ),
+                    (
+                        [
+                            {
+                                "tabs": [
+                                    {"windows": [{"pid": process.pid, "foreground_processes": []}]}
+                                ]
+                            }
+                        ],
+                        "foreground_client_changed",
+                    ),
                 ):
                     with (
                         patch("rofi_agent_plus.desktop.run_json", return_value=invalid),
-                        self.assertRaises(DesktopError),
+                        self.assertRaisesRegex(DesktopError, reason),
                     ):
                         validate_kitty_layout(control, process, process)
 
