@@ -82,11 +82,13 @@ remote login or provider connectivity.
 
 The list spans current Mesh hosts in Mesh order, with targets ordered by
 provider and canonical home. Each target with no registered TUI has one
-selectable launcher row. Each target with registered TUIs has one selectable
-row per instance, adjacent in stable ordinal order, and no launcher row. A
-title is sanitized display/search text only; it is never an identity or an
-action input. Host/provider status lines are nonselectable. Registered local
-windows remain visible when their source host is offline or removed.
+selectable launcher row when its native manager is supported. Each target with
+registered TUIs has one selectable row per instance, adjacent in stable ordinal
+order, and no launcher row. Starting, opening and uncertain instances retain
+their typed row identity and show their current status. A title is sanitized
+display/search text only; it is never an identity or an action input.
+Host/provider status lines are nonselectable. Registered local windows remain
+visible when their source host is offline or removed.
 
 The initial supported desktop is Niri plus dedicated Kitty. Every launch has a
 random instance ID, desktop generation, expected process-birth handles and a
@@ -97,14 +99,17 @@ layout. Ambiguity or unavailable compositor evidence refuses focus. A title or
 reused window ID cannot retarget an action.
 
 Open on an instance revalidates and focuses that exact instance without a host
-or provider probe. If the row is stale, it reports and refreshes; it never
-launches as a fallback. Open on a target validates a fresh EntryReference and
-dispatches one TUI. Tab selects **New window**, which creates a
-separate native manager client with its own terminal state. One callback replay
-uses one request ID and resolves to the same instance; a deliberate new action
-gets a new ID. Dispatch intent is durable before spawning. Uncertain dispatch
-is reconciled without automatic retry. Normal terminal controls close windows;
-the picker has no Close, batch or conversation action.
+or provider probe. A starting, opening or uncertain instance refuses focus and
+shows a notice; a stale row reports and refreshes. Neither case launches as a
+fallback. Open on a target validates a fresh EntryReference and dispatches one
+TUI. Tab selects **New window**, which uses the selected row's validated
+target/reference to request a separate native manager client with its own
+terminal state. Unsupported or unavailable targets still refuse launch. One
+callback replay uses one request ID and resolves to the same instance; a
+deliberate new action gets a new ID. Dispatch intent is durable before
+spawning. Uncertain dispatch is reconciled without automatic retry. Normal
+terminal controls close windows; the picker has no Close, batch or conversation
+action.
 
 | Key | Behavior |
 | --- | --- |
@@ -121,20 +126,32 @@ not row text or search input. Redraw keeps the filter, action and selected
 identity when possible. Each new dialog opens with empty search and Open
 selected, restoring the last successful instance/target if still present.
 
-The first frame uses the launcher's supported `-selected-row` option and renders
-the saved catalog and current local windows immediately. Missing or stale
-catalog data starts one dialog-owned background refresh. Rofi reads published
-results only while that refresh is pending, preserving search, selected
-identity and action. Refresh progress is quiet whenever a selectable row is
-available; failures remain visible. Checks stop at completion or timeout.
-Alt+R refreshes explicitly, or joins the pending startup refresh.
+The first frame uses the launcher's supported `-selected-row` option and reads
+the saved catalog, current local windows and frozen window titles immediately.
+Missing or stale inventory starts one bounded passive refresh per private
+catalog. It can finish after a picker closes; reopening reads the latest cache and joins an
+in-flight refresh instead of starting a duplicate. The worker exits at its
+30-second deadline or when its work finishes, leaving no persistent service or
+polling loop. Alt+R joins pending work, or starts a refresh when none is active,
+then redraws from the completed cache.
+
+An empty list checks the published cache at most twice per second and fills as
+soon as selectable rows arrive. Checks stop on the first usable row or when
+refresh completes or reaches its deadline; an armed timer is disabled so
+navigation remains responsive. Refresh results do not trigger automatic
+redraws when usable rows are already shown. Progress is hidden whenever a
+selectable row is available. Published host/provider failures appear
+on an explicit callback or reopen; they do not appear live while a usable list
+is idle.
 
 The fleet deadline is 20 seconds, each host is bounded to 12 seconds, and at
-most four host workers run concurrently. Host results publish and redraw as
-they complete. Ordinary redraws read only local Niri, registry/process and
-cache state; no watcher remains after discovery. Closing the dialog cancels
-unfinished passive probes, while accepted native TUI windows outlive it.
-Mosh, Ghostty and manual TUI adoption remain unsupported.
+most four host workers run concurrently. Host results publish to the cache as
+they complete, retaining valid siblings and last-known targets with their
+original observation times after partial failure. Explicit actions may read the
+latest published cache; titles remain sampled once for the open dialog. Local
+redraws read only Niri, registry/process and cache state. Accepted native TUI
+windows outlive the picker. Mosh, Ghostty and manual TUI adoption remain
+unsupported.
 
 ## Configuration and private state
 
@@ -177,7 +194,8 @@ record.
 | Config file / declarations | 256 KiB / 128 entries; selector path 4096 characters; label 256 characters |
 | Active runtime records | 512 per target; request and tombstone lookup is exact and bounded |
 | Rofi callback state / initial frame | 16 KiB / 16 MiB |
-| Catalog refresh / compositor request | 20 seconds / 1 second; startup refresh is asynchronous, Alt+R waits unless joining startup |
+| Passive startup worker | 30-second overall deadline; fleet probes are bounded to 20 seconds |
+| Catalog refresh / Alt+R join / compositor request | 20 seconds for a new refresh / up to the worker's remaining 30-second deadline when joining / 1 second |
 
 These bounds limit work and parsing; an interactive native manager or SSH
 authentication prompt is intentionally not given an inventory timeout.

@@ -36,22 +36,26 @@ if sys.argv[1] == "callback":
     )
     title = "Keep Work " + ["⠋", "⠙", "⠹", "⠸"][tick % 4]
     window = Window(1, 42, "org.agentplus." + "b" * 32, title, False)
+    rendered_rows = []
 
     def build_rows(_snapshot, **kwargs):
         if variant == "cold" and not (root / "publish").exists():
-            return (_status_row("Discovering inventory"),)
-        title = kwargs["windows"][0].title
-        return tuple(
-            PickerRow("target", "t:" + k * 64, label, label, target_id=k * 64, selectable=True)
-            for k, label in [
-                ("a", "Keep A"),
-                ("b", title),
-                ("c", "Keep C"),
-                ("d", "Other D"),
-                ("e", "Other E"),
-                ("f", "Other F"),
-            ]
-        )
+            rows = (_status_row("Discovering inventory"),)
+        else:
+            title = kwargs["windows"][0].title
+            rows = tuple(
+                PickerRow("target", "t:" + k * 64, label, label, target_id=k * 64, selectable=True)
+                for k, label in [
+                    ("a", "Keep A"),
+                    ("b", title),
+                    ("c", "Keep C"),
+                    ("d", "Other D"),
+                    ("e", "Other E"),
+                    ("f", "Other F"),
+                ]
+            )
+        rendered_rows[:] = rows
+        return rows
 
     context = SimpleNamespace(
         env={TITLES_ENV: str(root / TITLES_NAME)},
@@ -95,6 +99,7 @@ if sys.argv[1] == "callback":
         "oldRestore": _parse_state(os.environ.get("ROFI_DATA")).restore_selection,
         "new": json.loads(data)["selectedKey"],
         "restore": json.loads(data)["restoreSelection"],
+        "selectableRows": sum(row.selectable for row in rendered_rows),
         "select": next(
             (
                 line
@@ -202,8 +207,6 @@ process = subprocess.Popen(
         "1",
         "-kb-custom-7",
         "Tab",
-        "-kb-custom-19",
-        "F10",
         "-kb-element-next",
         "",
         "-kb-element-prev",
@@ -218,9 +221,25 @@ try:
     time.sleep(0.25)
     if variant == "cold":
         (root / "publish").write_text("ready")
-        key("F10")
-        wait(lambda: any(e["retv"] == 28 for e in events()))
-        time.sleep(0.2)
+        # No key drives this transition. The empty-list idle timeout must read
+        # the newly published rows and then disarm itself.
+        ready_event = wait(
+            lambda: next(
+                (
+                    event
+                    for event in events()
+                    if event["retv"] == 28 and event["selectableRows"] > 0
+                ),
+                None,
+            )
+        )
+    else:
+        ready_event = wait(
+            lambda: next(
+                (event for event in events() if event["selectableRows"] > 0),
+                None,
+            )
+        )
     probes = []
     for index in range(3):
         time.sleep(0.9)
@@ -247,8 +266,12 @@ try:
     receipt = {
         "package": str(package_file),
         "variant": variant,
+        "rowsLoadedByRetv": ready_event["retv"],
         "probes": probes,
         "events": len(events()),
+        "automaticCallbacksAfterRows": sum(
+            event["retv"] == 28 and event["started"] > ready_event["started"] for event in events()
+        ),
         "display": env["DISPLAY"],
         "desktopInput": 0,
         "providerActions": 0,
@@ -259,6 +282,8 @@ try:
     # probe. It catches blocked input without treating it as paint latency.
     assert all(p["observedAfterMs"] < 500 for p in probes), receipt
     assert sum(e["retv"] == 28 for e in events()) == (1 if variant == "cold" else 0), receipt
+    assert receipt["rowsLoadedByRetv"] == (28 if variant == "cold" else 0), receipt
+    assert receipt["automaticCallbacksAfterRows"] == 0, receipt
     (root / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt))
     key("Escape")

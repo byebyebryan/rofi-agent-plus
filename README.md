@@ -146,9 +146,11 @@ fallback applies.
 
 The picker shows a flat list across configured hosts. Host Mesh order is kept;
 targets sort by provider and canonical home; window rows for one target stay
-adjacent in ordinal order. A target with one or more registered windows has one
-row per window and no extra launcher row. A target with no registered window
-has one launcher row. Provider and host status rows are not selectable.
+adjacent in ordinal order. A target with registered instances has one
+selectable row per instance, including rows marked starting, opening or
+presence uncertain, and no extra launcher row. A target with no instance has
+one launcher row when its native manager is supported. Provider and host status
+rows are not selectable.
 
 | Key | Behavior |
 | --- | --- |
@@ -167,44 +169,46 @@ Search covers host, provider, environment label and current window title. Titles
 are sanitized and escaped for display; no title or typed search text enters an
 executable action. A title is not conversation identity. A missing/changed
 instance on Open produces a stale-selection notice and refresh; it never turns
-into a launch of another target. Focusing an existing row checks local Niri,
-process-generation and Kitty layout evidence and does not probe SSH or provider
-status. New window is the explicit action that creates another native
-client for that target. Normal terminal controls close it; the provider daemon
-and worker lifetime are independent.
+into a launch of another target. Open on a starting, opening or uncertain
+instance refuses focus and explains that New window can open another instance.
+Focusing a live row checks local Niri, process-generation and Kitty layout
+evidence and does not probe SSH or provider status. New window uses the
+selected row's validated target and reference to request another native
+client. Unsupported or unavailable targets still refuse launch. Normal
+terminal controls close a client; provider daemon and worker lifetime are
+independent.
 
-Opening the dialog immediately uses the saved catalog and current local windows.
-If the catalog is missing or stale, the launcher starts one background refresh
-after launching Rofi. A usable cached list stays steady while discovery updates
-the cache; it has no automatic redraw callbacks during navigation. Reopening or
-Alt+R loads the new results. An empty list checks for published results until
-usable rows appear, the refresh finishes, or its deadline expires. Refreshing is
-silent whenever the list has a selectable target or window; progress appears
-only for an empty list, and failures remain visible. Native search retains the
-flat host/environment/window order. Window titles are sampled once per open
-picker, including their search text; reopening samples them again. Leading
-spinner/status icons are omitted from the displayed and searchable title. Animated
-native titles therefore cannot start repeated selection corrections during
-discovery. Window presence and action validation still use current identities.
-Selection correction runs only when rows
-through the selected row change, so later additions need no extra callback.
-Once a correction starts, changing titles cannot restart it; another change
-to row positions or eligibility can. Empty-list checks run at most twice per
-second while pending, then stop as soon as selectable rows appear. Already
-armed timers are also disarmed when checks stop, so the next arrow key remains
-available for navigation.
-Fresh catalogs need no
-background work. Alt+R explicitly refreshes before redrawing, or waits for an
-already pending startup refresh and loads its completed results. The fleet deadline is 20 seconds, with
-12 seconds per host and at most four concurrent host workers. Each host result
-publishes to the cache as it arrives, retaining valid siblings and last-known
-targets with their original observation times after partial failure; the
-an empty picker can show its first usable result without waiting for slower peers. A complete current inventory
-may remove a missing target; registered windows remain listed from the private
-desktop registry. Local redraws do not probe providers. The startup timeout only
-reads published state while an empty list waits for its first usable rows; there is no ongoing polling
-after completion. Unfinished startup probes are cancelled when the dialog exits,
-while accepted native windows outlive the picker.
+Opening the dialog immediately reads the saved catalog and current local
+windows. Missing or stale inventory starts one bounded passive refresh per
+private catalog. It may finish after the picker closes; reopening reads the
+latest cache and joins that refresh instead of starting a duplicate. Alt+R joins pending
+work, or starts a refresh when none is active, then redraws from the completed
+cache. The worker has a 30-second deadline, uses bounded host probes, and exits
+when its work finishes; no persistent service or polling loop remains.
+
+A usable list stays on screen while passive discovery updates the cache;
+refresh results do not trigger automatic redraw callbacks. An empty list checks
+for published results at most twice per second and fills in as soon as
+selectable rows appear. Those checks stop when a usable row appears or refresh
+completes or reaches its deadline, and any armed timer is disabled so the next
+arrow key remains available. Progress stays hidden while selectable rows
+exist. Published host/provider failures appear on an explicit
+callback or reopen; an idle usable list does not redraw to show them. Each host
+result publishes to the cache as it arrives, retaining valid siblings and
+last-known targets with their original observation times after partial failure.
+A complete current inventory may remove a missing target; registered windows
+remain listed from the private desktop registry. Local redraws do not probe
+providers.
+
+Native search retains the flat host/environment/window order. Window titles are
+sampled once per open picker, including their search text; reopening samples
+them again. Leading spinner/status icons are omitted from the displayed and
+searchable title. Animated native titles therefore cannot start repeated
+selection corrections during discovery. Window presence and action validation
+still use current identities. Selection correction runs only when rows through
+the selected row change, so later additions need no extra callback. Once a
+correction starts, changing titles cannot restart it; another change to row
+positions or eligibility can.
 
 ## Identity and bounded resources
 
@@ -236,7 +240,8 @@ private and versioned; cache data is never launch authority.
 | Local catalog | 8 MiB, at most 256 host records |
 | Active registrations | 512 per target; terminal tombstones do not consume active capacity |
 | Picker callback state / first frame | 16 KiB / 16 MiB |
-| Startup/Alt+R catalog refresh / Niri request | 20 seconds / 1 second; startup is asynchronous, Alt+R waits, including when joining startup |
+| Passive startup worker | 30-second overall deadline; its fleet probe is bounded to 20 seconds |
+| Alt+R refresh / join / Niri request | 20 seconds for a new refresh / up to the worker's remaining 30-second deadline when joining / 1 second |
 
 ## Source, artifact and native checks
 

@@ -326,6 +326,7 @@ class PickerRowsTests(unittest.TestCase):
         directory = self.root / "dialog"
         directory.mkdir(mode=0o700)
         refresh = StartupRefresh(directory, Path("/unused"), {})
+        self.addCleanup(refresh.close)
         env = dict(refresh.env, **{TITLES_ENV: str(directory / TITLES_NAME)})
         desktop = FakeDesktop(self.generation, (window,))
         transport = FakeTransport()
@@ -473,25 +474,46 @@ class PickerRowsTests(unittest.TestCase):
             any("not in current Host Mesh" in row.display for row in rows if row.kind == "status")
         )
 
-    def test_non_live_instances_and_provider_status_are_nonselectable(self):
-        record, _ = self.registry.reserve(
-            target_id=self.target_id,
-            target=self.target.wire,
-            reference=self.reference.wire,
-            request_id="2" * 32,
-            additional=True,
-            owner=self.owner,
-            transport={"schemaVersion": 1, "kind": "local"},
+    def test_starting_opening_and_uncertain_instances_remain_typed_selectable_rows(self):
+        records = []
+        for index, state in enumerate(("reserved", "opening", "uncertain"), start=2):
+            record, _ = self.registry.reserve(
+                target_id=self.target_id,
+                target=self.target.wire,
+                reference=self.reference.wire,
+                request_id=str(index) * 32,
+                additional=True,
+                owner=self.owner,
+                transport={"schemaVersion": 1, "kind": "local"},
+            )
+            if state != "reserved":
+                record = self.registry.update(self.target_id, record.instance_id, state=state)
+            records.append(record)
+
+        # Avoid reconciliation here so the fixture retains all three exact
+        # registry states while the presentation contract is checked.
+        rows = build_rows(self.snapshot, registry=self.registry, desktop=None, windows=())
+        instances = [row for row in rows if row.target_id == self.target_id]
+        self.assertEqual(
+            [row.record.state for row in instances], ["reserved", "opening", "uncertain"]
         )
-        rows = build_rows(
-            self.snapshot, registry=self.registry, desktop=FakeDesktop(self.generation), windows=()
+        self.assertEqual([row.instance_id for row in instances], [r.instance_id for r in records])
+        for row, record in zip(instances, records, strict=True):
+            self.assertEqual(row.kind, "instance")
+            self.assertTrue(row.selectable)
+            self.assertEqual(
+                row.info,
+                {
+                    "schemaVersion": 1,
+                    "kind": "instance",
+                    "targetId": self.target_id,
+                    "instanceId": record.instance_id,
+                },
+            )
+        self.assertFalse(
+            any(row.kind == "target" and row.target_id == self.target_id for row in rows)
         )
-        row = next(item for item in rows if item.instance_id == record.instance_id)
-        self.assertFalse(row.selectable)
-        frame = __import__("rofi_agent_plus.rofi", fromlist=["_render"])._render(
-            rows, PickerState(request_id="f" * 32), preserve=True, select=False
-        )
-        self.assertIn("nonselectable\x1ftrue", frame)
+        self.assertTrue(any(row.kind == "status" and not row.selectable for row in rows))
 
 
 class FakeActions:
@@ -675,6 +697,7 @@ class PickerCallbackTests(unittest.TestCase):
         directory = self.root / "launch"
         directory.mkdir(mode=0o700)
         refresh = StartupRefresh(directory, Path("/unused"), {})
+        self.addCleanup(refresh.close)
         rows = build_rows(self.snapshot)
         selected = next(row for row in rows if row.target_id != self.target_id and row.selectable)
         state = PickerState(
@@ -716,6 +739,7 @@ class PickerCallbackTests(unittest.TestCase):
         directory = self.root / "launch"
         directory.mkdir(mode=0o700)
         refresh = StartupRefresh(directory, Path("/unused"), {})
+        self.addCleanup(refresh.close)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             run_rofi(dict(refresh.env, ROFI_RETV="0"), context=context)
@@ -741,6 +765,7 @@ class PickerCallbackTests(unittest.TestCase):
         directory = self.root / "launch"
         directory.mkdir(mode=0o700)
         refresh = StartupRefresh(directory, Path("/unused"), {})
+        self.addCleanup(refresh.close)
         env = {"ROFI_RETV": "0", STATUS_ENV: str(refresh.path)}
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -772,6 +797,7 @@ class PickerCallbackTests(unittest.TestCase):
         directory = self.root / "launch"
         directory.mkdir(mode=0o700)
         refresh = StartupRefresh(directory, Path("/unused"), {})
+        self.addCleanup(refresh.close)
         value = self.inventory.to_json()
         value["targets"][0]["label"] = "Newly discovered environment"
         fresh = parse_inventory(value)
@@ -1054,6 +1080,294 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertEqual(actions.focuses, [])
         self.assertEqual(transport.calls, 1)
         self.assertIn("Selection is stale", output.getvalue())
+
+    def test_open_on_nonlive_instance_refuses_focus_without_launch_fallback(self):
+        from contextlib import redirect_stdout
+
+        from rofi_agent_plus.actions import Actions
+
+        record, _ = self.registry.reserve(
+            target_id=self.target_id,
+            target=self.target.wire,
+            reference=self.reference.wire,
+            request_id="6" * 32,
+            additional=False,
+            owner=self.owner,
+            transport={"schemaVersion": 1, "kind": "local"},
+        )
+        context, _refresh_transport, _fake_actions = self._context()
+
+        class NoDispatchTransport:
+            pin_calls = 0
+
+            def pin_entry(self, _host_id):
+                self.pin_calls += 1
+                raise AssertionError("Open on a nonlive instance must not launch")
+
+        transport = NoDispatchTransport()
+        context.transport = transport
+        context.actions = Actions(
+            context.desktop,
+            self.registry,
+            transport,
+            terminal=("kitty",),
+            env=context.env,
+        )
+        row = next(
+            item
+            for item in build_rows(
+                self.snapshot,
+                registry=self.registry,
+                desktop=None,
+                windows=(),
+            )
+            if item.instance_id == record.instance_id
+        )
+        self.assertTrue(row.selectable)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": _state_json(
+                            PickerState(selected_key=row.key, request_id="7" * 32)
+                        ),
+                        "ROFI_INFO": json.dumps(row.info),
+                    },
+                    context=context,
+                ),
+            )
+
+        self.assertIn("still opening or its presence is uncertain", output.getvalue())
+        self.assertIn("choose New window", output.getvalue())
+        self.assertEqual(transport.pin_calls, 0)
+        self.assertEqual(len(self.registry.records(self.target_id)), 1)
+
+    def test_orphaned_dispatch_remains_uncertain_and_new_window_replay_is_idempotent(self):
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from rofi_agent_plus.actions import Actions
+        from rofi_agent_plus.transport import PinnedTransport
+
+        # The picker died in the spawn gap. Its PID still exists in this test,
+        # but the saved process generation does not, and no child identities
+        # were persisted before that death.
+        orphan_owner = replace(self.owner, start_ticks=str(int(self.owner.start_ticks) + 1))
+        orphan, _ = self.registry.reserve(
+            target_id=self.target_id,
+            target=self.target.wire,
+            reference=self.reference.wire,
+            request_id="8" * 32,
+            additional=False,
+            owner=orphan_owner,
+            transport={"schemaVersion": 1, "kind": "local"},
+        )
+        orphan = self.registry.update(self.target_id, orphan.instance_id, state="dispatching")
+        self.assertFalse(orphan_owner.alive())
+        self.assertTrue(
+            all(orphan.process(role) is None for role in ("terminal", "wrapper", "client"))
+        )
+
+        context, _transport, _fake_actions = self._context()
+
+        class PinTransport:
+            def __init__(inner_self):
+                inner_self.calls = 0
+
+            def pin_entry(inner_self, host_id):
+                self.assertEqual(host_id, self.target.key.host_id)
+                inner_self.calls += 1
+                return PinnedTransport(
+                    "local",
+                    host_id,
+                    "sha256:" + "a" * 64,
+                    helper="/usr/bin/rofi-agent-plus-host",
+                )
+
+        transport = PinTransport()
+        popen_calls = []
+
+        def launch(argv, **options):
+            # This stub proves the dispatch seam without starting a process.
+            popen_calls.append((list(argv), dict(options)))
+            return SimpleNamespace(pid=os.getpid())
+
+        context.actions = Actions(
+            context.desktop,
+            self.registry,
+            transport,
+            terminal=("kitty",),
+            env=context.env,
+            popen=launch,
+        )
+        row = next(
+            item
+            for item in build_rows(
+                self.snapshot,
+                registry=self.registry,
+                desktop=None,
+                windows=(),
+            )
+            if item.instance_id == orphan.instance_id
+        )
+        self.assertTrue(row.selectable)
+
+        with (
+            patch("rofi_agent_plus.desktop.shutil.which", return_value="/usr/bin/kitty"),
+            patch(
+                "rofi_agent_plus.actions._artifact_root",
+                return_value=Path(__file__).resolve().parents[1],
+            ),
+        ):
+            open_output = io.StringIO()
+            with redirect_stdout(open_output):
+                self.assertEqual(
+                    0,
+                    run_rofi(
+                        {
+                            "ROFI_RETV": "1",
+                            "ROFI_DATA": _state_json(
+                                PickerState(selected_key=row.key, request_id="7" * 32)
+                            ),
+                            "ROFI_INFO": json.dumps(row.info),
+                        },
+                        context=context,
+                    ),
+                )
+
+            # Normal Open reconciles through the real Registry path, preserves
+            # uncertainty, and refuses focus without pinning or dispatching.
+            self.assertIn("still opening or its presence is uncertain", open_output.getvalue())
+            self.assertIn("choose New window", open_output.getvalue())
+            uncertain = self.registry.records(self.target_id)
+            self.assertEqual(len(uncertain), 1)
+            self.assertEqual(uncertain[0].instance_id, orphan.instance_id)
+            self.assertEqual(uncertain[0].state, "uncertain")
+            self.assertEqual(transport.calls, 0)
+            self.assertEqual(popen_calls, [])
+
+            # Replaying the same explicit New window callback exercises the
+            # real Actions reservation and request-id lookup, not fake dedup.
+            new_env = {
+                "ROFI_RETV": "1",
+                "ROFI_DATA": _state_json(
+                    PickerState(
+                        selected_key=row.key,
+                        action="additional",
+                        request_id="9" * 32,
+                    )
+                ),
+                "ROFI_INFO": json.dumps(row.info),
+            }
+            new_output = io.StringIO()
+            with redirect_stdout(new_output):
+                for _ in range(2):
+                    self.assertEqual(0, run_rofi(new_env, context=context))
+
+        records = self.registry.records(self.target_id)
+        self.assertEqual(len(records), 2)
+        retained = next(item for item in records if item.instance_id == orphan.instance_id)
+        created = next(item for item in records if item.instance_id != orphan.instance_id)
+        self.assertEqual(retained.state, "uncertain")
+        self.assertIsNone(retained.process("terminal"))
+        self.assertEqual(created.value["requestId"], "9" * 32)
+        self.assertEqual(created.state, "opening")
+        self.assertEqual(created.process("terminal"), self.owner)
+        replay = self.registry.find_request(self.target_id, "8" * 32)
+        self.assertIsNotNone(replay)
+        self.assertEqual(replay.instance_id, orphan.instance_id)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(popen_calls), 1)
+
+    def test_new_window_refuses_unavailable_target_even_with_selectable_instance(self):
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+
+        from rofi_agent_plus.actions import Actions
+        from rofi_agent_plus.model import LaunchCapability
+
+        unavailable = replace(
+            self.target,
+            capability=LaunchCapability("unavailable", "native_manager_missing"),
+        )
+        hosts = []
+        for host in self.snapshot.hosts:
+            providers = []
+            for provider in host.providers:
+                targets = tuple(
+                    unavailable if target.key.identity == self.target.key.identity else target
+                    for target in provider.targets
+                )
+                providers.append(replace(provider, targets=targets))
+            hosts.append(replace(host, providers=tuple(providers)))
+        unavailable_snapshot = replace(self.snapshot, hosts=tuple(hosts))
+        record, _ = self.registry.reserve(
+            target_id=self.target_id,
+            target=unavailable.wire,
+            reference=self.reference.wire,
+            request_id="a" * 32,
+            additional=False,
+            owner=self.owner,
+            transport={"schemaVersion": 1, "kind": "local"},
+        )
+        context, _refresh_transport, _fake_actions = self._context()
+        context.cache = SimpleNamespace(load=lambda: unavailable_snapshot)
+
+        class NoDispatchTransport:
+            pin_calls = 0
+
+            def pin_entry(self, _host_id):
+                self.pin_calls += 1
+                raise AssertionError("Unavailable targets must fail before transport pinning")
+
+        transport = NoDispatchTransport()
+        context.transport = transport
+        context.actions = Actions(
+            context.desktop,
+            self.registry,
+            transport,
+            terminal=("kitty",),
+            env=context.env,
+        )
+        row = next(
+            item
+            for item in build_rows(
+                unavailable_snapshot,
+                registry=self.registry,
+                desktop=None,
+                windows=(),
+            )
+            if item.instance_id == record.instance_id
+        )
+        self.assertTrue(row.selectable)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {
+                        "ROFI_RETV": "1",
+                        "ROFI_DATA": _state_json(
+                            PickerState(
+                                selected_key=row.key,
+                                action="additional",
+                                request_id="b" * 32,
+                            )
+                        ),
+                        "ROFI_INFO": json.dumps(row.info),
+                    },
+                    context=context,
+                ),
+            )
+
+        self.assertIn("entry unavailable", output.getvalue())
+        self.assertIn("not currently launchable", output.getvalue())
+        self.assertEqual(transport.pin_calls, 0)
+        self.assertEqual(len(self.registry.records(self.target_id)), 1)
 
     def test_typed_custom_input_is_inert_and_does_not_refresh(self):
         context, transport, actions = self._context()

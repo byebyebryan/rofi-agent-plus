@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -129,7 +129,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ROFI_")}
     output = io.StringIO()
     try:
-        with TemporaryDirectory(prefix="rofi-agent-plus-launch-") as temporary:
+        with (
+            TemporaryDirectory(prefix="rofi-agent-plus-launch-") as temporary,
+            ExitStack() as cleanup,
+        ):
             directory = Path(temporary)
             frame_path = directory / "initial-frame"
             environment[TITLES_ENV] = str(directory / TITLES_NAME)
@@ -139,8 +142,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             except CacheError:
                 snapshot = None
             refresh = None
-            if snapshot is None or snapshot.is_stale(context.config.desktop.catalog_ttl_seconds):
-                refresh = StartupRefresh(directory, executable, environment)
+            candidate = StartupRefresh(
+                context.cache.root,
+                executable,
+                environment,
+                only_join=snapshot is not None
+                and not snapshot.is_stale(context.config.desktop.catalog_ttl_seconds),
+            )
+            cleanup.callback(candidate.close)
+            if candidate.active:
+                refresh = candidate
                 environment[STATUS_ENV] = str(refresh.path)
             with passive_probe_signals(), redirect_stdout(output):
                 run_rofi(dict(environment, ROFI_RETV="0"), context=context)
@@ -174,8 +185,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 130
             finally:
                 _stop_rofi(rofi)
-                if refresh is not None:
-                    refresh.stop()
     except (OSError, ValueError) as error:
         print(f"rofi-agent-plus-rofi: {error}", file=sys.stderr)
         return 1

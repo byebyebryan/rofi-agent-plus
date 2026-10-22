@@ -44,6 +44,9 @@ class FakeProcess:
 class LauncherTest(unittest.TestCase):
     def setUp(self):
         self.context = mock.Mock()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.context.cache.root = Path(self.temporary.name) / "cache"
         self.context.cache.load.return_value.is_stale.return_value = False
         patcher = mock.patch.object(launcher, "build_context", return_value=self.context)
         patcher.start()
@@ -187,7 +190,7 @@ class LauncherTest(unittest.TestCase):
             self.assertEqual(1, launcher.main(["-show", "agent-plus"]))
         self.assertFalse(frames[0].exists())
 
-    def test_stale_open_launches_rofi_before_refresh_and_cancels_owned_helper(self):
+    def test_stale_open_launches_rofi_before_refresh_and_leaves_worker_running(self):
         from rofi_agent_plus.startup_refresh import STATUS_ENV, read_status
 
         self.context.cache.load.return_value.is_stale.return_value = True
@@ -215,9 +218,33 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(calls[0][0][0], "rofi")
         self.assertEqual(calls[1][0], ["/artifact/bin/agent", "_direct-refresh"])
         self.assertTrue(calls[1][2]["start_new_session"])
-        self.assertEqual(worker.signals, [signal.SIGTERM])
-        self.assertTrue(worker.waited)
-        self.assertFalse(Path(calls[0][1][STATUS_ENV]).exists())
+        self.assertEqual(worker.signals, [])
+        self.assertFalse(worker.waited)
+        self.assertTrue(Path(calls[0][1][STATUS_ENV]).exists())
+        self.assertEqual(self.context.cache.root, Path(calls[0][1][STATUS_ENV]).parent)
+        self.assertEqual(1, len(calls[1][2]["pass_fds"]))
+
+    def test_fresh_partial_cache_open_joins_existing_refresh_without_another_worker(self):
+        from rofi_agent_plus.startup_refresh import STATUS_ENV, StartupRefresh, read_status
+
+        owner = StartupRefresh(self.context.cache.root, Path("/artifact/bin/agent"), {})
+        self.addCleanup(owner.close)
+
+        def render(environment, **_kwargs):
+            self.assertEqual(str(owner.path), environment[STATUS_ENV])
+            self.assertTrue(read_status(environment).pending)
+            print("frame")
+
+        with (
+            mock.patch.object(
+                launcher, "_agent_executable", return_value=Path("/artifact/bin/agent")
+            ),
+            mock.patch.object(launcher, "run_rofi", side_effect=render),
+            mock.patch.object(launcher.subprocess, "Popen", return_value=FakeProcess()) as launch,
+        ):
+            self.assertEqual(0, launcher.main([]))
+        self.assertEqual(1, launch.call_count)
+        self.assertEqual("rofi", launch.call_args.args[0][0])
 
     def test_app_reuses_the_prepared_first_frame_without_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:

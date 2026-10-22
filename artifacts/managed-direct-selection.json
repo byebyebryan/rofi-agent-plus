@@ -5,10 +5,10 @@
     "snap",
     "starship"
   ],
-  "version": "0.15.0a12",
-  "wheel": "rofi_agent_plus-0.15.0a12-py3-none-any.whl",
-  "wheelSha256": "10dbb420c9bd75b6de353d77910ebce441e4947cd64e34f5fa5b19ca0ea8a08c",
-  "prefix": ".local/share/rofi-agent-plus/0.15.0a12-10dbb420c9bd75b6",
+  "version": "0.15.0a13",
+  "wheel": "rofi_agent_plus-0.15.0a13-py3-none-any.whl",
+  "wheelSha256": "7b4b361c304cbf37d6a683aef1ad38e0c736b22aaac042d585599f97ddc01e2c",
+  "prefix": ".local/share/rofi-agent-plus/0.15.0a13-7b4b361c304cbf37",
   "python": "3.11",
   "entryPoints": [
     "rofi-agent-plus",

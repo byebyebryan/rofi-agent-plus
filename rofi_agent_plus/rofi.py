@@ -391,8 +391,13 @@ def build_rows(
                             "uncertain": "presence uncertain",
                         }
                         detail = f"Window {number} · {labels.get(record.state, 'status unknown')}"
-                        kind = "instance-status"
-                        selectable = False
+                        # Keep the typed instance identity on every active row.
+                        # Open still asks Actions to focus the exact instance,
+                        # which refuses nonlive evidence; New window can use
+                        # the row's target/reference to request an additional
+                        # native client.
+                        kind = "instance"
+                        selectable = True
                     key = f"i:{target_id}:{record.instance_id}"
                     rows.append(
                         PickerRow(
@@ -767,7 +772,12 @@ def _handle_selection(
         )
     except ActionError as error:
         notice = f"{error.code.replace('_', ' ')} · {clean_text(error, limit=512)}"
-        if error.code in _STALE_FOCUS_CODES:
+        if error.code == "instance_not_live":
+            notice = (
+                "This window is still opening or its presence is uncertain; "
+                "choose New window to open another"
+            )
+        elif error.code in _STALE_FOCUS_CODES:
             notice = "Window selection is stale; refresh the local view and select again"
         return False, replace(state, notice=notice)
 

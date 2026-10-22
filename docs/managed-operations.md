@@ -1,6 +1,6 @@
 # Agent Plus managed operations
 
-The direct-TUI trial selects `0.15.0a12` on Starship and Snap. Its immutable
+The direct-TUI trial selects `0.15.0a13` on Starship and Snap. Its immutable
 wheel and selected hosts are recorded in
 [managed-direct-selection.json](../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
@@ -63,5 +63,8 @@ and the transition from an empty list:
     "$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$PRIVATE_COLD_PROOF" cold
 
 Each output path must be new. The proof sends arrows after idle intervals, checks
-that every arrow advances selection, and rejects any further background redraw
-once selectable rows are shown. Rofi, Xvfb, libX11 and libXtst are required.
+that every arrow advances selection, and rejects automatic timeout callbacks
+after selectable rows appear. The cold case publishes its rows and waits for
+Rofi's actual empty-list idle timeout to load them; no key input drives that
+transition. Tab callbacks only record selection over inert rows. Rofi, Xvfb,
+libX11 and libXtst are required.
