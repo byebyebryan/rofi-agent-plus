@@ -99,6 +99,9 @@ class LauncherTest(unittest.TestCase):
             frame_path = Path(env[launcher.INITIAL_FRAME_ENV])
             self.assertEqual(0o600, frame_path.stat().st_mode & 0o777)
             self.assertEqual(0o700, frame_path.parent.stat().st_mode & 0o777)
+            self.assertEqual(
+                frame_path.parent / launcher.TITLES_NAME, Path(env[launcher.TITLES_ENV])
+            )
             self.assertEqual(frame, launcher.initial_frame(dict(env, ROFI_RETV="0")))
             return rofi
 

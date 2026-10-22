@@ -315,6 +315,67 @@ class PickerRowsTests(unittest.TestCase):
         self.assertNotIn('"title </span>', frame)
         self.assertNotIn("bad</script>", json.dumps(instances[0].info))
 
+    def test_startup_spinner_changes_do_not_correct_over_user_navigation(self):
+        from contextlib import redirect_stdout
+
+        from rofi_agent_plus.rofi import _parse_state
+        from rofi_agent_plus.startup_refresh import StartupRefresh
+        from rofi_agent_plus.window_titles import TITLES_ENV, TITLES_NAME
+
+        record, window = self.live_record("⠋ Working")
+        directory = self.root / "dialog"
+        directory.mkdir(mode=0o700)
+        refresh = StartupRefresh(directory, Path("/unused"), {})
+        env = dict(refresh.env, **{TITLES_ENV: str(directory / TITLES_NAME)})
+        desktop = FakeDesktop(self.generation, (window,))
+        transport = FakeTransport()
+        context = PickerContext(
+            env,
+            DirectConfig(DesktopConfig(), ()),
+            None,
+            transport,
+            self.snapshot_store,
+            ViewPreferenceStore(self.root / "state"),
+            desktop,
+            None,
+            self.registry,
+            None,
+        )
+
+        def render(callback):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(0, run_rofi(dict(env, **callback), context=context))
+            frame = output.getvalue()
+            state = _parse_state(
+                next(
+                    line.split("\x1f", 1)[1]
+                    for line in frame.replace("\x1e", "\n").splitlines()
+                    if line.startswith("\x00data\x1f")
+                )
+            )
+            return frame, state
+
+        frame, state = render({"ROFI_RETV": "0"})
+        rows = build_rows(self.snapshot, registry=self.registry, desktop=desktop, windows=(window,))
+        instance = next(row for row in rows if row.instance_id == record.instance_id)
+        other = next(row for row in rows if row.selectable and row.key != instance.key)
+        for tick, selected in enumerate((instance, other, instance, other)):
+            desktop.visible = (replace(window, title=f"New spinner frame {tick}"),)
+            frame, state = render(
+                {
+                    "ROFI_RETV": "28",
+                    "ROFI_DATA": _state_json(state),
+                    "ROFI_INFO": json.dumps(selected.info),
+                }
+            )
+            self.assertEqual(selected.key, state.selected_key)
+            self.assertFalse(state.restore_selection)
+            self.assertIn("⠋ Working", frame)
+            self.assertNotIn("New spinner frame", frame)
+            self.assertIn("delay: 0.5", frame)
+        self.assertEqual(0, transport.calls)
+
     def test_provider_is_named_for_bare_and_provider_prefixed_environment_labels(self):
         for label in ("Default", "Codex · Default"):
             target = replace(self.target, label=label)

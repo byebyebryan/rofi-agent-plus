@@ -29,6 +29,7 @@ from .registry import Instance, Registry, RegistryError, target_storage_key
 from .startup_refresh import POLL_SECONDS, RefreshStatus, read_status
 from .transport import Transport, TransportError
 from .view_preferences import ViewPreference, ViewPreferenceStore
+from .window_titles import freeze_titles
 
 ROFI_RETV_SELECTED = 1
 ROFI_RETV_CUSTOM_1 = 10
@@ -545,7 +546,8 @@ def _local_view(context: PickerContext) -> tuple[tuple[Window, ...], str | None]
     if context.desktop is None:
         return (), context.desktop_error or "desktop identity unavailable"
     try:
-        return tuple(context.desktop.windows()), None  # type: ignore[attr-defined]
+        windows = tuple(context.desktop.windows())  # type: ignore[attr-defined]
+        return freeze_titles(windows, context.env), None
     except (DesktopError, OSError, ValueError, TypeError) as error:
         return (), str(error)
 

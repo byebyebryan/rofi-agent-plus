@@ -180,7 +180,11 @@ pending, preserving the filter, selected row identity and chosen action. Redraw
 checks stop when the refresh finishes or its deadline expires. Refreshing is
 silent whenever the list has a selectable target or window; progress appears
 only for an empty list, and failures remain visible. Native search retains the
-flat host/environment/window order. Selection correction runs only when rows
+flat host/environment/window order. Window titles are sampled once per open
+picker, including their search text; reopening samples them again. Animated
+native titles therefore cannot start repeated selection corrections during
+discovery. Window presence and action validation still use current identities.
+Selection correction runs only when rows
 through the selected row change, so later additions need no extra callback.
 Once a correction starts, changing titles cannot restart it; another change
 to row positions or eligibility can. Discovery checks run at most twice per
