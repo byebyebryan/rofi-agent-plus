@@ -128,7 +128,7 @@ def expand_native_home(value: str, *, user_home: Path | str) -> str:
 def _default_label(provider: str, home: str) -> str:
     basename = PurePosixPath(home).name
     if provider == "codex" and basename == ".codex":
-        scope = "OSS"
+        scope = "Default"
     elif provider == "claude" and basename == ".claude":
         scope = "Default"
     else:

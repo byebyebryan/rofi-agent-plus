@@ -1,13 +1,24 @@
 {
   "manifestVersion": 1,
   "selection": "local_direct_tui_trial",
-  "hosts": ["snap", "starship"],
-  "version": "0.15.0a1",
-  "wheel": "rofi_agent_plus-0.15.0a1-py3-none-any.whl",
-  "wheelSha256": "549d5ec2b9fb66a052be41f71ed0b471d5242f47916c20364f87b29ba97fbd0c",
-  "prefix": ".local/share/rofi-agent-plus/0.15.0a1-549d5ec2b9fb66a0",
+  "hosts": [
+    "snap",
+    "starship"
+  ],
+  "version": "0.15.0a2",
+  "wheel": "rofi_agent_plus-0.15.0a2-py3-none-any.whl",
+  "wheelSha256": "e95523e576094ede01fc83e2d9fefd9f765f841c70fdde79721ef51d4d4091ef",
+  "prefix": ".local/share/rofi-agent-plus/0.15.0a2-e95523e576094ede",
   "python": "3.11",
-  "entryPoints": ["rofi-agent-plus", "rofi-agent-plus-rofi", "rofi-agent-plus-host", "rofi-agent-plus-viewer"],
-  "schemas": {"host": 1, "directState": 1},
+  "entryPoints": [
+    "rofi-agent-plus",
+    "rofi-agent-plus-rofi",
+    "rofi-agent-plus-host",
+    "rofi-agent-plus-viewer"
+  ],
+  "schemas": {
+    "host": 1,
+    "directState": 1
+  },
   "runtimeDependencies": []
 }

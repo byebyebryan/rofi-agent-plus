@@ -336,6 +336,34 @@ class DirectHostTests(unittest.TestCase):
             ).exists()
         )
 
+    def test_absent_undeclared_provider_is_quiet_and_never_probed(self) -> None:
+        self.harness.claude.unlink()
+        with patch.object(claude, "capability_argv", side_effect=AssertionError("Claude probed")):
+            with patch.object(claude, "status_argv", side_effect=AssertionError("Claude probed")):
+                inventory = self.harness.inventory()
+        self.assertEqual([target.key.provider for target in inventory.targets], ["codex"])
+        self.assertEqual(inventory.targets[0].label, "Codex · Default")
+        self.assertEqual(inventory.errors, ())
+        self.assertEqual(
+            {coverage.provider: coverage.status for coverage in inventory.provider_coverage},
+            {"codex": "complete", "claude": "missing"},
+        )
+        config = self.harness.write_config([{"provider": "codex", "home": "~/.codex"}])
+        self.assertEqual(self.harness.inventory(config).targets[0].label, "Codex · Default")
+
+    def test_explicit_missing_provider_declaration_still_reports_configuration_problem(
+        self,
+    ) -> None:
+        self.harness.claude.unlink()
+        config = self.harness.write_config([{"provider": "claude", "home": "~/.claude"}])
+        inventory = self.harness.inventory(config)
+        self.assertTrue(
+            any(
+                error.provider == "claude" and error.code == "provider_executable_missing"
+                for error in inventory.errors
+            )
+        )
+
     def test_missing_provider_unsupported_capability_and_status_failure_are_distinct(self) -> None:
         env = dict(self.harness.env)
         only_codex_bin = self.root / "codex-only"

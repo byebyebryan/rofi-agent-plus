@@ -58,6 +58,10 @@ executes the installed `codex agents` or `claude agents` CLI in the real
 foreground TTY.
 
 Capability and daemon observations are independent. Provider capability help
+is skipped for an uninstalled, undeclared provider. That normal absence has no
+picker row or host-partial warning; missing coverage remains in the diagnostic
+wire so cached targets can be withdrawn. Explicit declarations for missing
+providers still report the configuration problem. Provider capability help
 is cached by executable identity and adapter revision; status is a passive
 per-environment query. Only recognized positive running/stopped evidence is
 normalized. A nonzero status exit alone is unknown, and daemon status being

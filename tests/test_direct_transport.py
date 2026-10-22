@@ -163,6 +163,18 @@ class TransportTests(unittest.TestCase):
         self.assertIn("BatchMode=yes", ssh_call)
         self.assertIn("StrictHostKeyChecking=yes", ssh_call)
 
+    def test_absent_provider_does_not_make_successful_inventory_partial(self):
+        self.local_inventory["providerCoverage"][1].update(
+            status="missing", reason="provider_executable_missing"
+        )
+        self.local_inventory["targets"] = [
+            item for item in self.local_inventory["targets"] if item["key"]["provider"] == "codex"
+        ]
+        snapshot = self.transport().read_fleet()
+        self.assertEqual(snapshot.hosts[0].status, "complete")
+        self.assertEqual(snapshot.hosts[0].inventory.errors, ())
+        self.assertEqual(snapshot.hosts[1].status, "partial")
+
     def test_read_only_inventory_falls_back_before_authenticated_marker(self):
         self.mode = "fallback"
         transport = self.transport(routes=("first", "second"))

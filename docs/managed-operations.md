@@ -1,6 +1,6 @@
 # Agent Plus managed operations
 
-The direct-TUI trial selects `0.15.0a1` on Starship and Snap. Its immutable
+The direct-TUI trial selects `0.15.0a2` on Starship and Snap. Its immutable
 wheel and selected hosts are recorded in
 [managed-direct-selection.json](../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
@@ -34,7 +34,7 @@ scripts/check-installed-artifact --candidate-prefix "$PREFIX" \
 "$PREFIX/bin/rofi-agent-plus-host" inventory --json
 ```
 
-Check local and SSH inventory, canonical OSS/Work homes, the four selected
+Check local and SSH inventory, canonical Default/Work homes, the four selected
 entrypoints and Mod+A independently. Passive checks open no native manager.
 Any disruptive GUI testing belongs on unattended Snap; Starship is reserved
 for the user's own trial. Human input/visual judgment remains separate from

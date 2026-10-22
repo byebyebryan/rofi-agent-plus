@@ -241,7 +241,7 @@ def _provider_candidates(
 def _default_label(provider: str, home: str) -> str:
     base = Path(home).name
     if provider == "codex" and base == ".codex":
-        base = "OSS"
+        base = "Default"
     elif provider == "claude" and base == ".claude":
         base = "Default"
     return f"{provider.capitalize()} · {base or 'Home'}"
@@ -374,6 +374,16 @@ def build_inventory(
     for provider in ("codex", "claude"):
         adapter = ADAPTERS[provider]
         executable = resolve_executable(adapter.EXECUTABLE, env=process_env)
+        if executable is None and not any(
+            declaration.provider == provider for declaration in config.environments
+        ):
+            # Installation absence is a complete discovery observation. Keep
+            # coverage for cache invalidation without probing native commands
+            # or reporting a fault for an unconfigured provider.
+            coverage.append(
+                ProviderCoverage(provider, "missing", when, "provider_executable_missing")
+            )
+            continue
         capability = _capability_probe(
             provider,
             executable,

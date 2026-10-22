@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from rofi_agent_plus.cache import CacheError, CacheStore
@@ -156,6 +157,41 @@ class CacheStoreTests(unittest.TestCase):
         self.assertEqual(codex.status, "complete")
         self.assertEqual(codex.targets, ())
 
+    def test_absent_provider_clears_old_targets_without_warning_or_stale_cache(self):
+        self.store.publish_host(
+            host_result(fixture_inventory()), mesh_revision="sha256:" + "a" * 64
+        )
+        inventory = fixture_inventory(claude_status="missing", empty={"claude"})
+        self.store.publish_host(host_result(inventory), mesh_revision="sha256:" + "a" * 64)
+        snapshot = self.store.load()
+        self.assertEqual(snapshot.hosts[0].status, "complete")
+        self.assertFalse(snapshot.is_stale())
+        rows = build_rows(snapshot)
+        self.assertFalse(
+            any("Claude" in row.display or "inventory partial" in row.display for row in rows)
+        )
+        self.assertEqual(
+            [row.target.key.provider for row in rows if row.kind == "target"], ["codex"]
+        )
+
+    def test_explicit_missing_provider_error_remains_visible(self):
+        inventory = fixture_inventory(claude_status="missing", empty={"claude"}).to_json()
+        inventory["errors"] = [
+            {
+                "code": "provider_executable_missing",
+                "stage": "capability",
+                "message": "Explicit provider declaration is missing its executable",
+                "provider": "claude",
+            }
+        ]
+        self.store.publish_host(
+            host_result(parse_inventory(inventory), status="partial"),
+            mesh_revision="sha256:" + "a" * 64,
+        )
+        rows = build_rows(self.store.load())
+        self.assertTrue(any("Claude Code missing" in row.display for row in rows))
+        self.assertTrue(any("inventory partial" in row.display for row in rows))
+
     def test_per_host_callback_publishes_before_the_fleet_finishes(self):
         inventory = fixture_inventory()
         result = host_result(inventory)
@@ -278,6 +314,30 @@ class PickerRowsTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;bad&lt;/script&gt;", frame)
         self.assertNotIn('"title </span>', frame)
         self.assertNotIn("bad</script>", json.dumps(instances[0].info))
+
+    def test_provider_is_named_for_bare_and_provider_prefixed_environment_labels(self):
+        for label in ("Default", "Codex · Default"):
+            target = replace(self.target, label=label)
+            inventory = replace(self.inventory, targets=(target, *self.inventory.targets[1:]))
+            self.snapshot_store.publish_host(
+                host_result(inventory), mesh_revision="sha256:" + "a" * 64
+            )
+            rows = build_rows(self.snapshot_store.load())
+            row = next(row for row in rows if row.target_id == self.target_id)
+            self.assertEqual(row.display, "Starship · Codex · Default")
+            claude_row = next(
+                row for row in rows if row.target and row.target.key.provider == "claude"
+            )
+            self.assertEqual(claude_row.display, "Starship · Claude Code · Default")
+        record, window = self.live_record()
+        rows = build_rows(
+            self.snapshot_store.load(),
+            registry=self.registry,
+            desktop=FakeDesktop(self.generation, (window,)),
+            windows=(window,),
+        )
+        row = next(row for row in rows if row.instance_id == record.instance_id)
+        self.assertIn("Starship · Codex · Default — Window 1", row.display)
 
     def test_registered_window_remains_visible_without_catalog(self):
         record, window = self.live_record()

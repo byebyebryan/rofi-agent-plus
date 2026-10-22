@@ -295,6 +295,8 @@ def build_rows(
                 }[host.status]
                 rows.append(_status_row(f"{host.display} · {suffix}", host.host_id))
             for provider in host.providers:
+                if provider.status == "missing" and not provider.errors and not provider.targets:
+                    continue
                 if provider.status in {"partial", "unknown", "missing", "unsupported"}:
                     reason = provider.reason or provider.status
                     rows.append(
@@ -332,7 +334,19 @@ def build_rows(
             records = active_by_target.get(target_id, [])
             host = host_display.get(host_id, host_id)
             provider_name = _PROVIDER_NAMES[target.key.provider]
-            identity_text = f"{host} {provider_name} {target.label} {target.key.home}"
+            environment = target.label
+            # Older helpers included a provider prefix in default labels;
+            # declarations may contain just the environment name.
+            for prefix in (f"{provider_name} · ", f"{target.key.provider.capitalize()} · "):
+                if environment.startswith(prefix):
+                    environment = environment[len(prefix) :]
+                    break
+            display_name = (
+                provider_name
+                if environment == provider_name
+                else f"{provider_name} · {environment}"
+            )
+            identity_text = f"{host} {display_name} {target.key.home}"
             if records:
                 for record in records:
                     number = record.value["ordinal"]
@@ -368,7 +382,7 @@ def build_rows(
                         PickerRow(
                             kind,
                             key,
-                            clean_text(f"{host} · {target.label} — {detail}"),
+                            clean_text(f"{host} · {display_name} — {detail}"),
                             clean_text(f"{identity_text} {detail}"),
                             target_id,
                             record.instance_id,
@@ -383,7 +397,7 @@ def build_rows(
                 reason = target.capability.reason or target.capability.status
                 rows.append(
                     _status_row(
-                        f"{host} · {target.label} — launch {target.capability.status}: {reason}",
+                        f"{host} · {display_name} — launch {target.capability.status}: {reason}",
                         identity_text,
                     )
                 )
@@ -393,7 +407,7 @@ def build_rows(
                 PickerRow(
                     "target",
                     key,
-                    clean_text(f"{host} · {target.label}"),
+                    clean_text(f"{host} · {display_name}"),
                     clean_text(identity_text),
                     target_id,
                     target=target,

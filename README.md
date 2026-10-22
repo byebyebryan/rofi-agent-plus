@@ -89,7 +89,7 @@ structured and stable; native prompts remain native.
 The optional schema-versioned file is
 `$XDG_CONFIG_HOME/rofi-agent-plus/direct.toml`, defaulting to
 `~/.config/rofi-agent-plus/direct.toml` under the effective account's passwd
-home. [The example](examples/direct.toml) labels the Codex OSS default and
+home. [The example](examples/direct.toml) labels the Codex default and
 declares a separate Work home:
 
 ```toml
@@ -102,7 +102,7 @@ catalog_ttl_seconds = 30
 [[environments]]
 provider = "codex"
 home = "~/.codex"
-label = "OSS"
+label = "Default"
 
 [[environments]]
 provider = "codex"

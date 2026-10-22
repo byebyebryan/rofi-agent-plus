@@ -7,7 +7,7 @@ catalog_ttl_seconds = 30
 [[environments]]
 provider = "codex"
 home = "~/.codex"
-label = "OSS"
+label = "Default"
 
 [[environments]]
 provider = "codex"
