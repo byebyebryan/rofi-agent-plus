@@ -373,7 +373,7 @@ class PickerRowsTests(unittest.TestCase):
             self.assertFalse(state.restore_selection)
             self.assertIn("⠋ Working", frame)
             self.assertNotIn("New spinner frame", frame)
-            self.assertIn("delay: 0.5", frame)
+            self.assertIn("delay: 0.0; action: false", frame)
         self.assertEqual(0, transport.calls)
 
     def test_provider_is_named_for_bare_and_provider_prefixed_environment_labels(self):
@@ -699,7 +699,7 @@ class PickerCallbackTests(unittest.TestCase):
             self.assertIn('"selectedKey":"' + selected.key + '"', frame)
             self.assertIn("New window", frame)
             self.assertIn("a" * 32, frame)
-            self.assertIn(f"timeout {{ delay: {0.0 if complete else 0.5};", frame)
+            self.assertIn("timeout { delay: 0.0; action: false;", frame)
             self.assertIn("Open · <span", frame)
             self.assertIn("[New window]</span>", frame)
             self.assertIn("Tab: Cycle actions", frame)
@@ -721,7 +721,7 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertIn(self.target.label, output.getvalue())
         self.assertNotIn("Refreshing host inventory", output.getvalue())
         self.assertIn("[Open]</span> · New window", output.getvalue())
-        self.assertIn("delay: 0.5", output.getvalue())
+        self.assertIn("delay: 0.0; action: false", output.getvalue())
         finish_refresh(refresh.env, "controlled failure")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -730,7 +730,7 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertIn("delay: 0.0", output.getvalue())
         self.assertEqual(transport.calls, 0)
 
-    def test_startup_poll_loads_newly_published_rows_and_alt_r_joins_pending_refresh(self):
+    def test_empty_startup_poll_loads_first_rows_then_disarms_the_timer(self):
         import contextlib
 
         from rofi_agent_plus.startup_refresh import STATUS_ENV, StartupRefresh, finish_refresh
@@ -747,12 +747,12 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertIn("Refreshing host inventory", output.getvalue())
         self.assertIn("delay: 0.5", output.getvalue())
         context.cache.publish_host(host_result(self.inventory), mesh_revision=None)
-        for retv in ("28", "10"):
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                run_rofi(dict(env, ROFI_RETV=retv), context=context)
-            self.assertIn(self.target.label, output.getvalue())
-            self.assertNotIn("Refreshing host inventory", output.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            run_rofi(dict(env, ROFI_RETV="28"), context=context)
+        self.assertIn(self.target.label, output.getvalue())
+        self.assertNotIn("Refreshing host inventory", output.getvalue())
+        self.assertIn("delay: 0.0; action: false", output.getvalue())
         self.assertEqual(transport.calls, 0)
         finish_refresh(env, "offline test peer")
         output = io.StringIO()
@@ -760,6 +760,38 @@ class PickerCallbackTests(unittest.TestCase):
             run_rofi(dict(env, ROFI_RETV="28"), context=context)
         self.assertIn("offline test peer", output.getvalue())
         self.assertIn("delay: 0.0", output.getvalue())
+
+    def test_explicit_refresh_joins_worker_and_loads_its_completed_snapshot(self):
+        import contextlib
+        import threading
+
+        from rofi_agent_plus.startup_refresh import StartupRefresh, finish_refresh
+
+        context, transport, _actions = self._context()
+        directory = self.root / "launch"
+        directory.mkdir(mode=0o700)
+        refresh = StartupRefresh(directory, Path("/unused"), {})
+        value = self.inventory.to_json()
+        value["targets"][0]["label"] = "Newly discovered environment"
+        fresh = parse_inventory(value)
+
+        def publish():
+            time.sleep(0.03)
+            context.cache.publish_host(host_result(fresh), mesh_revision=None)
+            finish_refresh(refresh.env)
+
+        worker = threading.Thread(target=publish)
+        worker.start()
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(0, run_rofi(dict(refresh.env, ROFI_RETV="10"), context=context))
+        finally:
+            worker.join(timeout=1)
+        self.assertIn("Newly discovered environment", output.getvalue())
+        self.assertIn("delay: 0.0", output.getvalue())
+        self.assertNotIn("Refreshing host inventory", output.getvalue())
+        self.assertEqual(0, transport.calls)
 
     def test_row_insertion_restores_identity_after_rofi_rebuilds_its_filtered_map(self):
         from rofi_agent_plus.rofi import _parse_state, _render

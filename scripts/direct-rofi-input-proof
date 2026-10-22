@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Offscreen Rofi input regression: drive OUTPUT cached|cold; callbacks are inert."""
+
+import ctypes
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+if not sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from rofi_agent_plus import __file__ as package_file  # noqa: E402
+from rofi_agent_plus.config import DesktopConfig, DirectConfig  # noqa: E402
+from rofi_agent_plus.desktop import Window  # noqa: E402
+from rofi_agent_plus.rofi import PickerRow, _parse_state, _status_row, run_rofi  # noqa: E402
+from rofi_agent_plus.startup_refresh import RefreshStatus  # noqa: E402
+from rofi_agent_plus.view_preferences import ViewPreference  # noqa: E402
+from rofi_agent_plus.window_titles import TITLES_ENV, TITLES_NAME  # noqa: E402
+
+root = Path(sys.argv[2])
+variant = sys.argv[3]
+assert variant in {"cached", "cold"}
+if sys.argv[1] == "callback":
+    started = time.monotonic()
+    tick = (
+        len((root / "events.jsonl").read_text().splitlines())
+        if (root / "events.jsonl").exists()
+        else 0
+    )
+    title = "Keep Work " + ["⠋", "⠙", "⠹", "⠸"][tick % 4]
+    window = Window(1, 42, "org.agentplus." + "b" * 32, title, False)
+
+    def build_rows(_snapshot, **kwargs):
+        if variant == "cold" and not (root / "publish").exists():
+            return (_status_row("Discovering inventory"),)
+        title = kwargs["windows"][0].title
+        return tuple(
+            PickerRow("target", "t:" + k * 64, label, label, target_id=k * 64, selectable=True)
+            for k, label in [
+                ("a", "Keep A"),
+                ("b", title),
+                ("c", "Keep C"),
+                ("d", "Other D"),
+                ("e", "Other E"),
+                ("f", "Other F"),
+            ]
+        )
+
+    context = SimpleNamespace(
+        env={TITLES_ENV: str(root / TITLES_NAME)},
+        config=DirectConfig(DesktopConfig(), ()),
+        config_error=None,
+        cache=SimpleNamespace(load=lambda: None),
+        preferences=SimpleNamespace(load=lambda: ViewPreference("b" * 64)),
+        desktop=SimpleNamespace(windows=lambda: (window,)),
+        registry=None,
+        desktop_error=None,
+        transport=None,
+        actions=None,
+    )
+    frame = StringIO()
+    with (
+        patch("rofi_agent_plus.rofi.build_rows", side_effect=build_rows),
+        patch(
+            "rofi_agent_plus.rofi.read_status",
+            return_value=RefreshStatus(
+                "pending" if not (root / "complete").exists() else "complete",
+                time.monotonic() + 10,
+                "",
+            ),
+        ),
+        redirect_stdout(frame),
+    ):
+        run_rofi(os.environ, context=context)
+    data = next(
+        (
+            line.split("\x1f", 1)[1]
+            for line in frame.getvalue().replace("\x1e", "\n").splitlines()
+            if line.startswith("\x00data\x1f")
+        ),
+        None,
+    )
+    event = {
+        "retv": int(os.environ["ROFI_RETV"]),
+        "info": os.environ.get("ROFI_INFO"),
+        "input": os.environ.get("ROFI_INPUT"),
+        "old": _parse_state(os.environ.get("ROFI_DATA")).selected_key,
+        "oldRestore": _parse_state(os.environ.get("ROFI_DATA")).restore_selection,
+        "new": json.loads(data)["selectedKey"],
+        "restore": json.loads(data)["restoreSelection"],
+        "select": next(
+            (
+                line
+                for line in frame.getvalue().replace("\x1e", "\n").splitlines()
+                if line.startswith("\x00new-selection")
+            ),
+            None,
+        ),
+        "at": time.monotonic(),
+        "started": started,
+    }
+    with (root / "events.jsonl").open("a") as stream:
+        stream.write(json.dumps(event) + "\n")
+    print(frame.getvalue(), end="")
+    raise SystemExit(0)
+
+assert sys.argv[1] == "drive"
+root.mkdir(mode=0o700)
+xvfb = subprocess.Popen(
+    ["Xvfb", "-displayfd", "1", "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+    stdout=subprocess.PIPE,
+    stderr=(root / "xvfb.log").open("w"),
+)
+number = xvfb.stdout.readline().decode().strip()
+assert number.isdecimal(), number
+env = {
+    k: v
+    for k, v in os.environ.items()
+    if k not in ("WAYLAND_DISPLAY", "NIRI_SOCKET") and not k.startswith("ROFI_")
+}
+env.update(DISPLAY=":" + number, XDG_CACHE_HOME=str(root / "cache"))
+x = ctypes.CDLL("libX11.so.6")
+t = ctypes.CDLL("libXtst.so.6")
+x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x.XOpenDisplay.restype = ctypes.c_void_p
+x.XStringToKeysym.argtypes = [ctypes.c_char_p]
+x.XStringToKeysym.restype = ctypes.c_ulong
+x.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x.XKeysymToKeycode.restype = ctypes.c_uint
+x.XFlush.argtypes = [ctypes.c_void_p]
+x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+t.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+display = x.XOpenDisplay(env["DISPLAY"].encode())
+assert display
+
+
+def key(name):
+    code = x.XKeysymToKeycode(display, x.XStringToKeysym(name.encode()))
+    assert code
+    t.XTestFakeKeyEvent(display, code, 1, 0)
+    t.XTestFakeKeyEvent(display, code, 0, 0)
+    x.XFlush(display)
+
+
+def events():
+    return (
+        [json.loads(s) for s in (root / "events.jsonl").read_text().splitlines()]
+        if (root / "events.jsonl").exists()
+        else []
+    )
+
+
+def wait(predicate):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = predicate()
+        if result:
+            return result
+        time.sleep(0.01)
+    raise RuntimeError("offscreen test timeout")
+
+
+wrapper = root / "callback"
+wrapper.write_text(
+    "#!/bin/sh\nexec "
+    + shlex.join(
+        [
+            sys.executable,
+            ("-I" if sys.flags.isolated else "-B"),
+            "-B",
+            __file__,
+            "callback",
+            str(root),
+            variant,
+        ]
+    )
+    + "\n"
+)
+wrapper.chmod(0o700)
+log = (root / "rofi.log").open("w")
+process = subprocess.Popen(
+    [
+        "rofi",
+        "-pid",
+        str(root / "rofi.pid"),
+        "-no-config",
+        "-display",
+        env["DISPLAY"],
+        "-no-sort",
+        "-show",
+        "owned",
+        "-modes",
+        "owned:" + str(wrapper),
+        "-selected-row",
+        "1",
+        "-kb-custom-7",
+        "Tab",
+        "-kb-custom-19",
+        "F10",
+        "-kb-element-next",
+        "",
+        "-kb-element-prev",
+        "",
+    ],
+    env=env,
+    stdout=log,
+    stderr=log,
+)
+try:
+    wait(lambda: events())
+    time.sleep(0.25)
+    if variant == "cold":
+        (root / "publish").write_text("ready")
+        key("F10")
+        wait(lambda: any(e["retv"] == 28 for e in events()))
+        time.sleep(0.2)
+    probes = []
+    for index in range(3):
+        time.sleep(0.9)
+        sent = time.monotonic()
+        key("Down")
+        time.sleep(0.15)
+        count = len([e for e in events() if e["retv"] == 16])
+        key("Tab")
+        observed = wait(
+            lambda count=count: (
+                next((e for e in reversed(events()) if e["retv"] == 16), None)
+                if len([e for e in events() if e["retv"] == 16]) > count
+                else None
+            )
+        )
+        probes.append(
+            {
+                "arrow": index,
+                "selected": json.loads(observed["info"])["targetId"][0],
+                "observedAfterMs": round((observed["started"] - sent) * 1000, 1),
+            }
+        )
+        time.sleep(0.2)
+    receipt = {
+        "package": str(package_file),
+        "variant": variant,
+        "probes": probes,
+        "events": len(events()),
+        "display": env["DISPLAY"],
+        "desktopInput": 0,
+        "providerActions": 0,
+    }
+    expected = list("bcd" if variant == "cold" else "cde")
+    assert [p["selected"] for p in probes] == expected, receipt
+    # This upper bound includes the deliberate 150ms before the inert Tab
+    # probe. It catches blocked input without treating it as paint latency.
+    assert all(p["observedAfterMs"] < 500 for p in probes), receipt
+    assert sum(e["retv"] == 28 for e in events()) == (1 if variant == "cold" else 0), receipt
+    (root / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    print(json.dumps(receipt))
+    key("Escape")
+    process.wait(timeout=5)
+finally:
+    if process.poll() is None:
+        process.terminate()
+        process.wait(timeout=5)
+    x.XCloseDisplay(display)
+    xvfb.terminate()
+    xvfb.wait(timeout=5)

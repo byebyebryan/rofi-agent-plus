@@ -26,7 +26,7 @@ from .model import (
     parse_target,
 )
 from .registry import Instance, Registry, RegistryError, target_storage_key
-from .startup_refresh import POLL_SECONDS, RefreshStatus, read_status
+from .startup_refresh import POLL_SECONDS, RefreshStatus, read_status, wait_for_refresh
 from .transport import Transport, TransportError
 from .view_preferences import ViewPreference, ViewPreferenceStore
 from .window_titles import freeze_titles
@@ -627,7 +627,18 @@ def _render(
         prefix_revision=prefix,
         position_revision=position,
     )
-    delay = 0.02 if restore else (POLL_SECONDS if polling else 0.0)
+    # Rofi 2.0's idle timeout captures selection before the next input event
+    # completes the script callback. A usable list must not keep taking that
+    # path while the user navigates. Only an empty list checks for first rows.
+    delay = (
+        0.02
+        if restore
+        else (POLL_SECONDS if polling and not any(row.selectable for row in rows) else 0.0)
+    )
+    # A previous timeout can already be armed. Its handler reads the current
+    # action at firing time; an absent string action makes that timer inert.
+    # Merely changing delay to zero does not cancel an already armed timer.
+    timeout_action = '"kb-custom-19"' if delay else "false"
     headers = [
         _protocol("prompt", prompt),
         # Rofi suppresses hotkeys when a filter has no selected row if this is
@@ -637,7 +648,7 @@ def _render(
         _protocol("markup-rows", "true"),
         _protocol(
             "theme",
-            f'configuration {{ timeout {{ delay: {delay}; action: "kb-custom-19"; }} }}',
+            f"configuration {{ timeout {{ delay: {delay}; action: {timeout_action}; }} }}",
         ),
         _protocol("data", _state_json(state)),
         # Rofi reads retention flags from the preceding frame, including the
@@ -829,11 +840,16 @@ def run_rofi(
 
     if retv == ROFI_RETV_CUSTOM_1:
         refresh_error = None
-        if not polling:
+        if polling:
+            refresh = wait_for_refresh(env)
+            polling = False
+            snapshot, refresh_error = _load_snapshot(context)
+            refresh_error = refresh_error or (refresh.message if refresh is not None else "")
+        else:
             snapshot, refresh_error = _refresh(context)
         state = replace(
             state,
-            notice=refresh.message if polling else (refresh_error or ""),
+            notice=refresh_error or "",
         )
     elif retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
         action = ACTION_ADDITIONAL if state.action == ACTION_OPEN else ACTION_OPEN

@@ -170,5 +170,5 @@ if find rofi_agent_plus tests bin scripts -type d -name __pycache__ -print -quit
 fi
 
 python3 scripts/check-installed-artifact --self-test
-ruff check scripts/check-installed-artifact scripts/native-fixture scripts/check-native-entry scripts/direct-window-proof scripts/direct-rofi-proof scripts/direct-picker-proof
-ruff format --check scripts/check-installed-artifact scripts/native-fixture scripts/check-native-entry scripts/direct-window-proof scripts/direct-rofi-proof scripts/direct-picker-proof
+ruff check scripts/check-installed-artifact scripts/native-fixture scripts/check-native-entry scripts/direct-window-proof scripts/direct-rofi-proof scripts/direct-rofi-input-proof scripts/direct-picker-proof
+ruff format --check scripts/check-installed-artifact scripts/native-fixture scripts/check-native-entry scripts/direct-window-proof scripts/direct-rofi-proof scripts/direct-rofi-input-proof scripts/direct-picker-proof

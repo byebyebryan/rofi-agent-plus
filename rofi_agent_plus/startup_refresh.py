@@ -90,6 +90,16 @@ def finish_refresh(environ: Mapping[str, str], error: str | None = None) -> None
     )
 
 
+def wait_for_refresh(environ: Mapping[str, str]) -> RefreshStatus | None:
+    """An explicit refresh may join the launcher's bounded passive worker."""
+
+    status = read_status(environ)
+    while status is not None and status.pending:
+        time.sleep(min(0.05, max(0.0, status.deadline - time.monotonic())))
+        status = read_status(environ)
+    return status
+
+
 class StartupRefresh:
     """The launcher cancels this passive child when its Rofi dialog exits."""
 

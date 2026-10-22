@@ -175,9 +175,10 @@ and worker lifetime are independent.
 
 Opening the dialog immediately uses the saved catalog and current local windows.
 If the catalog is missing or stale, the launcher starts one background refresh
-after launching Rofi. The dialog reads published results while that refresh is
-pending, preserving the filter, selected row identity and chosen action. Redraw
-checks stop when the refresh finishes or its deadline expires. Refreshing is
+after launching Rofi. A usable cached list stays steady while discovery updates
+the cache; it has no automatic redraw callbacks during navigation. Reopening or
+Alt+R loads the new results. An empty list checks for published results until
+usable rows appear, the refresh finishes, or its deadline expires. Refreshing is
 silent whenever the list has a selectable target or window; progress appears
 only for an empty list, and failures remain visible. Native search retains the
 flat host/environment/window order. Window titles are sampled once per open
@@ -187,18 +188,20 @@ discovery. Window presence and action validation still use current identities.
 Selection correction runs only when rows
 through the selected row change, so later additions need no extra callback.
 Once a correction starts, changing titles cannot restart it; another change
-to row positions or eligibility can. Discovery checks run at most twice per
-second while pending, then stop.
+to row positions or eligibility can. Empty-list checks run at most twice per
+second while pending, then stop as soon as selectable rows appear. Already
+armed timers are also disarmed when checks stop, so the next arrow key remains
+available for navigation.
 Fresh catalogs need no
-background work. Alt+R explicitly refreshes before redrawing, or joins an already
-pending startup refresh. The fleet deadline is 20 seconds, with
+background work. Alt+R explicitly refreshes before redrawing, or waits for an
+already pending startup refresh and loads its completed results. The fleet deadline is 20 seconds, with
 12 seconds per host and at most four concurrent host workers. Each host result
 publishes to the cache as it arrives, retaining valid siblings and last-known
 targets with their original observation times after partial failure; the
-picker can show each result without waiting for slower peers. A complete current inventory
+an empty picker can show its first usable result without waiting for slower peers. A complete current inventory
 may remove a missing target; registered windows remain listed from the private
 desktop registry. Local redraws do not probe providers. The startup timeout only
-reads published state while one refresh is pending; there is no ongoing polling
+reads published state while an empty list waits for its first usable rows; there is no ongoing polling
 after completion. Unfinished startup probes are cancelled when the dialog exits,
 while accepted native windows outlive the picker.
 
@@ -232,7 +235,7 @@ private and versioned; cache data is never launch authority.
 | Local catalog | 8 MiB, at most 256 host records |
 | Active registrations | 512 per target; terminal tombstones do not consume active capacity |
 | Picker callback state / first frame | 16 KiB / 16 MiB |
-| Startup/Alt+R catalog refresh / Niri request | 20 seconds / 1 second; startup is asynchronous, Alt+R waits unless joining startup |
+| Startup/Alt+R catalog refresh / Niri request | 20 seconds / 1 second; startup is asynchronous, Alt+R waits, including when joining startup |
 
 ## Source, artifact and native checks
 

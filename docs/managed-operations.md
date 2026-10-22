@@ -1,6 +1,6 @@
 # Agent Plus managed operations
 
-The direct-TUI trial selects `0.15.0a10` on Starship and Snap. Its immutable
+The direct-TUI trial selects `0.15.0a11` on Starship and Snap. Its immutable
 wheel and selected hosts are recorded in
 [managed-direct-selection.json](../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
@@ -53,3 +53,15 @@ and recovery instructions are in [legacy retirement](legacy-retirement.md).
 Use the captured direct-trial targets above for current rollback. The
 [candidate execution record](direct-tui-candidate-20261021.md) preserves the
 direct artifact's source, wheel and native evidence boundaries.
+
+The input regression runs on a private Xvfb display with a separate Rofi PID
+file and inert rows; it sends no input to the physical desktop. Use the selected
+artifact interpreter with isolated imports to qualify both a stale usable list
+and the transition from an empty list:
+
+    "$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$PRIVATE_CACHED_PROOF" cached
+    "$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$PRIVATE_COLD_PROOF" cold
+
+Each output path must be new. The proof sends arrows after idle intervals, checks
+that every arrow advances selection, and rejects any further background redraw
+once selectable rows are shown. Rofi, Xvfb, libX11 and libXtst are required.
