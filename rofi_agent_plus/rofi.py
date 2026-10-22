@@ -596,9 +596,9 @@ def _render(
         # first timeout or Tab callback after opening.
         _protocol("keep-filter", "true"),
         _protocol("keep-selection", "true"),
+        # Rofi retains its previous message when this header is omitted.
+        _protocol("message", clean_text(state.notice, limit=MAX_MESSAGE_LENGTH)),
     ]
-    if state.notice:
-        headers.append(_protocol("message", clean_text(state.notice, limit=MAX_MESSAGE_LENGTH)))
     if select and not restore:
         index = _selected_index(rows, state.selected_key)
         if index is not None:

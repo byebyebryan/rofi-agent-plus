@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rofi-agent-plus"
-version = "0.15.0a4"
+version = "0.15.0a5"
 description = "Direct native agent manager and TUI window picker"
 readme = "README.md"
 requires-python = ">=3.11"

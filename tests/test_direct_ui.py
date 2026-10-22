@@ -638,6 +638,11 @@ class PickerCallbackTests(unittest.TestCase):
             self.assertIn("Open another window", frame)
             self.assertIn("a" * 32, frame)
             self.assertIn(f"timeout {{ delay: {0.0 if complete else 0.2};", frame)
+            if complete:
+                self.assertIn("\x00message\x1f\x1e", frame)
+                self.assertNotIn("Refreshing host inventory", frame)
+            else:
+                self.assertIn("\x00message\x1fRefreshing host inventory", frame)
         self.assertEqual(transport.calls, 0)
 
     def test_startup_poll_loads_newly_published_rows_and_alt_r_joins_pending_refresh(self):
