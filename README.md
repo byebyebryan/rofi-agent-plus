@@ -159,6 +159,10 @@ has one launcher row. Provider and host status rows are not selectable.
 | Left / Right, Ctrl+B / Ctrl+F | Edit the search field using Rofi's native cursor bindings |
 | Escape / Ctrl+G | Close the picker |
 
+The action bar lists Open and Open another window, highlights the active action
+in blue and shows Enter/Tab hints, matching SSH Plus and Tmux Plus. Notices appear
+below it; quiet refreshes leave the action bar in place.
+
 Search covers host, provider, environment label and current window title. Titles
 are sanitized and escaped for display; no title or typed search text enters an
 executable action. A title is not conversation identity. A missing/changed

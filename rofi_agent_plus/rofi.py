@@ -562,6 +562,20 @@ def _selected_index(rows: tuple[PickerRow, ...], key: str | None) -> int | None:
     return next((index for index, row in enumerate(rows) if row.key == key), None)
 
 
+def _action_message(state: PickerState) -> str:
+    labels = []
+    for action, text in ((ACTION_OPEN, "Open"), (ACTION_ADDITIONAL, "Open another window")):
+        label = html.escape(text, quote=False)
+        if action == state.action:
+            label = f'<span foreground="#42a5f5" weight="bold">[{label}]</span>'
+        labels.append(label)
+    hint = f"Enter: {' · '.join(labels)}  │  Tab: Cycle actions"
+    if not state.notice:
+        return hint
+    notice = html.escape(clean_text(state.notice, limit=MAX_MESSAGE_LENGTH), quote=False)
+    return f"{hint}\u2028\u2028{notice}"
+
+
 def _render(
     rows: tuple[PickerRow, ...],
     state: PickerState,
@@ -607,8 +621,8 @@ def _render(
         # first timeout or Tab callback after opening.
         _protocol("keep-filter", "true"),
         _protocol("keep-selection", "true"),
-        # Rofi retains its previous message when this header is omitted.
-        _protocol("message", clean_text(state.notice, limit=MAX_MESSAGE_LENGTH)),
+        # Always replace the message so completed notices leave only the bar.
+        _protocol("message", _action_message(state)),
     ]
     if select and not restore:
         if index is not None:

@@ -568,7 +568,8 @@ class PickerCallbackTests(unittest.TestCase):
 
         self.assertEqual(transport.calls, 1)
         self.assertIn("Fresh catalog label", output.getvalue())
-        self.assertIn("\x00message\x1f\x1e", output.getvalue())
+        self.assertIn("[Open]</span> · Open another window", output.getvalue())
+        self.assertNotIn("Host inventory refreshed", output.getvalue())
         self.assertIn("new-selection\x1f0", output.getvalue())
 
     def test_missing_catalog_renders_immediately_without_waiting_for_discovery(self):
@@ -638,7 +639,9 @@ class PickerCallbackTests(unittest.TestCase):
             self.assertIn("Open another window", frame)
             self.assertIn("a" * 32, frame)
             self.assertIn(f"timeout {{ delay: {0.0 if complete else 0.2};", frame)
-            self.assertIn("\x00message\x1f\x1e", frame)
+            self.assertIn("Open · <span", frame)
+            self.assertIn("[Open another window]</span>", frame)
+            self.assertIn("Tab: Cycle actions", frame)
             self.assertNotIn("Refreshing host inventory", frame)
         self.assertEqual(transport.calls, 0)
 
@@ -656,7 +659,7 @@ class PickerCallbackTests(unittest.TestCase):
             run_rofi(dict(refresh.env, ROFI_RETV="0"), context=context)
         self.assertIn(self.target.label, output.getvalue())
         self.assertNotIn("Refreshing host inventory", output.getvalue())
-        self.assertIn("\x00message\x1f\n", output.getvalue())
+        self.assertIn("[Open]</span> · Open another window", output.getvalue())
         self.assertIn("delay: 0.2", output.getvalue())
         finish_refresh(refresh.env, "controlled failure")
         output = io.StringIO()
@@ -798,6 +801,22 @@ class PickerCallbackTests(unittest.TestCase):
         )
         self.assertIn("delay: 0.02", frame)
 
+    def test_action_bar_keeps_notices_below_the_hint_and_escapes_their_markup(self):
+        from rofi_agent_plus.rofi import _render
+
+        frame = _render(
+            build_rows(self.snapshot),
+            PickerState(request_id="a" * 32, notice="<offline> & busy\nnext\x1fcontrol"),
+            preserve=False,
+            select=False,
+        )
+        self.assertIn('<span foreground="#42a5f5" weight="bold">[Open]</span>', frame)
+        self.assertIn(
+            "Tab: Cycle actions\u2028\u2028&lt;offline&gt; &amp; busy next control", frame
+        )
+        message = frame.split("\x00message\x1f", 1)[1].split("\n", 1)[0]
+        self.assertNotIn("<offline>", message)
+
     def test_enter_replay_reuses_request_id_and_registry_dispatch(self):
         context, _transport, actions = self._context()
         row = next(
@@ -834,6 +853,8 @@ class PickerCallbackTests(unittest.TestCase):
             )
         frame = output.getvalue()
         self.assertIn("prompt\x1fOpen another window", frame)
+        self.assertIn("[Open another window]</span>", frame)
+        self.assertNotIn("[Open]</span>", frame)
         self.assertIn("keep-filter\x1ftrue", frame)
         self.assertIn("new-selection\x1f0", frame)
         self.assertEqual(transport.calls, 0)
