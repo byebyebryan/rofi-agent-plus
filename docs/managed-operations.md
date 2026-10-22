@@ -1,7 +1,7 @@
 # Agent Plus managed operations
 
-The direct-TUI trial selects `0.15.0a13` on Starship and Snap. Its immutable
-wheel and selected hosts are recorded in
+This guide describes the repository owner's chezmoi-managed fleet. The
+selected immutable wheel, version, digest and hosts are recorded in
 [managed-direct-selection.json](../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
 Carbon retains its historical artifact and has no Agent Plus desktop binding.
@@ -51,20 +51,12 @@ The retired Observer/Tmux manifest, three-selector rollback tool and unused
 fixtures have been removed from the current source tree. Their Git checkpoint
 and recovery instructions are in [legacy retirement](legacy-retirement.md).
 Use the captured direct-trial targets above for current rollback. The
-[candidate execution record](direct-tui-candidate-20261021.md) preserves the
-direct artifact's source, wheel and native evidence boundaries.
+[first candidate record](history/direct-tui-candidate-20261021.md) preserves
+the original qualification scope. Later deployment receipts belong to their
+exact source revision and wheel digest; the historical candidate is not a
+fresh acceptance pass for them.
 
-The input regression runs on a private Xvfb display with a separate Rofi PID
-file and inert rows; it sends no input to the physical desktop. Use the selected
-artifact interpreter with isolated imports to qualify both a stale usable list
-and the transition from an empty list:
-
-    "$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$PRIVATE_CACHED_PROOF" cached
-    "$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$PRIVATE_COLD_PROOF" cold
-
-Each output path must be new. The proof sends arrows after idle intervals, checks
-that every arrow advances selection, and rejects automatic timeout callbacks
-after selectable rows appear. The cold case publishes its rows and waits for
-Rofi's actual empty-list idle timeout to load them; no key input drives that
-transition. Tab callbacks only record selection over inert rows. Rofi, Xvfb,
-libX11 and libXtst are required.
+The [development guide](development.md#native-proofs) documents the private
+Xvfb input regression and the other native proof drivers. A documentation or
+repository-metadata update does not alter the immutable selection. Preserve
+the selected artifact while native wrappers still use it.

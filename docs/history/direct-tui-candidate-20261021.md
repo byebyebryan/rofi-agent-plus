@@ -1,5 +1,9 @@
 # Direct TUI candidate execution record
 
+> Historical record from the October 2026 direct-TUI transition. Commands,
+> labels, refresh behavior and completion status below describe that stage.
+> Use the [current guides](../README.md) for present behavior.
+
 The direct environment/window picker is implemented as `0.15.0a1`. This record
 separates the tested candidate from desktop selection, publication and final
 human input acceptance. The original [design](agent-plus-daemon-tui-design.md),
@@ -19,7 +23,7 @@ The source cutover removes the former Observer/Tmux/session runtime and runtime
 dependencies. It adds strict host references, finite passive inventory, canonical
 home/profile identity, private Niri/Kitty registration, replay-safe requests and
 independent foreground clients. The responsibility/test replacement map and
-operational contract are in [SUITE_INTEGRATION.md](SUITE_INTEGRATION.md).
+operational contract are in [SUITE_INTEGRATION.md](../SUITE_INTEGRATION.md).
 
 The candidate uses the plan's **opening/Alt+R snapshot fallback**. Actual Rofi
 2.0 idle-timeout experiments fired once per idle interval rather than providing

@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Render documentation sample rows on a private Xvfb display."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[1]
+
+THEME = """* {
+    font: "DejaVu Sans Mono 13";
+    background-color: #111722;
+    text-color: #e0e2e8;
+    border-color: #303c50;
+}
+window { width: 1120px; border: 1px; padding: 26px; }
+mainbox { children: [inputbar, message, listview]; spacing: 16px; }
+inputbar { children: [prompt, entry]; spacing: 16px; padding: 4px 8px; }
+prompt { text-color: #95c5ff; }
+entry { placeholder: "Search hosts, environments and windows"; }
+message { padding: 8px; }
+textbox { background-color: transparent; }
+listview { lines: 5; fixed-height: true; scrollbar: false; spacing: 6px; }
+element { padding: 14px 12px; border-radius: 6px; }
+element selected.normal { background-color: #253c5c; }
+element-text { background-color: transparent; }
+"""
+
+
+def frame() -> str:
+    sys.path.insert(0, str(ROOT))
+    from rofi_agent_plus.rofi import PickerRow, PickerState, _render
+
+    rows = []
+    examples = [
+        ("workstation", "Codex", "Default", 1, "Review the launcher", "a"),
+        ("workstation", "Codex", "Default", 2, "Update the documentation", "a"),
+        ("workstation", "Claude", "Default", None, "", "b"),
+        ("buildbox", "Codex", "Default", None, "", "c"),
+        ("buildbox", "Codex", "Work", 1, "Project review", "d"),
+    ]
+    for host, provider, environment, number, title, key in examples:
+        target_id = key * 64
+        instance_id = str(number) * 32 if number else None
+        label = f"{host} · {provider} · {environment}"
+        if number:
+            label += f" — Window {number} · {title}"
+        kind = "instance" if number else "target"
+        identity = f"i:{target_id}:{instance_id}" if number else f"t:{target_id}"
+        rows.append(
+            PickerRow(
+                kind,
+                identity,
+                label,
+                label,
+                target_id=target_id,
+                instance_id=instance_id,
+                selectable=True,
+            )
+        )
+    return _render(tuple(rows), PickerState(selected_key=rows[0].key), preserve=False, select=True)
+
+
+def render(output: Path) -> None:
+    for command in ("rofi", "Xvfb", "magick"):
+        if not shutil.which(command):
+            raise ValueError(f"preview requires {command}")
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="agent-plus-preview-") as temporary:
+        private = Path(temporary)
+        theme = private / "preview.rasi"
+        theme.write_text(THEME, encoding="utf-8")
+        data = private / "frame"
+        data.write_text(frame(), encoding="utf-8")
+        callback = private / "callback"
+        callback.write_text(
+            "#!/bin/sh\nexec "
+            + shlex.join([sys.executable, "-B", __file__, "--frame", str(data)])
+            + "\n",
+            encoding="utf-8",
+        )
+        callback.chmod(0o700)
+        xvfb = None
+        rofi = None
+        with (private / "xvfb.log").open("w") as xlog, (private / "rofi.log").open("w") as rlog:
+            try:
+                # displayfd selects an unused private X server. All GUI calls
+                # below receive that display explicitly; Wayland is removed.
+                xvfb = subprocess.Popen(
+                    ["Xvfb", "-displayfd", "1", "-screen", "0", "1200x520x24", "-nolisten", "tcp"],
+                    stdout=subprocess.PIPE,
+                    stderr=xlog,
+                )
+                assert xvfb.stdout is not None
+                import selectors
+
+                with selectors.DefaultSelector() as selector:
+                    selector.register(xvfb.stdout, selectors.EVENT_READ)
+                    if not selector.select(5):
+                        raise ValueError("private X server did not start")
+                    number = xvfb.stdout.readline().decode().strip()
+                if not number.isdecimal():
+                    raise ValueError("private X server returned no display")
+                display = ":" + number
+                env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if k not in {"WAYLAND_DISPLAY", "NIRI_SOCKET"} and not k.startswith("ROFI_")
+                }
+                env.update(DISPLAY=display, XDG_CACHE_HOME=str(private / "cache"))
+                rofi = subprocess.Popen(
+                    [
+                        "rofi",
+                        "-no-config",
+                        "-display",
+                        display,
+                        "-pid",
+                        str(private / "rofi.pid"),
+                        "-theme",
+                        str(theme),
+                        "-no-sort",
+                        "-selected-row",
+                        "0",
+                        "-show",
+                        "agent-plus",
+                        "-modes",
+                        "agent-plus:" + str(callback),
+                    ],
+                    env=env,
+                    stdout=rlog,
+                    stderr=rlog,
+                )
+                deadline = time.monotonic() + 5
+                while not data.with_suffix(".served").exists():
+                    if rofi.poll() is not None or time.monotonic() >= deadline:
+                        raise ValueError(
+                            "preview Rofi did not render: " + (private / "rofi.log").read_text()
+                        )
+                    time.sleep(0.025)
+                time.sleep(0.3)
+                subprocess.run(
+                    [
+                        "magick",
+                        "import",
+                        "-display",
+                        display,
+                        "-window",
+                        "root",
+                        "-trim",
+                        "+repage",
+                        str(output),
+                    ],
+                    env=env,
+                    capture_output=True,
+                    check=True,
+                    timeout=5,
+                )
+            finally:
+                for child in (rofi, xvfb):
+                    if child is not None:
+                        if child.poll() is None:
+                            child.terminate()
+                        try:
+                            child.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait(timeout=3)
+                if xvfb is not None and xvfb.stdout is not None:
+                    xvfb.stdout.close()
+    print(f"Rendered sample data with no provider or desktop actions: {output}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "docs/assets/picker.png")
+    parser.add_argument("--frame", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.frame is not None:
+        sys.stdout.buffer.write(args.frame.read_bytes())
+        args.frame.with_suffix(".served").touch()
+        return 0
+    render(args.output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

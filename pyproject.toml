@@ -5,11 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rofi-agent-plus"
 version = "0.15.0a13"
-description = "Direct native agent manager and TUI window picker"
+description = "Rofi launcher for local and remote Codex and Claude TUIs"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = []
+keywords = ["rofi", "codex", "claude", "niri", "kitty", "ssh", "tui"]
+
+[project.urls]
+Source = "https://github.com/byebyebryan/rofi-agent-plus"
+Documentation = "https://github.com/byebyebryan/rofi-agent-plus/blob/main/docs/README.md"
+Issues = "https://github.com/byebyebryan/rofi-agent-plus/issues"
 
 [project.optional-dependencies]
 dev = ["ruff==0.16.3"]
@@ -22,9 +28,6 @@ rofi-agent-plus-viewer = "rofi_agent_plus.viewer:main"
 
 [tool.setuptools.packages.find]
 include = ["rofi_agent_plus*"]
-
-[tool.setuptools.package-data]
-rofi_agent_plus = ["assets/providers/*.svg"]
 
 [tool.ruff]
 target-version = "py311"

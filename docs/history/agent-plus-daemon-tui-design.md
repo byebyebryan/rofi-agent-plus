@@ -1,5 +1,9 @@
 # Agent Plus daemon and TUI design
 
+> Historical record from the October 2026 direct-TUI transition. Commands,
+> labels, refresh behavior and completion status below describe that stage.
+> Use the [current guides](../README.md) for present behavior.
+
 Date: 2026-10-21
 
 Status: design draft for review. Direct TUIs and individual window rows are the
@@ -508,9 +512,9 @@ human input acceptance and managed rollout remain explicit separate gates.
 
 ## Source references
 
-- [Current Agent Plus runtime](../README.md) and [suite ownership](SUITE_INTEGRATION.md)
+- [Current Agent Plus runtime](../../README.md) and [suite ownership](../SUITE_INTEGRATION.md)
   describe the earlier conversation picker and its unsupported client binding.
-- [Host Mesh v1](../contracts/host-mesh-v1/contract.md) defines logical hosts,
+- [Host Mesh v1](../../contracts/host-mesh-v1/contract.md) defines logical hosts,
   route order, SSH policy and typed failure behavior.
 - Installed `/usr/bin/codex --help`, `codex agents --help` and
   `codex app-server daemon --help` were inspected on 2026-10-21. They establish

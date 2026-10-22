@@ -1,5 +1,9 @@
 # Agent Plus direct TUI implementation plan
 
+> Historical record from the October 2026 direct-TUI transition. Commands,
+> labels, refresh behavior and completion status below describe that stage.
+> Use the [current guides](../README.md) for present behavior.
+
 Date: 2026-10-21
 
 Status: execution plan for an unattended implementation run. Runtime

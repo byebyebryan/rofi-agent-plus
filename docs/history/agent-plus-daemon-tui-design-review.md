@@ -1,5 +1,9 @@
 # Agent Plus daemon and TUI design review
 
+> Historical record from the October 2026 direct-TUI transition. Commands,
+> labels, refresh behavior and completion status below describe that stage.
+> Use the [current guides](../README.md) for present behavior.
+
 Date: 2026-10-21
 
 Reviewed proposal: [Agent Plus daemon and TUI design](agent-plus-daemon-tui-design.md).

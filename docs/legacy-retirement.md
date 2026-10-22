@@ -1,8 +1,8 @@
 # Previous Agent Plus implementation
 
 The direct environment/window picker replaced the conversation picker, Observer
-write client and Tmux viewer runtime. The current package already contains only
-the direct implementation. This cleanup removes its unused supporting files:
+write client and Tmux viewer runtime. The retirement removed these unused
+supporting files:
 
 - The Tmux Session contract bundle and old consumer/Observer fixture corpora.
 - The unused Observer fixture helper.
@@ -39,5 +39,7 @@ Chezmoi no longer declares the old picker archive or manages its legacy
 deployment preimages and running native clients are retained. Carbon keeps its
 previous archive/configuration and has no Mod+A binding.
 
-This cleanup changes source support files and management policy; the installed
-direct package bytes and version remain unchanged.
+The October 2026 retirement changed source support files and management policy.
+It preserved installed direct package bytes and existing native clients.
+The [history index](history/README.md) separates the original transition plans
+and candidate evidence from the current guides.

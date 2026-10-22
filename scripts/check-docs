@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Check repository-local Markdown links, images and heading anchors."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+LINK = re.compile(r"\[[^\]\n]*\]\(([^\s)]+)(?:\s+\"[^\"]*\")?\)")
+
+
+def prose(text: str) -> str:
+    return re.sub(r"^(`{3,}|~{3,}).*?^\1[^\n]*$", "", text, flags=re.MULTILINE | re.DOTALL)
+
+
+def anchors(path: Path) -> set[str]:
+    result: set[str] = set()
+    counts: dict[str, int] = {}
+    for heading in re.findall(r"^#{1,6}\s+(.+?)\s*#*\s*$", prose(path.read_text()), re.MULTILINE):
+        heading = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", heading)
+        base = re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+        count = counts.get(base, 0)
+        result.add(base + (f"-{count}" if count else ""))
+        counts[base] = count + 1
+    result.update(re.findall(r'<a\s+(?:id|name)=["\']([^"\']+)', path.read_text()))
+    return result
+
+
+def main() -> int:
+    paths = (
+        subprocess.check_output(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT
+        )
+        .decode()
+        .split("\0")
+    )
+    errors = []
+    count = 0
+    for name in sorted(set(paths)):
+        path = ROOT / name
+        if not name.endswith(".md") or not path.is_file():
+            continue
+        count += 1
+        for match in LINK.finditer(prose(path.read_text())):
+            target = urlsplit(match.group(1).strip("<>"))
+            if target.scheme or target.netloc:
+                continue
+            resolved = (path.parent / unquote(target.path)).resolve() if target.path else path
+            if not resolved.is_relative_to(ROOT) or not resolved.exists():
+                errors.append(f"{name}: missing local target {match.group(1)}")
+            elif target.fragment and resolved.suffix == ".md":
+                if unquote(target.fragment) not in anchors(resolved):
+                    errors.append(f"{name}: missing heading {match.group(1)}")
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+    print(f"Documentation links and images passed ({count} Markdown files)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -280,8 +280,8 @@ class DirectHostTests(unittest.TestCase):
         alias.symlink_to(self.harness.codex_home, target_is_directory=True)
         config = self.harness.write_config(
             [
-                {"provider": "codex", "home": "~/.codex", "label": "OSS"},
-                {"provider": "codex", "home": str(alias), "label": "OSS", "id": "same-target"},
+                {"provider": "codex", "home": "~/.codex", "label": "Personal"},
+                {"provider": "codex", "home": str(alias), "label": "Personal", "id": "same-target"},
                 {"provider": "codex", "home": "~/.codex-work", "label": "Work"},
                 {"provider": "codex", "home": "~/.codex-missing", "label": "Missing"},
             ]
@@ -291,7 +291,7 @@ class DirectHostTests(unittest.TestCase):
         self.assertEqual(len(codex_targets), 3)
         self.assertEqual(len({target.key.identity for target in codex_targets}), 3)
         by_home = {target.key.home: target for target in codex_targets}
-        self.assertEqual(by_home[str(self.harness.codex_home)].label, "OSS")
+        self.assertEqual(by_home[str(self.harness.codex_home)].label, "Personal")
         self.assertEqual(by_home[str(self.harness.codex_home)].daemon.status, "stopped")
         self.assertEqual(by_home[str(self.harness.work_home)].daemon.status, "unknown")
         self.assertEqual(by_home[str(self.harness.work_home)].capability.status, "supported")
