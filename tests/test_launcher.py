@@ -77,6 +77,7 @@ class LauncherTest(unittest.TestCase):
             self.assertEqual("Tab", argv[argv.index("-kb-custom-7") + 1])
             self.assertEqual("ISO_Left_Tab", argv[argv.index("-kb-custom-8") + 1])
             self.assertNotIn("-kb-custom-2", argv)
+            self.assertIn("-no-sort", argv)
             self.assertIn("Control+f", argv)
             self.assertIn("Control+b", argv)
             self.assertNotIn("ROFI_RETV", calls[0][1])

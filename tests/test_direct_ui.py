@@ -568,7 +568,7 @@ class PickerCallbackTests(unittest.TestCase):
 
         self.assertEqual(transport.calls, 1)
         self.assertIn("Fresh catalog label", output.getvalue())
-        self.assertIn("Host inventory refreshed", output.getvalue())
+        self.assertIn("\x00message\x1f\x1e", output.getvalue())
         self.assertIn("new-selection\x1f0", output.getvalue())
 
     def test_missing_catalog_renders_immediately_without_waiting_for_discovery(self):
@@ -638,11 +638,32 @@ class PickerCallbackTests(unittest.TestCase):
             self.assertIn("Open another window", frame)
             self.assertIn("a" * 32, frame)
             self.assertIn(f"timeout {{ delay: {0.0 if complete else 0.2};", frame)
-            if complete:
-                self.assertIn("\x00message\x1f\x1e", frame)
-                self.assertNotIn("Refreshing host inventory", frame)
-            else:
-                self.assertIn("\x00message\x1fRefreshing host inventory", frame)
+            self.assertIn("\x00message\x1f\x1e", frame)
+            self.assertNotIn("Refreshing host inventory", frame)
+        self.assertEqual(transport.calls, 0)
+
+    def test_cached_startup_frame_is_silent_while_discovery_runs(self):
+        import contextlib
+
+        from rofi_agent_plus.startup_refresh import StartupRefresh, finish_refresh
+
+        context, transport, _actions = self._context()
+        directory = self.root / "launch"
+        directory.mkdir(mode=0o700)
+        refresh = StartupRefresh(directory, Path("/unused"), {})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            run_rofi(dict(refresh.env, ROFI_RETV="0"), context=context)
+        self.assertIn(self.target.label, output.getvalue())
+        self.assertNotIn("Refreshing host inventory", output.getvalue())
+        self.assertIn("\x00message\x1f\n", output.getvalue())
+        self.assertIn("delay: 0.2", output.getvalue())
+        finish_refresh(refresh.env, "controlled failure")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            run_rofi(dict(refresh.env, ROFI_RETV="28"), context=context)
+        self.assertIn("controlled failure", output.getvalue())
+        self.assertIn("delay: 0.0", output.getvalue())
         self.assertEqual(transport.calls, 0)
 
     def test_startup_poll_loads_newly_published_rows_and_alt_r_joins_pending_refresh(self):
@@ -667,6 +688,7 @@ class PickerCallbackTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 run_rofi(dict(env, ROFI_RETV=retv), context=context)
             self.assertIn(self.target.label, output.getvalue())
+            self.assertNotIn("Refreshing host inventory", output.getvalue())
         self.assertEqual(transport.calls, 0)
         finish_refresh(env, "offline test peer")
         output = io.StringIO()
@@ -727,6 +749,54 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertFalse(frame_state(second).restore_selection)
         self.assertEqual(frame_state(second).selected_key, selected.key)
         self.assertEqual(transport.calls, 0)
+
+    def test_later_rows_do_not_require_selection_correction(self):
+        from rofi_agent_plus.rofi import _parse_state, _render
+
+        rows = build_rows(self.snapshot)
+        initial = _render(
+            rows,
+            PickerState(selected_key=rows[0].key, request_id="a" * 32),
+            preserve=False,
+            select=True,
+        )
+        state = _parse_state(
+            next(
+                line.split("\x1f", 1)[1]
+                for line in initial.splitlines()
+                if line.startswith("\x00data\x1f")
+            )
+        )
+        for changed in (
+            (*rows, replace(rows[-1], key="t:" + "f" * 64)),
+            (rows[0], replace(rows[1], display="Renamed later row")),
+        ):
+            frame = _render(changed, state, preserve=True, select=True)
+            self.assertIn("new-selection\x1f0", frame)
+            self.assertIn("delay: 0.0", frame)
+            self.assertIn('"restoreSelection":false', frame)
+        # A search-matching field before the selection can change its filtered
+        # position even when row identities and absolute indexes are unchanged.
+        initial = _render(
+            rows,
+            PickerState(selected_key=rows[1].key, request_id="a" * 32),
+            preserve=False,
+            select=True,
+        )
+        state = _parse_state(
+            next(
+                line.split("\x1f", 1)[1]
+                for line in initial.splitlines()
+                if line.startswith("\x00data\x1f")
+            )
+        )
+        frame = _render(
+            (replace(rows[0], meta="Changed filter metadata"), rows[1]),
+            state,
+            preserve=True,
+            select=True,
+        )
+        self.assertIn("delay: 0.02", frame)
 
     def test_enter_replay_reuses_request_id_and_registry_dispatch(self):
         context, _transport, actions = self._context()

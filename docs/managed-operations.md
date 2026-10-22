@@ -1,6 +1,6 @@
 # Agent Plus managed operations
 
-The direct-TUI trial selects `0.15.0a5` on Starship and Snap. Its immutable
+The direct-TUI trial selects `0.15.0a6` on Starship and Snap. Its immutable
 wheel and selected hosts are recorded in
 [managed-direct-selection.json](../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.

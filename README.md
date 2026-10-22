@@ -173,8 +173,12 @@ Opening the dialog immediately uses the saved catalog and current local windows.
 If the catalog is missing or stale, the launcher starts one background refresh
 after launching Rofi. The dialog reads published results while that refresh is
 pending, preserving the filter, selected row identity and chosen action. Redraw
-checks stop when the refresh finishes or its deadline expires. A new install
-shows discovery progress until its first targets arrive. Fresh catalogs need no
+checks stop when the refresh finishes or its deadline expires. Refreshing is
+silent whenever the list has a selectable target or window; progress appears
+only for an empty list, and failures remain visible. Native search retains the
+flat host/environment/window order. Selection correction runs only when rows
+through the selected row change, so later additions need no extra callback.
+Fresh catalogs need no
 background work. Alt+R explicitly refreshes before redrawing, or joins an already
 pending startup refresh. The fleet deadline is 20 seconds, with
 12 seconds per host and at most four concurrent host workers. Each host result

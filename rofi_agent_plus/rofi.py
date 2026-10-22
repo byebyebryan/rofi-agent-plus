@@ -26,7 +26,7 @@ from .model import (
     parse_target,
 )
 from .registry import Instance, Registry, RegistryError, target_storage_key
-from .startup_refresh import POLL_SECONDS, read_status
+from .startup_refresh import POLL_SECONDS, RefreshStatus, read_status
 from .transport import Transport, TransportError
 from .view_preferences import ViewPreference, ViewPreferenceStore
 
@@ -112,6 +112,7 @@ class PickerState:
     notice: str = ""
     row_revision: str | None = None
     restore_selection: bool = False
+    prefix_revision: str | None = None
 
 
 @dataclass
@@ -483,6 +484,7 @@ def _state_json(state: PickerState) -> str:
         "notice": clean_text(state.notice, limit=MAX_MESSAGE_LENGTH),
         "rowRevision": state.row_revision,
         "restoreSelection": state.restore_selection,
+        "prefixRevision": state.prefix_revision,
     }
     encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_DATA_BYTES:
@@ -507,7 +509,7 @@ def _parse_state(raw: object) -> PickerState:
     if (
         not isinstance(value, dict)
         or not expected <= set(value)
-        or set(value) - expected - {"rowRevision", "restoreSelection"}
+        or set(value) - expected - {"rowRevision", "restoreSelection", "prefixRevision"}
         or type(value.get("schemaVersion")) is not int
         or value["schemaVersion"] != 1
     ):
@@ -526,7 +528,10 @@ def _parse_state(raw: object) -> PickerState:
     if not isinstance(revision, str) or not _HEX_64.fullmatch(revision):
         revision = None
     restore = value.get("restoreSelection") is True and revision is not None
-    return PickerState(key, action, request_id, notice, revision, restore)
+    prefix = value.get("prefixRevision")
+    if not isinstance(prefix, str) or not _HEX_64.fullmatch(prefix):
+        prefix = None
+    return PickerState(key, action, request_id, notice, revision, restore, prefix)
 
 
 def _local_view(context: PickerContext) -> tuple[tuple[Window, ...], str | None]:
@@ -566,19 +571,25 @@ def _render(
     polling: bool = False,
 ) -> str:
     prompt = "Open another window" if state.action == ACTION_ADDITIONAL else "Open"
-    revision = hashlib.sha256(
-        json.dumps([(row.key, row.selectable) for row in rows]).encode()
+    signatures = [(row.key, row.selectable, row.display, row.meta) for row in rows]
+    revision = hashlib.sha256(json.dumps(signatures).encode()).hexdigest()
+    index = _selected_index(rows, state.selected_key)
+    prefix = hashlib.sha256(
+        json.dumps(signatures[: index + 1] if index is not None else []).encode()
     ).hexdigest()
     restore = (
         preserve
         and state.row_revision is not None
         and state.row_revision != revision
-        and _selected_index(rows, state.selected_key) is not None
+        and state.prefix_revision != prefix
+        and index is not None
     )
     # Rofi applies new-selection against the *previous* filtered line map.
     # After rows change, restore identity in one short follow-up once Rofi has
-    # rebuilt that map. Explicit user actions still honor their current row.
-    state = replace(state, row_revision=revision, restore_selection=restore)
+    # rebuilt that map. With native sorting disabled, unchanged rows through
+    # the selection need no correction when later rows arrive or change.
+    # Explicit user actions still honor their current row.
+    state = replace(state, row_revision=revision, restore_selection=restore, prefix_revision=prefix)
     delay = 0.02 if restore else (POLL_SECONDS if polling else 0.0)
     headers = [
         _protocol("prompt", prompt),
@@ -600,7 +611,6 @@ def _render(
         _protocol("message", clean_text(state.notice, limit=MAX_MESSAGE_LENGTH)),
     ]
     if select and not restore:
-        index = _selected_index(rows, state.selected_key)
         if index is not None:
             headers.append(_protocol("new-selection", index))
     rendered: list[str] = []
@@ -625,6 +635,12 @@ def _load_snapshot(context: PickerContext) -> tuple[CatalogSnapshot | None, str 
         return context.cache.load(), None
     except CacheError as error:
         return None, f"Catalog cache unavailable · {error}"
+
+
+def _refresh_notice(refresh: RefreshStatus | None, rows: tuple[PickerRow, ...]) -> str:
+    if refresh is None or (refresh.pending and any(row.selectable for row in rows)):
+        return ""
+    return refresh.message
 
 
 def _refresh(context: PickerContext) -> tuple[CatalogSnapshot | None, str | None]:
@@ -729,11 +745,12 @@ def run_rofi(
         saved = context.preferences.load()
         snapshot, cache_error = _load_snapshot(context)
         notice = cache_error or ""
-        if refresh is not None:
-            notice = notice or refresh.message
-        elif snapshot is not None and snapshot.is_stale(context.config.desktop.catalog_ttl_seconds):
+        if (
+            refresh is None
+            and snapshot is not None
+            and snapshot.is_stale(context.config.desktop.catalog_ttl_seconds)
+        ):
             notice = notice or "Showing saved inventory; use Alt+R to refresh"
-        state = replace(state, notice=notice)
         windows, window_error = _local_view(context)
         rows = build_rows(
             snapshot,
@@ -742,6 +759,7 @@ def run_rofi(
             windows=windows,
             desktop_error=window_error,
         )
+        state = replace(state, notice=notice or _refresh_notice(refresh, rows))
         if context.config_error:
             state = replace(
                 state, notice=f"Configuration ignored · {clean_text(context.config_error)}"
@@ -764,7 +782,12 @@ def run_rofi(
             if raw_info["kind"] == "target"
             else f"i:{raw_info['targetId']}:{raw_info['instanceId']}"
         )
-    state = replace(state, selected_key=selected_key, notice=notice)
+    state = replace(
+        state,
+        selected_key=selected_key,
+        notice=notice,
+        prefix_revision=state.prefix_revision if selected_key == state.selected_key else None,
+    )
     did_action = False
 
     if retv == ROFI_RETV_CUSTOM_1:
@@ -773,7 +796,7 @@ def run_rofi(
             snapshot, refresh_error = _refresh(context)
         state = replace(
             state,
-            notice=refresh.message if polling else (refresh_error or "Host inventory refreshed"),
+            notice=refresh.message if polling else (refresh_error or ""),
         )
     elif retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
         action = ACTION_ADDITIONAL if state.action == ACTION_OPEN else ACTION_OPEN
@@ -834,16 +857,19 @@ def run_rofi(
         windows=windows,
         desktop_error=window_error,
     )
+    if retv == ROFI_RETV_CUSTOM_19 or (retv == ROFI_RETV_CUSTOM_1 and polling):
+        state = replace(state, notice=_refresh_notice(refresh, rows))
     if state.selected_key and not any(row.key == state.selected_key for row in rows):
         fallback = state.selected_key.split(":", 2)
         target_key = f"t:{fallback[1]}" if len(fallback) > 1 else None
         if target_key and any(row.key == target_key and row.selectable for row in rows):
-            state = replace(state, selected_key=target_key)
+            state = replace(state, selected_key=target_key, prefix_revision=None)
         else:
             next_key = next((row.key for row in rows if row.selectable), None)
             state = replace(
                 state,
                 selected_key=next_key,
+                prefix_revision=None,
                 notice=state.notice or "Selected window is no longer present",
             )
     select = (

@@ -157,6 +157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     str(_selected_row(frame)),
                     "-filter",
                     "",
+                    "-no-sort",
                     *arguments,
                 ],
                 env=environment,
