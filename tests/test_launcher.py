@@ -1,10 +1,10 @@
-"""Selection restoration must use the same first frame Rofi displays."""
+"""Launch frame selection and exact Rofi child lifetime."""
 
 from __future__ import annotations
 
 import io
 import os
-import subprocess
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,99 +13,183 @@ from unittest import mock
 from rofi_agent_plus import app, launcher
 
 
+class FakeProcess:
+    def __init__(self, values=(0,)):
+        self.values = list(values)
+        self.returncode = None
+        self.signals: list[int] = []
+        self.waited = False
+
+    def poll(self):
+        if self.returncode is None and self.values:
+            value = self.values.pop(0)
+            if value is not None:
+                self.returncode = value
+        return self.returncode
+
+    def send_signal(self, value):
+        self.signals.append(value)
+        self.returncode = 128 + value
+
+    def wait(self, timeout=None):
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
 class LauncherTest(unittest.TestCase):
-    def test_installed_default_mode_uses_sibling_cli_from_same_artifact(self) -> None:
+    def test_default_bindings_select_flat_open_and_native_search(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            commands = root / "bin"
-            commands.mkdir()
-            agent = commands / "rofi-agent-plus"
-            agent.write_text("#!/bin/sh\nexit 0\n")
-            agent.chmod(0o700)
-            entry = commands / "rofi-agent-plus-rofi"
-            entry.write_text("#!/bin/sh\nexit 0\n")
-            entry.chmod(0o700)
+            executable = Path(temporary) / "rofi-agent-plus"
+            executable.touch()
+            rofi = FakeProcess()
+            calls = []
+
+            def render(environment):
+                self.assertEqual("0", environment["ROFI_RETV"])
+                print("\x00new-selection\x1f1\nOne\x00info\x1f{}")
+
+            def popen(argv, *, env, **kwargs):
+                calls.append((argv, env, kwargs))
+                self.assertTrue(argv[0] in {"rofi", str(executable)})
+                return rofi
+
             with (
-                mock.patch("sys.argv", [str(entry)]),
-                mock.patch.object(launcher, "__file__", str(root / "site-packages/launcher.py")),
-                mock.patch.object(launcher, "run_rofi", side_effect=lambda _env: print("row")),
-                mock.patch.object(launcher.subprocess, "run") as run,
+                mock.patch.object(launcher, "_agent_executable", return_value=executable),
+                mock.patch.object(launcher, "run_rofi", side_effect=render),
+                mock.patch.object(launcher.subprocess, "Popen", side_effect=popen),
+                mock.patch.dict(os.environ, {"ROFI_RETV": "19", "ROFI_DATA": "old"}),
             ):
-                run.return_value.returncode = 0
                 self.assertEqual(0, launcher.main([]))
-                argv = run.call_args.args[0]
-                self.assertEqual(f"agent-plus:{agent}", argv[argv.index("-modes") + 1])
+            argv = calls[0][0]
+            self.assertEqual("Alt+r", argv[argv.index("-kb-custom-1") + 1])
+            self.assertEqual("Tab", argv[argv.index("-kb-custom-7") + 1])
+            self.assertEqual("ISO_Left_Tab", argv[argv.index("-kb-custom-8") + 1])
+            self.assertNotIn("-kb-custom-2", argv)
+            self.assertIn("Control+f", argv)
+            self.assertIn("Control+b", argv)
+            self.assertNotIn("ROFI_RETV", calls[0][1])
 
-    def test_initial_frame_is_shared_and_removed_without_second_discovery(self) -> None:
-        frame = "\x00new-selection\x1f2\n\x00delim\x1f\\t\na\tb\tc\t"
-        path_seen: list[Path] = []
+    def test_first_frame_is_shared_and_selected_row_is_passed_to_rofi(self):
+        frame = "\x00new-selection\x1f2\n\x00delim\x1f\\t\nOne\tTwo\t"
+        rofi = FakeProcess((0,))
 
-        def render(environment: dict[str, str]) -> int:
+        def render(environment):
             self.assertEqual("0", environment["ROFI_RETV"])
             self.assertNotIn("ROFI_DATA", environment)
             print(frame, end="")
-            return 0
 
-        def launch(
-            arguments: list[str], *, env: dict[str, str], check: bool
-        ) -> subprocess.CompletedProcess:
-            self.assertEqual(["rofi", "-selected-row", "2", "-filter", ""], arguments[:5])
-            self.assertNotIn("ROFI_RETV", env)
-            path = Path(env[launcher.INITIAL_FRAME_ENV])
-            path_seen.append(path)
-            self.assertEqual(0o600, path.stat().st_mode & 0o777)
-            self.assertEqual(0o700, path.parent.stat().st_mode & 0o777)
-            with (
-                mock.patch.dict(os.environ, dict(env, ROFI_RETV="0"), clear=True),
-                mock.patch("rofi_agent_plus.app.run_rofi") as rediscover,
-                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
-            ):
-                self.assertEqual(0, app.main([]))
-                self.assertEqual(frame, output.getvalue())
-                rediscover.assert_not_called()
-            self.assertIsNone(launcher.initial_frame(dict(env, ROFI_RETV="11")))
-            return subprocess.CompletedProcess(arguments, 0)
+        calls = []
+
+        def launch(argv, *, env, **kwargs):
+            calls.append((argv, env, kwargs))
+            self.assertEqual(["rofi", "-selected-row", "2", "-filter", ""], argv[:5])
+            frame_path = Path(env[launcher.INITIAL_FRAME_ENV])
+            self.assertEqual(0o600, frame_path.stat().st_mode & 0o777)
+            self.assertEqual(0o700, frame_path.parent.stat().st_mode & 0o777)
+            self.assertEqual(frame, launcher.initial_frame(dict(env, ROFI_RETV="0")))
+            return rofi
 
         with (
-            mock.patch.dict(os.environ, {"ROFI_RETV": "1", "ROFI_DATA": "old"}),
-            mock.patch("rofi_agent_plus.launcher.run_rofi", side_effect=render) as renderer,
-            mock.patch("rofi_agent_plus.launcher.subprocess.run", side_effect=launch),
+            mock.patch.object(
+                launcher, "_agent_executable", return_value=Path("/artifact/bin/rofi-agent-plus")
+            ),
+            mock.patch.object(launcher, "run_rofi", side_effect=render),
+            mock.patch.object(launcher.subprocess, "Popen", side_effect=launch),
+            mock.patch.dict(os.environ, {"ROFI_RETV": "1", "ROFI_DATA": "stale"}),
         ):
             self.assertEqual(0, launcher.main(["-show", "agent-plus"]))
-        renderer.assert_called_once()
-        self.assertFalse(path_seen[0].exists())
+        self.assertEqual(1, len(calls))
+        self.assertNotIn("ROFI_AGENT_PLUS_REFRESH_REQUEST", calls[0][1])
+        self.assertNotIn("ROFI_AGENT_PLUS_REFRESH_STATUS", calls[0][1])
+        self.assertTrue(rofi.waited)
+        self.assertFalse(Path(calls[0][1][launcher.INITIAL_FRAME_ENV]).exists())
 
-    def test_unsafe_or_missing_frame_uses_normal_render(self) -> None:
+    def test_keyboard_interrupt_cancels_only_the_rofi_child(self):
+        class InterruptedProcess(FakeProcess):
+            def wait(self, timeout=None):
+                if not self.signals:
+                    raise KeyboardInterrupt
+                return super().wait(timeout)
+
+        rofi = InterruptedProcess(values=())
+        launched = []
+
+        def render(_environment):
+            print("frame")
+
+        def launch(argv, **kwargs):
+            launched.append(argv)
+            return rofi
+
+        with (
+            mock.patch.object(
+                launcher, "_agent_executable", return_value=Path("/artifact/bin/rofi-agent-plus")
+            ),
+            mock.patch.object(launcher, "run_rofi", side_effect=render),
+            mock.patch.object(launcher.subprocess, "Popen", side_effect=launch),
+        ):
+            self.assertEqual(130, launcher.main(["-show", "agent-plus"]))
+
+        self.assertEqual(["rofi", "-selected-row", "0", "-filter", ""], launched[0][:5])
+        self.assertEqual([signal.SIGINT], rofi.signals)
+        self.assertTrue(rofi.waited)
+
+    def test_initial_frame_rejects_wrong_owner_mode_symlink_and_size(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "frame"
-            path.write_text("frame")
-            path.chmod(0o644)
+            root = Path(temporary)
+            path = root / "frame"
+            path.write_text("frame", encoding="utf-8")
             env = {"ROFI_RETV": "0", launcher.INITIAL_FRAME_ENV: str(path)}
             self.assertIsNone(launcher.initial_frame(env))
             path.chmod(0o600)
             self.assertEqual("frame", launcher.initial_frame(env))
-            link = Path(temporary) / "link"
+            link = root / "link"
             link.symlink_to(path)
             self.assertIsNone(
-                launcher.initial_frame(dict(env, ROFI_AGENT_PLUS_INITIAL_FRAME=str(link)))
+                launcher.initial_frame({**env, launcher.INITIAL_FRAME_ENV: str(link)})
             )
-            path.unlink()
-            self.assertIsNone(launcher.initial_frame(env))
+            self.assertIsNone(launcher.initial_frame({**env, "ROFI_RETV": "1"}))
 
-    def test_rofi_launch_failure_cleans_the_private_frame(self) -> None:
+    def test_frame_or_rofi_failure_cleans_the_private_session_directory(self):
         frames: list[Path] = []
 
-        def failure(_arguments: list[str], *, env: dict[str, str], check: bool) -> None:
+        def render(environment):
+            print("frame")
+
+        def failure(_argv, *, env, **_kwargs):
             frames.append(Path(env[launcher.INITIAL_FRAME_ENV]))
-            raise OSError("synthetic launch failure")
+            raise OSError("controlled Rofi failure")
 
         with (
-            mock.patch("rofi_agent_plus.launcher.run_rofi", side_effect=lambda _env: print("row")),
-            mock.patch("rofi_agent_plus.launcher.subprocess.run", side_effect=failure),
+            mock.patch.object(
+                launcher, "_agent_executable", return_value=Path("/artifact/bin/agent")
+            ),
+            mock.patch.object(launcher, "run_rofi", side_effect=render),
+            mock.patch.object(launcher.subprocess, "Popen", side_effect=failure),
             mock.patch("sys.stderr", new_callable=io.StringIO),
         ):
             self.assertEqual(1, launcher.main(["-show", "agent-plus"]))
         self.assertFalse(frames[0].exists())
+
+    def test_app_reuses_the_prepared_first_frame_without_discovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "frame"
+            path.write_text("prepared", encoding="utf-8")
+            path.chmod(0o600)
+            env = {"ROFI_RETV": "0", launcher.INITIAL_FRAME_ENV: str(path)}
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("rofi_agent_plus.app.run_rofi") as rediscover,
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                self.assertEqual(0, app.main([]))
+            self.assertEqual("prepared", output.getvalue())
+            rediscover.assert_not_called()
 
 
 if __name__ == "__main__":

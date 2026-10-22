@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 2 ]; then
-    echo "usage: $0 SSH_CHECKOUT TMUX_CHECKOUT" >&2
+if [ "$#" -ne 1 ]; then
+    echo "usage: $0 SSH_CHECKOUT" >&2
     exit 2
 fi
 
@@ -24,7 +24,6 @@ HEX = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 EXPECTED = {
     "host-mesh-v1": "https://github.com/byebyebryan/rofi-ssh-plus",
-    "tmux-session-v1": "https://github.com/byebyebryan/rofi-tmux-plus",
 }
 
 
@@ -187,9 +186,6 @@ def compare(name: str, source_checkout: Path, target_root: Path) -> None:
 
 
 ssh_checkout = Path(sys.argv[2]).resolve()
-tmux_checkout = Path(sys.argv[3]).resolve()
 compare("host-mesh-v1", ssh_checkout, ROOT / "contracts" / "host-mesh-v1")
-compare("tmux-session-v1", tmux_checkout, ROOT / "contracts" / "tmux-session-v1")
 print(f"Host Mesh bundle sha256:{hashlib.sha256((ROOT / 'contracts/host-mesh-v1/SHA256SUMS').read_bytes()).hexdigest()}")
-print(f"Tmux Session bundle sha256:{hashlib.sha256((ROOT / 'contracts/tmux-session-v1/SHA256SUMS').read_bytes()).hexdigest()}")
 PY

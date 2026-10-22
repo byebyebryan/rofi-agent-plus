@@ -1,4 +1,4 @@
-"""Private, best-effort storage for Agent Plus picker navigation hints."""
+"""Private direct-v1 selection hints for stable picker redraws."""
 
 from __future__ import annotations
 
@@ -9,226 +9,112 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote, unquote_to_bytes
 
-from . import engine
-from .session_identity import SessionIdentity, logical_identity
+SCHEMA_VERSION = 1
+MAX_RECORD_BYTES = 4096
+_TARGET_ID = re.compile(r"[a-f0-9]{64}\Z", re.ASCII)
+_INSTANCE_ID = re.compile(r"[a-f0-9]{32}\Z", re.ASCII)
 
-PREFERENCE_VERSION = 2
-PREFERENCE_DATA_PREFIX = "last-used:"
-MAX_RECORD_BYTES = 64 * 1024
-MAX_ID_LENGTH = 16 * 1024
-_HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
-_PROVIDERS = frozenset({"codex", "claude"})
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("preference contains a duplicate JSON field")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True)
 class ViewPreference:
-    """One saved page and the last successfully used conversation identity."""
-
-    page_kind: str = "all"
-    page_host_id: str | None = None
-    last_used: SessionIdentity | None = None
+    last_target_id: str | None = None
+    last_instance_id: str | None = None
 
 
-def _valid_host_id(value: object) -> bool:
-    return isinstance(value, str) and len(value) <= 256 and _HOST_ID.fullmatch(value) is not None
-
-
-def _valid_identity(value: object) -> SessionIdentity | None:
+def _valid(value: object) -> ViewPreference | None:
     if not isinstance(value, dict) or set(value) != {
-        "hostId",
-        "provider",
-        "sessionId",
-        "namespace",
-        "nativeIdKind",
+        "schemaVersion",
+        "lastTargetId",
+        "lastInstanceId",
     }:
         return None
-    host_id = value.get("hostId")
-    provider = value.get("provider")
-    session_id = value.get("sessionId")
-    if (
-        not _valid_host_id(host_id)
-        or not isinstance(provider, str)
-        or provider not in _PROVIDERS
-        or not isinstance(session_id, str)
-        or not session_id
-        or len(session_id) > MAX_ID_LENGTH
+    if type(value["schemaVersion"]) is not int or value["schemaVersion"] != SCHEMA_VERSION:
+        return None
+    target, instance = value["lastTargetId"], value["lastInstanceId"]
+    if target is not None and (not isinstance(target, str) or not _TARGET_ID.fullmatch(target)):
+        return None
+    if instance is not None and (
+        not isinstance(instance, str) or not _INSTANCE_ID.fullmatch(instance)
     ):
         return None
-    if engine.UUID_PATTERN.fullmatch(session_id) is None:
+    if instance is not None and target is None:
         return None
-    return logical_identity(
-        {
-            "hostId": host_id,
-            "kind": provider,
-            "id": session_id,
-            "namespace": value["namespace"],
-            "nativeIdKind": value["nativeIdKind"],
-        }
-    )
-
-
-def _identity_json(identity: SessionIdentity | None) -> dict[str, str] | None:
-    if identity is None:
-        return None
-    if not isinstance(identity, tuple) or len(identity) != 5:
-        return None
-    host_id, provider, session_id, namespace, native_kind = identity
-    value = {
-        "hostId": host_id,
-        "provider": provider,
-        "sessionId": session_id,
-        "namespace": namespace,
-        "nativeIdKind": native_kind,
-    }
-    parsed = _valid_identity(value)
-    if parsed is None:
-        return None
-    return value
-
-
-def _preference_json(preference: ViewPreference) -> dict[str, object] | None:
-    if not isinstance(preference, ViewPreference):
-        return None
-    page: dict[str, str] = {"kind": preference.page_kind}
-    if preference.page_kind == "host":
-        if not _valid_host_id(preference.page_host_id):
-            return None
-        page["hostId"] = preference.page_host_id
-    elif (
-        preference.page_kind not in {"active", "open", "all", "local"}
-        or preference.page_host_id is not None
-    ):
-        return None
-    identity = _identity_json(preference.last_used)
-    if preference.last_used is not None and identity is None:
-        return None
-    return {"version": PREFERENCE_VERSION, "page": page, "lastUsed": identity}
-
-
-def _parse_preference(value: object) -> ViewPreference | None:
-    if not isinstance(value, dict) or set(value) != {"version", "page", "lastUsed"}:
-        return None
-    version = value.get("version")
-    page = value.get("page")
-    if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version != PREFERENCE_VERSION
-        or not isinstance(page, dict)
-        or not isinstance(page.get("kind"), str)
-    ):
-        return None
-    kind = page["kind"]
-    if kind == "host":
-        if set(page) != {"kind", "hostId"} or not _valid_host_id(page.get("hostId")):
-            return None
-        host_id = page["hostId"]
-    elif kind in {"active", "open", "all", "local"}:
-        if set(page) != {"kind"}:
-            return None
-        host_id = None
-    else:
-        return None
-
-    raw_identity = value.get("lastUsed")
-    if raw_identity is None:
-        identity = None
-    else:
-        identity = _valid_identity(raw_identity)
-        if identity is None:
-            return None
-    return ViewPreference(kind, host_id, identity)
-
-
-def encode_last_used(identity: SessionIdentity | None) -> str | None:
-    """Encode a validated identity for private Rofi continuation data."""
-
-    identity_json = _identity_json(identity)
-    if identity is None or identity_json is None:
-        return None
-    payload = {"version": PREFERENCE_VERSION, "lastUsed": identity_json}
-    encoded = quote(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), safe="")
-    return PREFERENCE_DATA_PREFIX + encoded
-
-
-def parse_last_used(value: object) -> SessionIdentity | None:
-    """Parse the optional last-used identity carried between Rofi callbacks."""
-
-    if not isinstance(value, str) or len(value) > MAX_RECORD_BYTES:
-        return None
-    components = [
-        component[len(PREFERENCE_DATA_PREFIX) :]
-        for component in value.split(";")
-        if component.startswith(PREFERENCE_DATA_PREFIX)
-    ]
-    if len(components) != 1 or not components[0]:
-        return None
-    try:
-        payload = json.loads(unquote_to_bytes(components[0]).decode("utf-8"))
-    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
-        return None
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != {"version", "lastUsed"}
-        or isinstance(payload.get("version"), bool)
-        or not isinstance(payload.get("version"), int)
-        or payload.get("version") != PREFERENCE_VERSION
-    ):
-        return None
-    return _valid_identity(payload.get("lastUsed"))
+    return ViewPreference(target, instance)
 
 
 class ViewPreferenceStore:
-    """Load and atomically write ``$XDG_STATE_HOME/rofi-agent-plus/view.json``."""
+    """Atomically persist the last successful target and optional instance."""
 
-    def __init__(self, state_home: str | Path | None = None) -> None:
-        if state_home is None:
-            configured = os.environ.get("XDG_STATE_HOME", "")
-            candidate = Path(configured).expanduser() if configured else None
-            if candidate is not None and candidate.is_absolute():
-                state_home = candidate
-            else:
-                state_home = Path.home() / ".local" / "state"
-        self.path = Path(state_home) / "rofi-agent-plus" / "view.json"
+    def __init__(
+        self, root: str | Path | None = None, *, env: dict[str, str] | None = None
+    ) -> None:
+        environment = os.environ if env is None else env
+        if root is None:
+            configured = environment.get("XDG_STATE_HOME", "")
+            base = Path(configured) if configured else Path.home() / ".local" / "state"
+            if not base.is_absolute():
+                raise ValueError("XDG_STATE_HOME must be absolute")
+            root = base / "rofi-agent-plus" / "direct-v1"
+        self.root = Path(root)
+        self.path = self.root / "view.json"
 
     def load(self) -> ViewPreference:
-        """Return validated state, using defaults for absent or malformed files."""
-
         try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-            descriptor = os.open(self.path, flags)
-            try:
-                metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_RECORD_BYTES:
+            descriptor = os.open(
+                self.path,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077
+                    or info.st_size > MAX_RECORD_BYTES
+                ):
                     return ViewPreference()
-                with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                    raw = stream.read(MAX_RECORD_BYTES + 1)
-            finally:
-                os.close(descriptor)
-            if len(raw) > MAX_RECORD_BYTES:
-                return ViewPreference()
-            parsed = _parse_preference(json.loads(raw.decode("utf-8")))
-        except (OSError, UnicodeError, ValueError, RecursionError):
+                raw = stream.read(MAX_RECORD_BYTES + 1)
+        except OSError:
             return ViewPreference()
-        return parsed if parsed is not None else ViewPreference()
+        if len(raw) > MAX_RECORD_BYTES:
+            return ViewPreference()
+        try:
+            value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+        except (UnicodeError, ValueError, RecursionError):
+            return ViewPreference()
+        return _valid(value) or ViewPreference()
 
     def save(self, preference: ViewPreference) -> bool:
-        """Best-effort atomic replacement with private file and directory modes."""
-
-        payload = _preference_json(preference)
-        if payload is None:
+        if not isinstance(preference, ViewPreference):
+            return False
+        payload = {
+            "schemaVersion": SCHEMA_VERSION,
+            "lastTargetId": preference.last_target_id,
+            "lastInstanceId": preference.last_instance_id,
+        }
+        if _valid(payload) is None:
             return False
         encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_RECORD_BYTES:
             return False
+        descriptor = None
         temporary: str | None = None
-        descriptor: int | None = None
         try:
-            self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-            os.chmod(self.path.parent, 0o700)
-            descriptor, temporary = tempfile.mkstemp(prefix=".view-", dir=self.path.parent)
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            info = self.root.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                return False
+            descriptor, temporary = tempfile.mkstemp(prefix=".view-", dir=self.root)
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as stream:
                 descriptor = None
@@ -237,30 +123,16 @@ class ViewPreferenceStore:
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
             temporary = None
+            directory = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
-                directory_fd = os.open(
-                    self.path.parent,
-                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                )
-            except OSError:
-                return True
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
+                os.fsync(directory)
             finally:
-                os.close(directory_fd)
+                os.close(directory)
             return True
         except OSError:
             return False
         finally:
             if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+                os.close(descriptor)
             if temporary is not None:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
+                Path(temporary).unlink(missing_ok=True)

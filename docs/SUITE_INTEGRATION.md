@@ -1,147 +1,279 @@
-# Agent Plus suite ownership after the native-runtime migration
+# Rofi Agent Plus suite ownership and acceptance
 
-This document describes the `0.14.0a1` Observer v2 consumer candidate. Earlier P6/P9/P10
-acceptance records apply to their foreground-runtime versions. Native discovery,
-source installation and live attachment acceptance are tracked separately in
-[consumer execution record](observer-v2-execution.md).
+This source candidate implements the direct environment/window picker described
+in the [design](agent-plus-daemon-tui-design.md),
+[design review](agent-plus-daemon-tui-design-review.md), and
+[implementation plan](agent-plus-daemon-tui-implementation-plan.md). Those
+documents preserve the design record and proof requirements; candidate source,
+wheel and native results are recorded separately in the
+[candidate execution report](direct-tui-candidate-20261021.md).
 
-## Boundaries
+## Ownership and runtime boundary
 
 | Responsibility | Owner |
 | --- | --- |
-| Host identity, display order, routes and SSH policy | SSH Plus / Host Mesh v1 |
-| Passive provider identity, history, work, presence and source coverage | Agent Observer, one independent installation per host |
-| Native daemon, worker and logical session lifecycle | Codex / Claude Code |
-| Picker presentation, cache, preferences and fresh action validation | Agent Plus |
-| Tmux sessions, deferred terminal clients and endpoint-local viewers | Tmux Plus / Tmux Session v1 |
+| Logical host IDs, aliases, routes, SSH executable and connection policy | SSH Plus public Host Mesh |
+| Environment targets, labels, capabilities, passive daemon observations and native manager entry | Agent Plus headless host helper and provider adapters |
+| Local list, cache, selection hints, launch requests, window registration and exact focus | Agent Plus desktop picker/actions |
+| Conversations, agent work, native settings and authentication | Codex and Claude Code |
+| Supported desktop and terminal surface | Niri compositor with one dedicated Kitty window per registered TUI |
 
-Agent Plus consumes public commands and bounded JSON, plus the pinned pure
-Observer v2 contract validator library. Installations are independent; Plus
-imports no collectors or provider action implementation. Released Host Mesh v1
-and Tmux Session v1 bundles retain their manifests and provenance. The frozen
-Observer corpus records its accepted prerelease artifact and contract versions.
+The host helper works without Rofi, Niri, Kitty, Agent Observer or Tmux Plus.
+The desktop uses the public `rofi-ssh-plus` Mesh output and fixed
+`rofi-agent-plus-host` operations on each host. Remote hosts must have the same
+Agent Plus artifact installed with the host helper visible in noninteractive
+`PATH`. A configured Mesh failure is a host error; it cannot be replaced by an
+OS hostname. The local-only identity fallback is used only when the SSH Plus
+CLI is absent.
 
-## Discovery
+The direct artifact has no runtime Python dependencies. It does not import
+Observer collectors or Tmux lifecycle code. Inventory reads provider
+capabilities and daemon status without starting daemons, authenticating,
+creating homes, enumerating conversations or executing provider commands from
+inventory fields. Codex and Claude Code own their native manager and work
+lifecycle. Agent Plus owns only its exact foreground client/terminal/window
+registrations; it never kills a daemon or worker descendant.
 
-For each Host Mesh host, invoke public `agent-observer snapshot --host-scope
-HOST_ID` with that host's configured providers. Existing marked SSH routes and
-shared deadlines remain external composition. There are no provider-private
-readers or daemon auto-start fallbacks. Independent current facts survive partial
-history/runtime feeds; missing rows remain explicitly stale without renewing
-phase or activity clocks.
+## Identity, discovery and transport
 
-Native keys contain host, provider, store namespace, native ID kind and full ID.
-Phase (working/blocked/waiting), runtime, worker, outcome and attachment remain
-separate. Default attention order is blocked, waiting, working, unknown, then
-actual conversation activity. Unsupported age stays unknown. Configured root,
-relative path, Git and project metadata are presentation context, never native
-identity. Confirmed child rows of both providers are excluded. OpenCode remains
-deferred.
+A target's canonical identity is logical host ID, effective UID/account,
+provider and native home/configuration directory. Aliases and labels do not
+create new targets. The specification revision hashes launch-relevant adapter,
+executable and environment selection; it excludes labels, daemon status,
+observation timestamps, daemon PID/socket and ordinary provider settings.
+Entry references contain expected host/user, canonical target key and
+specification revision. The owning helper resolves its own identity and target
+again immediately before native exec.
 
-## Actions
+Each host discovers the effective account's passwd-home `~/.codex` and
+`~/.claude` defaults, regardless of inherited `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR`. Extra homes are explicit host-local declarations in
+`direct.toml`; default and declared aliases collapse by canonical identity. An
+additional Codex home requires a readable `config.toml`; an additional Claude
+configuration directory must already exist and be usable. A missing default
+may remain available for first-use setup on explicit Open. Discovery does not
+create homes. On entry, Codex sets `CODEX_HOME` and clears `CODEX_PLUS_SOCKET`;
+Claude sets `CLAUDE_CONFIG_DIR`. Entry uses the owning user's home as cwd and
+executes the installed `codex agents` or `claude agents` CLI in the real
+foreground TTY.
 
-An explicit action refreshes the selected owning host and resolves the same full
-reference. Plus passes a public request to `agent-observer-write prepare`, then
-executes once on the prepared route. Observer owns provider acceptance, native
-route selection, config/cwd/binary/runtime validation and result correlation.
-The write result separates pending/requested/actual identity and confirmed versus
-uncertain effects, including copied Claude history. Plus constructs no provider
-argv and parses no native launch cue.
+Capability and daemon observations are independent. Provider capability help
+is cached by executable identity and adapter revision; status is a passive
+per-environment query. Only recognized positive running/stopped evidence is
+normalized. A nonzero status exit alone is unknown, and daemon status being
+unknown does not block fresh validated Open. Partial provider/host errors retain
+valid sibling targets and last-known targets with their original observation
+times. A complete current inventory can remove absent targets. An unreachable
+host is not an empty or stopped host.
 
-Tmux Plus receives `agent-observer-write enter --plan-json PLAN` through its
-public deferred create/open interface. Native TTY entry revalidates the plan.
-Typed viewer name collisions can retry the same plan; unknown transport,
-post-write stale authority and viewer failure never repeat provider work.
-Write-client cleanup preserves provider descendants. New contains no source
-session reference; Plus uses the selected row only to choose a fresh directory
-context. Observer's standalone New supports zero rows independently.
+Passive remote inventory uses current Host Mesh routes, fixed shell-quoted
+helper arguments, BatchMode and strict host-key checking. It has bounded route
+fallback and writes no SSH history. Interactive entry selects one route from a
+fresh Mesh view, sends one bounded reference over a TTY and permits native SSH
+authentication. Once entry dispatch begins, an uncertain result is never
+retried through another route. A window proves local presence, not successful
+remote login or provider connectivity.
 
-Current client-to-conversation binding remains unsupported. A fresh native
-attachment does not authorize focus/Close from a historical wrapper option.
-Conversation-specific Open/Close and group viewer actions remain unavailable;
-generic Tmux viewer management is independent. Native permissions/trust remain
-provider-owned.
+## Window model and picker behavior
 
-## Configuration and delivery
+The list spans current Mesh hosts in Mesh order, with targets ordered by
+provider and canonical home. Each target with no registered TUI has one
+selectable launcher row. Each target with registered TUIs has one selectable
+row per instance, adjacent in stable ordinal order, and no launcher row. A
+title is sanitized display/search text only; it is never an identity or an
+action input. Host/provider status lines are nonselectable. Registered local
+windows remain visible when their source host is offline or removed.
 
-Agent Plus accepts `max_sessions`, `refresh_seconds` and the optional
-`[host_providers]` table. Provider selection can disable a provider on an
-existing host; it cannot define hosts or routes. Host Mesh owns hosts, aliases
-and SSH policy; Tmux Plus owns terminal argv. Malformed present
-contracts fail closed. An absent SSH Plus retains the shared local-only identity;
-an absent Tmux Plus is a visible failure. Refreshes do not increment SSH usage
-history.
+The initial supported desktop is Niri plus dedicated Kitty. Every launch has a
+random instance ID, desktop generation, expected process-birth handles and a
+launch marker; its Kitty control socket is private to that instance. Before
+focus, Agent Plus freshly validates the compositor generation, process
+identity, exact window marker and single Kitty OS-window/tab/pane foreground
+layout. Ambiguity or unavailable compositor evidence refuses focus. A title or
+reused window ID cannot retarget an action.
 
-Each package has its own installation and public entry point. The managed
-pilot records exact artifact hashes and scoped chezmoi changes. Source tests,
-installed module equality, native provider work, ordinary hook execution,
-cross-host attach, visual/focus behavior and physical RLCD acceptance are
-separate evidence categories. No earlier suite acceptance silently certifies
-the new runtime boundary.
+Open on an instance revalidates and focuses that exact instance without a host
+or provider probe. If the row is stale, it reports and refreshes; it never
+launches as a fallback. Open on a target validates a fresh EntryReference and
+dispatches one TUI. Tab selects **Open another window**, which creates a
+separate native manager client with its own terminal state. One callback replay
+uses one request ID and resolves to the same instance; a deliberate new action
+gets a new ID. Dispatch intent is durable before spawning. Uncertain dispatch
+is reconciled without automatic retry. Normal terminal controls close windows;
+the picker has no Close, batch or conversation action.
 
-## Owner conformance tooling
+| Key | Behavior |
+| --- | --- |
+| Up / Down | Select a row |
+| Enter | Open a target or focus the exact selected window |
+| Tab / Shift+Tab | Cycle Open / Open another window |
+| Alt+R | Refresh the bounded catalog before redraw |
+| Left / Right, Ctrl+B / Ctrl+F | Edit the search text using native Rofi cursor bindings |
+| Escape / Ctrl+G | Cancel and close the picker |
 
-`scripts/check` runs this project's source and synthetic guard checks.
-`scripts/check-public-contract` runs isolated public CLI probes: SSH owns Host
-Mesh; Tmux supplies `--ssh-checkout /absolute/ssh`; Agent supplies that argument
-and `--tmux-checkout /absolute/tmux`. Checkouts must be clean. Run with the
-project's selected Python environment and declared dependency versions. The
-probe uses a private HOME/XDG/PATH, synthetic local-only alpha authority, empty
-tmux state and provider stubs. It imports no sibling implementation and inspects
-no ordinary provider sessions. Consumer bundle-sync gates retain canonical
-producer ancestry, historical/current manifests and vendored provenance.
+Search includes host, provider, environment label and current title. Rows escape
+markup/control characters. Callback state carries typed target/instance IDs,
+not row text or search input. Redraw keeps the filter, action and selected
+identity when possible. Each new dialog opens with empty search and Open
+selected, restoring the last successful instance/target if still present.
 
-`scripts/check-installed --self-test` proves owned callback and parser guards.
-Explicit `--live` checks installed public behavior with isolated UI state and
-semantic SSH history preservation. Tmux's separate `--lifecycle` option owns
-uniquely named disposable sessions, exact reference cleanup, stale-name and
-collision guards and baseline preservation. Run it only for authorized lifecycle
-acceptance; pure relocation does not need it. SSH probes no legacy custom-connect
-mutation. Source/synthetic, installed, provider actions, graphical/focus and
-physical acceptance remain separate.
+The first frame uses the launcher's supported `-selected-row` option. A fresh
+cached catalog renders immediately; missing or expired data triggers a bounded
+synchronous refresh before the first frame. Alt+R performs the same refresh
+before redrawing. The fleet deadline is 20 seconds, each host is bounded to 12
+seconds, and at most four host workers run concurrently. Host results publish
+to cache as they complete, but the picker redraws after the fleet callback
+returns. There is no periodic Rofi timer; ordinary redraws read only local
+Niri, registry/process and cache state. Closing a dialog callback cancels its
+passive probes; detached TUI viewers live until their native client exits.
+Mosh, Ghostty, manual TUI adoption and a persistent watcher are not supported.
 
-## Foreground-picker deployment history
+## Configuration and private state
 
-The retired managed ledger tracked the earlier foreground runtime. 0.9.0
-introduced batch viewer actions; 0.10.0 shared Resume/Close/New, 0.10.1 added
-asynchronous fixed previews, 0.10.2 kept the action bar through compact progress,
-and 0.10.3 excluded already satisfied viewers. 0.11.0 joined endpoint viewer
-facts; 0.11.1 corrected provider/viewer display, 0.11.2 renewed positive evidence
-before expiry, and 0.11.3 made uncertainty suffixes consistent. 0.12.0 added Open
-and compact state rows; 0.12.1 kept viewer timers valid across page changes.
+The only active settings file is
+`$XDG_CONFIG_HOME/rofi-agent-plus/direct.toml` (default
+`~/.config/rofi-agent-plus/direct.toml`). Schema version 1 accepts
+`[desktop]` with a bounded Kitty argument vector and `catalog_ttl_seconds`, and
+up to 128 `[[environments]]` declarations with `provider`, `home`, optional
+`label` and optional alias `id`. Unknown settings and schema versions are
+rejected. The supported catalog TTL is 1–300 seconds, default 30. See
+[`examples/direct.toml`](../examples/direct.toml).
 
-Their accepted interaction remains in the batch/navigation/UI design documents;
-it is historical acceptance for those artifacts. Native 0.14.0a1 discovery and
-write delegation have their own proof and currently unsupported viewer bindings.
-[Immutable release ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md#agent-plus-121-viewer-timer-across-view-changes)
-retains exact commits, installed/operator results and pending gates. P8 flat peers
-and P9 CLI contracts retain [original rollout wording](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-p9-cli-contracts.md);
-canonical Host Mesh and Tmux Session contracts remain producer-owned.
+New state is isolated from the retired conversation runtime:
 
-## Lessons retained from DMS Agent Picker
+| Purpose | Location |
+| --- | --- |
+| Target catalog | `$XDG_CACHE_HOME/rofi-agent-plus/direct-v1/catalog.json` |
+| Last successful target/instance hint | `$XDG_STATE_HOME/rofi-agent-plus/direct-v1/view.json` |
+| Desktop registry and per-target active/tombstone records | `$XDG_RUNTIME_DIR/rofi-agent-plus/direct-v1/<desktop-generation>/` |
+| Per-instance short Kitty control socket | `$XDG_RUNTIME_DIR/rofi-agent-plus-sockets/<instance-id>.sock` |
 
-The earlier [DMS Agent Picker runtime and launch notes](https://github.com/byebyebryan/dms-agent-picker/blob/09cb232992e62ad5dcef605b272dafd223ab15d3/README.md)
-contain three principles that still apply under the current suite ownership:
+The cache is display/performance state, never action authority. Catalog refresh
+uses a private file lock and atomic publication; per-host success, partial and
+failure results update independently. Registry transitions hold a short
+per-target lock and perform no provider or SSH probes under it. Terminal
+request tombstones preserve replay identity without consuming the 512-active-
+instance per-target cap. Bad catalog data cannot erase a valid local window
+record.
 
-- Saved conversation metadata, a running provider process, and a tmux
-  association are separate evidence. A metadata query's short-lived Codex
-  app-server does not prove that an interactive conversation is running.
-  Shared daemons and supervised runtimes require their own correlation model;
-  the supported runtime and known identity limits remain in
-  [Agent Plus retains](#boundaries).
-- Provider startup needs the attached terminal for capability and color
-  probes. Agent Plus requests `--defer-until-attached` through the public
-  create command; Tmux Plus owns the bounded wait and pending-session
-  mechanics in [Tmux Session v1](https://github.com/byebyebryan/rofi-tmux-plus/blob/main/docs/TMUX_SESSION_V1.md#create).
-  Picker lifetime and terminal ownership are handled by Tmux Plus's
-  [process lifecycle](https://github.com/byebyebryan/rofi-tmux-plus/blob/main/docs/DESIGN.md#process-ownership-and-errors).
-- Cached history should remain usable during a bounded refresh, while
-  current activity requires current observation evidence. The old plugin's
-  per-host streaming publication is historical; Agent Plus publishes a
-  complete authority-scoped snapshot and keeps observation labels separate
-  from operation authority, as described in [P9 locked CLI contracts](#boundaries)
-  and [Discovery flow](#discovery).
+## Resource and wire bounds
 
-DMS launcher rows, badges, plugin settings, direct launch plumbing, and old
-live observations stay with the retired plugin. The current Rofi interaction,
-process contracts, and suite acceptance records govern this implementation.
+| Work or record | Bound |
+| --- | --- |
+| Native provider capability/status probe | 3 seconds each; capability cache TTL 300 seconds |
+| One host / entire fleet inventory | 12 / 20 seconds; at most 4 concurrent host workers |
+| SSH | Current Host Mesh connect timeout and attempts; remote inventory output 1 MiB and stderr 64 KiB |
+| Host inventory wire | 1 MiB; at most 128 targets, 2 provider-coverage records and 256 diagnostics; 16 KiB string fields |
+| Entry reference | 64 KiB |
+| Cached catalog | 8 MiB and at most 256 host records |
+| Config file / declarations | 256 KiB / 128 entries; selector path 4096 characters; label 256 characters |
+| Active runtime records | 512 per target; request and tombstone lookup is exact and bounded |
+| Rofi callback state / initial frame | 16 KiB / 16 MiB |
+| Catalog refresh / compositor request | 20 seconds / 1 second; catalog refresh is synchronous and there is no periodic Rofi timer |
+
+These bounds limit work and parsing; an interactive native manager or SSH
+authentication prompt is intentionally not given an inventory timeout.
+
+## Replacement coverage for retired responsibilities
+
+The former conversation picker, Observer write client and Tmux viewer runtime
+are retired from this artifact. The remaining concern is either obsolete for a
+direct environment picker or has direct-window coverage:
+
+| Retired responsibility | Current disposition and coverage |
+| --- | --- |
+| Conversation/session identity, saved-history selection and work-phase display | Obsolete. Native provider managers own conversations; `test_direct_host.py` covers canonical target/spec references and `test_direct_ui.py` covers target/window rows. |
+| Observer snapshot, provider-private readers, native action plans and write execution | Obsolete. `host.py` exposes passive capability/status inventory plus fresh native entry; `test_direct_host.py` and `test_direct_transport.py` cover host, self-identity, validation, route and shell-quoting boundaries. |
+| Observer/session runtime identity and conversation-to-window association | Replaced by `TargetKey`, `EntryReference`, random instance ID, desktop generation and process-birth/window validation; `test_direct_host.py`, `test_direct_desktop_registry.py` and `test_direct_actions.py` cover these identities and stale/replay cases. Conversation binding remains unsupported. |
+| Tmux ownership, deferred attach, viewer launch and cleanup | Obsolete. `desktop.py`, `viewer.py`, `actions.py` and `registry.py` own one direct Kitty client and retire it when its foreground provider client exits. `test_direct_desktop_registry.py` and `test_direct_actions.py` cover lifetime, dispatch gaps and exact focus. |
+| Batch open/resume/close and batch workers | Obsolete. Each explicit Open another window is an independent user request; no batch command or worker remains. Rofi dispatch/replay and row behavior are covered in `test_direct_ui.py` and `test_direct_actions.py`. |
+| Old cache schemas, Viewer preferences and asynchronous session refresh workers | Not migrated. New bounded direct-v1 cache/preferences and finite dialog-owned refresh are covered by `test_direct_ui.py`; `test_direct_bounds.py` covers oversized, timed-out and descendant-held process output. |
+
+`test_direct_host.py`, `test_direct_transport.py`,
+`test_direct_desktop_registry.py`, `test_direct_actions.py`,
+`test_direct_bounds.py` and `test_direct_ui.py` are the active focused suites.
+Old Observer/Tmux/session/batch tests and modules are intentionally not kept as
+a compatibility runtime or source gate.
+
+## Source, wheel and per-case native gates
+
+| Gate | Driver | What it can establish |
+| --- | --- | --- |
+| Source | `./scripts/check` | Unit tests, Ruff, shell/text guards and released Host Mesh bundle validation; no native acceptance |
+| Public bundle sync | `./scripts/check-contract-sync /absolute/path/to/rofi-ssh-plus` | Exact public Host Mesh bundle/source alignment |
+| Installed wheel | `scripts/check-installed-artifact --candidate-prefix PREFIX --wheel WHEEL --output PRIVATE_DIR` | Isolated imports, package byte parity, entry points, no retired runtime dependency and controlled headless inventory |
+| Niri/Kitty mechanics | `candidate-prefix/bin/python -I -B scripts/direct-window-proof run PRIVATE_DIR` | Marked dedicated windows, real foreground TTY, exact title/focus identity, private Kitty layout refusal, interrupt and independent client lifetime |
+| Installed Rofi callback | `candidate-prefix/bin/python -I -B scripts/direct-rofi-proof PRIVATE_DIR` | Real Rofi first-frame selection, Tab mode changes and filter retention with inert rows, no periodic timer and zero provider actions |
+| Provider/host case | `candidate-prefix/bin/python -I -B scripts/check-native-entry ...` | Actual installed artifact launch against one selected logical host/home/provider and its exact native fixture |
+| Picker actions | `candidate-prefix/bin/python -I -B scripts/direct-picker-proof --native-root FIXTURE_ROOT --output PRIVATE_DIR` | Actual launcher, Rofi callbacks and Actions create two native windows, focus a selected row and refuse a stale row; controlled local-only Mesh |
+
+The per-case native entry driver accepts `--host`, `--home`, `--provider`,
+`--config`, optional remote `--helper`, repeated `--expected`, optional
+`--exercise-client-state`, optional `--fixture-script` and
+`--disconnect-first`, and a private `--output` directory. Run one explicit
+case per fixture. `--config` is resolved on the selected host; do not forward a
+desktop-local config path as the remote peer's path. `--helper` must be an
+absolute candidate helper path on that remote host. The proof-only injection
+does not make inventory-supplied commands trusted. `--exercise-client-state`
+checks independent manager state where supported and submits no agent turn.
+`--fixture-script` observes the owned daemon on the fixture's host while its
+clients are alive. `--disconnect-first` interrupts only the registered SSH
+client using a revalidated process handle and checks that entry is not replayed.
+
+The selector shape for an installed case is:
+
+```sh
+"$CANDIDATE_PREFIX/bin/python" -I -B scripts/check-native-entry \
+  --host "$LOGICAL_HOST" \
+  --home "$HOST_NATIVE_HOME" \
+  --config "$HOST_DIRECT_TOML" \
+  --provider "$PROVIDER" \
+  --helper "$HOST_CANDIDATE_PREFIX/bin/rofi-agent-plus-host" \
+  --expected "$OWNED_FIXTURE_TEXT_A" \
+  --expected "$OWNED_FIXTURE_TEXT_B" \
+  --exercise-client-state \
+  --fixture-script "$HOST_FIXTURE_SCRIPT" \
+  --output "$LOCAL_RUN_ROOT/provider-case"
+```
+
+Omit `--helper` for the local host. For a remote case, the config and helper
+paths are absolute paths on the named peer, while the output directory is
+private to the machine running the proof. On the fixture-owning host, prepare,
+observe and clean up the private native home with:
+
+```sh
+./scripts/native-fixture prepare "$FIXTURE_ROOT" \
+  --provider "$PROVIDER" --label "$LABEL" \
+  --helper "$CANDIDATE_PREFIX/bin/rofi-agent-plus-host"
+./scripts/native-fixture observe "$FIXTURE_ROOT"
+./scripts/native-fixture cleanup "$FIXTURE_ROOT"
+```
+
+The required provider/host matrix is local Codex on Starship, Codex default/OSS
+and Work homes on Snap, Claude on Snap, and explicit Starship-to-Snap entry
+through the candidate helper. Each case checks fresh identity/spec validation,
+two clients to one target, additional-request replay, exact focus, independent
+exit, cleanup and preservation of ordinary windows. Provider-specific fixture
+text and selection/draft/resize checks are recorded per case. A missing provider
+or authentication prerequisite is a recorded gap, not a source-test pass.
+The private `scripts/native-fixture` helper owns prepare/observe/cleanup for a
+case and records exact owned process generations before cleanup.
+
+The actual picker driver is interactive: select the owned local launcher,
+reopen with Tab for the additional action, then select the first window row.
+In a fourth dialog select that same row, run the driver's `--close-first` mode,
+and press Enter. While the stale notice remains open, run
+`--confirm-stale-open` before Escape. Both modes use the same `--native-root`
+and `--output`. The confirmation validates the exact live Rofi process and sole
+remaining native client. These proofs temporarily take desktop focus and should
+run only in an agreed idle/test window.
+
+The candidate report records the actual artifact digest, host/helper paths,
+per-case receipts, cleanup, and remaining gates. Final human keyboard/visual
+judgment, managed desktop selection, publication and rollout remain separate.
+
+**Historical evidence only:** the [0.14.0a1 installed operational proof](native-operational-proof.md)
+and [Observer v2 consumer execution record](observer-v2-execution.md) document
+the former Observer/Tmux conversation-picker artifact. They do not test or
+qualify this direct-window implementation. The [immutable release ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md#agent-plus-121-viewer-timer-across-view-changes)
+is historical as well.

@@ -1,55 +1,73 @@
-"""The picker delegates observation through its prepared public CLI backend."""
+"""The public engine surface stays pure and does not import desktop modules."""
 
 from __future__ import annotations
 
 import io
-import json
+import sys
 import unittest
-from unittest.mock import patch
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
 
-from rofi_agent_plus import app, engine
-
-ID = "11111111-1111-1111-1111-111111111111"
+from rofi_agent_plus import VERSION, app, engine
 
 
-class ActiveCommandTest(unittest.TestCase):
-    def test_active_uses_full_host_inventory_and_preserves_namespace_identity(self):
-        rows = [
-            {
-                "hostId": "snap",
-                "kind": "codex",
-                "id": ID,
-                "namespace": namespace,
-                "nativeIdKind": "thread",
-                "active": True,
-            }
-            for namespace in ("config-a", "config-b")
-        ]
-        unknown = {**rows[0], "id": "22222222-2222-2222-2222-222222222222", "active": None}
-        snapshot = {
-            "sessions": rows[:1],
-            "hosts": {"snap": {"sessions": [*rows, unknown]}},
-            "errors": [],
-        }
-        with (
-            patch.object(app, "CacheStore") as store,
-            patch("sys.stdout", new_callable=io.StringIO) as output,
-        ):
-            store.return_value.refresh.return_value = snapshot
-            self.assertEqual(0, app.diagnostic_main(["active"]))
-        result = json.loads(output.getvalue())
-        self.assertEqual(["config-a", "config-b"], [row["namespace"] for row in result["sessions"]])
-        store.return_value.refresh.assert_called_once()
-
-    def test_engine_has_no_provider_or_generic_lifecycle_surface(self):
+class EngineBoundaryTests(unittest.TestCase):
+    def test_package_and_engine_export_only_versioned_error_surface(self):
+        self.assertEqual(VERSION, engine.VERSION)
+        self.assertTrue(issubclass(engine.PickerError, RuntimeError))
         for name in (
-            "provider_active_snapshot",
-            "merge_provider_results",
-            "_process_table",
-            "_thread_id_for_process",
+            "ProviderAdapter",
             "HostTarget",
+            "RuntimeInstance",
             "SshPolicy",
             "launch_attach",
             "focus_existing_window",
+            "provider_active_snapshot",
         ):
             self.assertFalse(hasattr(engine, name), name)
+
+    def test_direct_commands_reject_retired_actions_and_legacy_options(self):
+        error = io.StringIO()
+        with patch("sys.stderr", error):
+            self.assertEqual(2, app.main(["active"]))
+        self.assertIn("unsupported", error.getvalue())
+        self.assertIn("list --json", error.getvalue())
+
+        error = io.StringIO()
+        with patch("sys.stderr", error):
+            self.assertEqual(2, app.diagnostic_main(["list", "--limit", "12", "--json"]))
+        self.assertIn("unrecognized arguments", error.getvalue())
+
+    def test_importing_app_does_not_load_observer_or_legacy_picker_modules(self):
+        blocked = {
+            "rofi_agent_plus.batch",
+            "rofi_agent_plus.observer_contract",
+            "rofi_agent_plus.session_identity",
+            "rofi_agent_plus.contract_lifecycle",
+            "rofi_agent_plus.viewer_state",
+        }
+        self.assertTrue(blocked.isdisjoint(sys.modules))
+
+    def test_script_callback_wraps_refreshable_work_in_probe_cancellation(self):
+        with (
+            patch.dict("os.environ", {"ROFI_RETV": "10"}, clear=True),
+            patch.object(app, "initial_frame", return_value=None),
+            patch.object(app, "passive_probe_signals", return_value=nullcontext()) as signals,
+            patch.object(app, "run_rofi", return_value=0),
+        ):
+            self.assertEqual(0, app.main([]))
+        signals.assert_called_once_with()
+
+    def test_direct_refresh_helper_remains_explicit_and_cancellable(self):
+        context = Mock()
+        with (
+            patch.object(app, "build_context", return_value=context),
+            patch.object(app, "passive_probe_signals", return_value=nullcontext()) as signals,
+        ):
+            self.assertEqual(0, app.diagnostic_main(["_direct-refresh"]))
+        signals.assert_called_once_with()
+        context.cache.refresh.assert_called_once_with(context.transport)
+
+
+if __name__ == "__main__":
+    unittest.main()

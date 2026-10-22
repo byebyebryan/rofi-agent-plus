@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
-"""Bootstrap this client from the accepted, supplied public Observer wheel."""
+"""Install the direct picker and its development tools in the selected Python."""
 
 import argparse
-import hashlib
 import subprocess
 import sys
 from pathlib import Path
 
-OBSERVER_WHEEL = "agent_observer-0.2.0a3-py3-none-any.whl"
-OBSERVER_SHA256 = "6aa793e6a0ba5ae37403f73999ea6e6d56bc8c21e5e4c7a10ac52cb946a45a3f"
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--observer-wheel", type=Path, required=True)
-    args = parser.parse_args()
-    wheel = args.observer_wheel.resolve(strict=True)
-    if (
-        wheel.name != OBSERVER_WHEEL
-        or hashlib.sha256(wheel.read_bytes()).hexdigest() != OBSERVER_SHA256
-    ):
-        raise SystemExit("Observer artifact mismatch")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], check=True
-    )
+    parser.parse_args()
     subprocess.run(
         [
             sys.executable,

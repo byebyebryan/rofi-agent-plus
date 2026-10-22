@@ -1,0 +1,15 @@
+schema_version = 1
+
+[desktop]
+terminal = ["kitty"]
+catalog_ttl_seconds = 30
+
+[[environments]]
+provider = "codex"
+home = "~/.codex"
+label = "OSS"
+
+[[environments]]
+provider = "codex"
+home = "~/.codex-work"
+label = "Work"

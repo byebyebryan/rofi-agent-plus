@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -12,10 +13,12 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .process import passive_probe_signals
 from .rofi import run_rofi
 
 INITIAL_FRAME_ENV = "ROFI_AGENT_PLUS_INITIAL_FRAME"
 MAX_INITIAL_FRAME_BYTES = 16 * 1024 * 1024
+ROFI_STOP_SECONDS = 1.0
 
 
 def _agent_executable() -> Path:
@@ -68,16 +71,30 @@ def _selected_row(frame: str) -> int:
     return 0
 
 
+def _stop_rofi(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.send_signal(signal.SIGINT)
+        process.wait(timeout=ROFI_STOP_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait()
+        except OSError:
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Launch Rofi with its supported initial-row option and one shared frame."""
 
     arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        executable = _agent_executable()
+    except ValueError as error:
+        print(f"rofi-agent-plus-rofi: {error}", file=sys.stderr)
+        return 1
     if not arguments:
-        try:
-            executable = _agent_executable()
-        except ValueError as error:
-            print(f"rofi-agent-plus-rofi: {error}", file=sys.stderr)
-            return 1
         arguments = [
             "-show",
             "agent-plus",
@@ -85,12 +102,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"agent-plus:{executable}",
             "-kb-custom-1",
             "Alt+r",
-            "-kb-custom-2",
-            "Right",
-            "-kb-custom-3",
-            "Left",
-            "-kb-custom-4",
-            "Alt+a",
             "-kb-custom-7",
             "Tab",
             "-kb-custom-8",
@@ -115,23 +126,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ROFI_")}
     output = io.StringIO()
     try:
-        with redirect_stdout(output):
-            run_rofi(dict(environment, ROFI_RETV="0"))
-        frame = output.getvalue()
-        if len(frame.encode("utf-8")) > MAX_INITIAL_FRAME_BYTES:
-            raise ValueError("initial picker frame is too large")
         with TemporaryDirectory(prefix="rofi-agent-plus-launch-") as temporary:
-            path = Path(temporary) / "initial-frame"
-            path.write_text(frame, encoding="utf-8")
-            path.chmod(0o600)
-            environment[INITIAL_FRAME_ENV] = str(path)
+            directory = Path(temporary)
+            frame_path = directory / "initial-frame"
+            with passive_probe_signals(), redirect_stdout(output):
+                run_rofi(dict(environment, ROFI_RETV="0"))
+            frame = output.getvalue()
+            if len(frame.encode("utf-8")) > MAX_INITIAL_FRAME_BYTES:
+                raise ValueError("initial picker frame is too large")
+            frame_path.write_text(frame, encoding="utf-8")
+            frame_path.chmod(0o600)
+            environment[INITIAL_FRAME_ENV] = str(frame_path)
             # Initial script headers cannot select a row. Pass the same frame
             # to the first callback so this index cannot race another refresh.
-            return subprocess.run(
-                ["rofi", "-selected-row", str(_selected_row(frame)), "-filter", "", *arguments],
+            rofi = subprocess.Popen(
+                [
+                    "rofi",
+                    "-selected-row",
+                    str(_selected_row(frame)),
+                    "-filter",
+                    "",
+                    *arguments,
+                ],
                 env=environment,
-                check=False,
-            ).returncode
+            )
+            try:
+                return_code = rofi.wait()
+                return int(return_code) if return_code is not None else 1
+            except KeyboardInterrupt:
+                _stop_rofi(rofi)
+                return 130
+            finally:
+                _stop_rofi(rofi)
     except (OSError, ValueError) as error:
         print(f"rofi-agent-plus-rofi: {error}", file=sys.stderr)
         return 1

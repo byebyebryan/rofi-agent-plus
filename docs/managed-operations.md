@@ -1,36 +1,55 @@
 # Agent Plus managed operations
 
-## Retained artifact and portable operations checks
+The direct-TUI trial selects `0.15.0a1` on Starship and Snap. Its immutable
+wheel and selected hosts are recorded in
+[managed-direct-selection.json](../artifacts/managed-direct-selection.json).
+Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
+Carbon retains its historical artifact and has no Agent Plus desktop binding.
 
-[Managed native selection](../artifacts/managed-native-selection.json) extracts
-the still-selected Plus wheel and its frozen pure Observer dependency from the
-retired joint pilot. It covers Snap/Starship; Carbon retains the older archive
-and script mapping declared by dotfiles, and is outside this native selection.
-The manifest does not select the producer collector, reader, bridge or writer.
-Provider versions and other picker entry hashes are historical diagnostics, not
-current allowlists.
+The wheel is staged on each selected host under
+`~/.local/share/rofi-agent-plus/artifacts/<wheel-sha256>/`. The managed
+`18-install-agent-plus.sh` pre-hook verifies its checksum and installs it
+offline into a version-and-digest prefix with Python 3.11. It verifies the
+installed package against wheel bytes before selectors are applied. An existing
+different/corrupt prefix is refused rather than overwritten. The host must have
+`uv` and a locally available Python 3.11 interpreter.
+
+The trial artifact is distributed locally; no GitHub push or publication is a
+deployment prerequisite. Keep the wheel and its checksum together. The package
+has no Observer or Tmux dependency. Its remote headless helper must be reachable
+as `rofi-agent-plus-host` in the owning user's noninteractive PATH.
+
+Review scoped `chezmoi status`, `chezmoi diff` and
+`chezmoi apply --dry-run --verbose` before applying the installer, four links,
+Rofi script link, direct configuration and active Niri binds. Use `umask 022`
+and preserve unrelated drift. Native settings, authentication, daemons and
+existing clients need no restart. Niri reloads its configuration in place.
+
+After installation, use the source-owned artifact verifier with the exact
+managed prefix and wheel:
 
 ```sh
-./scripts/check-installed-artifact --selection artifacts/managed-native-selection.json --host starship
-./scripts/check-installed --self-test
-./scripts/check-public-contract --self-test
+scripts/check-installed-artifact --candidate-prefix "$PREFIX" \
+  --wheel "$WHEEL" --output "$PRIVATE_RECEIPT_DIR"
+"$PREFIX/bin/rofi-agent-plus-host" inventory --json
 ```
 
-The artifact gate is passive: it checks wheel digests, installed members,
-interpreter entrypoints, dependency/SDK profile, public read/write schemas and
-selected Plus links. Cache-v7 identity and contract guards remain in the owner
-installed gate and synthetic tests. Use `--live` only for explicit installed
-read/refresh evidence; it isolates cache/preferences and performs no provider
-write. `--legacy-callbacks` is an explicit historical foreground-picker probe,
-not proof that native conversation focus/Close or group viewers are supported.
-Current unsupported bindings remain described in [suite integration](SUITE_INTEGRATION.md).
+Check local and SSH inventory, canonical OSS/Work homes, the four selected
+entrypoints and Mod+A independently. Passive checks open no native manager.
+Any disruptive GUI testing belongs on unattended Snap; Starship is reserved
+for the user's own trial. Human input/visual judgment remains separate from
+package and passive inventory checks.
 
-`scripts/managed-selection-rollback` accepts an explicit `--source` and new
-private `--directory`; `capture`, `arm`, and `rollback` affect only the three
-Plus selector templates/links and optionally captured UI state. Source/link/state
-changes after arm, corrupt payloads and foreign/nonprivate backups reject
-before restoration. It never operates on providers or producer selectors.
-Old joint backups require their [immutable original procedure](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/agent-observer-pilot-operations.md)
-and cannot be reinterpreted as new scoped snapshots.
+Before applying, capture the selected links, direct configuration, active binds
+and their source inputs in a private host-local rollback directory. Rollback
+restores those exact inputs/targets and the previous selected prefix through a
+scoped chezmoi apply. Preserve an immutable prefix while any direct TUI wrapper
+still uses it. Changing picker selection never closes terminals or stops native
+provider work.
 
-Carbon's older foreground selection uses `scripts/check-installed --live --legacy-profile --legacy-callbacks`; the native manifest above does not apply there. Host-render and archive selection checks remain configuration-owned.
+The older [managed-native-selection.json](../artifacts/managed-native-selection.json)
+and three-selector `managed-selection-rollback` tool describe the retired
+Observer/Tmux artifact only. They do not qualify or fully roll back this direct
+trial's additional helper/configuration/binding targets. The
+[candidate execution record](direct-tui-candidate-20261021.md) preserves its
+source, wheel and native evidence boundaries.

@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""Owned Niri/Kitty mechanics proof, independent of provider credentials."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+if not sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from rofi_agent_plus import __file__ as package_file  # noqa: E402
+from rofi_agent_plus.desktop import (  # noqa: E402
+    Desktop,
+    DesktopError,
+    observe_process,
+    run_json,
+    validate_kitty_layout,
+)
+
+
+def save(path: Path, value: object) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def birth(pid: int) -> str:
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
+def child(root: Path) -> int:
+    signal.signal(signal.SIGINT, lambda *_: save(root / "interrupt.json", {"received": True}))
+    save(
+        root / "child.json",
+        {
+            "pid": os.getpid(),
+            "birth": birth(os.getpid()),
+            "tty": os.isatty(0),
+            "group": os.getpgrp(),
+            "foregroundGroup": os.tcgetpgrp(0),
+        },
+    )
+    last = None
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline and not (root / "stop").exists():
+        title = (root / "title").read_text() if (root / "title").exists() else "Owned proof"
+        if title != last:
+            print(f"\x1b]2;{title}\x07", end="", flush=True)
+            last = title
+        time.sleep(0.05)
+    return 0
+
+
+def wrapper(root: Path) -> int:
+    # A caught handler resets on exec; SIG_IGN would leak ignored SIGINT into
+    # the native foreground program.
+    signal.signal(signal.SIGINT, lambda *_: None)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            *(["-I", "-B"] if sys.flags.isolated else ["-B"]),
+            str(Path(__file__).resolve()),
+            "child",
+            str(root),
+        ]
+    )
+    save(
+        root / "wrapper.json",
+        {
+            "pid": os.getpid(),
+            "birth": birth(os.getpid()),
+            "client": process.pid,
+            "clientBirth": birth(process.pid),
+        },
+    )
+    result = process.wait()
+    save(root / "exit.json", {"clientExited": True, "status": result})
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("run", "wrapper", "child"))
+    parser.add_argument("root", type=Path)
+    args = parser.parse_args()
+    if args.mode == "child":
+        return child(args.root)
+    if args.mode == "wrapper":
+        return wrapper(args.root)
+
+    root = args.root.resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    if root.stat().st_uid != os.getuid():
+        raise RuntimeError("proof root is not owned")
+    environment = os.environ.copy()
+    environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    runtime = Path(environment["XDG_RUNTIME_DIR"])
+    sockets = list(runtime.glob("niri.*.sock"))
+    if "NIRI_SOCKET" not in environment:
+        if len(sockets) != 1:
+            raise RuntimeError("supply exact NIRI_SOCKET for an ambiguous desktop")
+        environment["NIRI_SOCKET"] = str(sockets[0])
+    environment.setdefault(
+        "WAYLAND_DISPLAY",
+        Path(environment["NIRI_SOCKET"]).name.rsplit(".", 2)[0].removeprefix("niri."),
+    )
+    desktop = Desktop(environment)
+    controls = runtime / "rofi-agent-plus-sockets"
+    controls.mkdir(mode=0o700, exist_ok=True)
+
+    def niri(*arguments: str) -> object:
+        result = subprocess.run(
+            ["niri", "msg", "--json", *arguments],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=3,
+        )
+        return json.loads(result.stdout) if result.stdout.strip() else None
+
+    def await_value(read, predicate, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = read()
+            if predicate(value):
+                return value
+            time.sleep(0.05)
+        raise RuntimeError("owned proof observation timed out")
+
+    before = niri("windows")
+    original_focus = next((w["id"] for w in before if w.get("is_focused")), None)
+    processes = []
+    instances = []
+    receipt = {
+        "schemaVersion": 1,
+        "package": str(package_file),
+        "mechanical": {},
+        "human": "pending",
+        "owned": [],
+    }
+    save(root / "receipt.json", receipt)
+    try:
+        for ordinal in (1, 2):
+            instance = root / str(ordinal)
+            instance.mkdir(mode=0o700)
+            marker = "org.agentplus.proof." + uuid.uuid4().hex
+            control = controls / (uuid.uuid4().hex + ".sock")
+            log = (instance / "kitty.log").open("wb")
+            process = subprocess.Popen(
+                [
+                    "kitty",
+                    "--class",
+                    marker,
+                    "--single-instance=no",
+                    "--session",
+                    "none",
+                    "--override",
+                    "allow_remote_control=socket-only",
+                    "--listen-on",
+                    f"unix:{control}",
+                    sys.executable,
+                    *(["-I", "-B"] if sys.flags.isolated else ["-B"]),
+                    str(Path(__file__).resolve()),
+                    "wrapper",
+                    str(instance),
+                ],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+            log.close()
+            processes.append(process)
+            item = {
+                "marker": marker,
+                "terminalPid": process.pid,
+                "terminalBirth": birth(process.pid),
+                "control": str(control),
+            }
+            receipt["owned"].append(item)
+            save(root / "receipt.json", receipt)
+            window = await_value(
+                lambda marker=marker: [w for w in niri("windows") if w.get("app_id") == marker],
+                lambda ws: len(ws) == 1,
+            )[0]
+            assert window["pid"] == process.pid
+            await_value(lambda instance=instance: (instance / "child.json").exists(), bool)
+            client = json.loads((instance / "child.json").read_text())
+            wrapper_info = json.loads((instance / "wrapper.json").read_text())
+            validate_kitty_layout(
+                control, observe_process(wrapper_info["pid"]), observe_process(client["pid"])
+            )
+            assert client["tty"] and client["group"] == client["foregroundGroup"]
+            item.update(windowId=window["id"], client=client)
+            instances.append((instance, marker, window))
+            save(root / "receipt.json", receipt)
+        receipt["mechanical"]["dedicatedIdentityAndRealTty"] = True
+        receipt["mechanical"]["privateControlAndForegroundValidation"] = True
+        receipt["desktopGeneration"] = desktop.generation
+        control = Path(receipt["owned"][1]["control"])
+        extra_id = run_json(
+            [
+                "kitten",
+                "@",
+                "--to",
+                f"unix:{control}",
+                "launch",
+                "--type=tab",
+                "/usr/bin/sleep",
+                "20",
+            ]
+        )
+        second_child = json.loads((instances[1][0] / "child.json").read_text())
+        second_wrapper = json.loads((instances[1][0] / "wrapper.json").read_text())
+        try:
+            validate_kitty_layout(
+                control,
+                observe_process(second_wrapper["pid"]),
+                observe_process(second_child["pid"]),
+            )
+        except DesktopError as error:
+            assert str(error) == "ambiguous_terminal_layout"
+            receipt["mechanical"]["extraTabRefused"] = True
+        else:
+            raise AssertionError("extra owned tab accepted")
+        run_json(
+            [
+                "kitten",
+                "@",
+                "--to",
+                f"unix:{control}",
+                "close-window",
+                "--match",
+                f"id:{extra_id}",
+            ]
+        )
+        for instance, marker, window in instances:
+            (instance / "title").write_text(f"Owned changing title {instance.name}")
+            await_value(
+                lambda marker=marker: [w for w in niri("windows") if w.get("app_id") == marker],
+                lambda ws, instance=instance: (
+                    len(ws) == 1 and ws[0]["title"] == f"Owned changing title {instance.name}"
+                ),
+            )
+            niri("action", "focus-window", "--id", str(window["id"]))
+            assert niri("focused-window")["id"] == window["id"]
+        receipt["mechanical"]["dynamicTitleAndExactFocus"] = True
+        first = instances[0][0]
+        child_info = json.loads((first / "child.json").read_text())
+        os.killpg(child_info["group"], signal.SIGINT)
+        await_value(lambda: (first / "interrupt.json").exists(), bool)
+        assert birth(child_info["pid"]) == child_info["birth"]
+        receipt["mechanical"]["foregroundInterruptAndWrapperSurvival"] = True
+        (first / "stop").touch()
+        await_value(
+            lambda: [w for w in niri("windows") if w.get("app_id") == instances[0][1]],
+            lambda ws: not ws,
+        )
+        assert processes[0].wait(timeout=5) == 0
+        assert processes[1].poll() is None
+        receipt["mechanical"]["independentExitAndDisappearance"] = True
+        second, marker, window = instances[1]
+        niri("action", "focus-window", "--id", str(window["id"]))
+        assert niri("focused-window")["id"] == window["id"]
+        receipt["mechanical"]["focusSurvivingSibling"] = True
+    finally:
+        for instance in (root / "1", root / "2"):
+            if instance.is_dir():
+                (instance / "stop").touch()
+        for process in processes:
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                owned = next(
+                    item for item in receipt["owned"] if item["terminalPid"] == process.pid
+                )
+                if birth(process.pid) == owned["terminalBirth"]:
+                    process.terminate()
+                    process.wait(timeout=5)
+        for item in receipt["owned"]:
+            Path(item["control"]).unlink(missing_ok=True)
+        current = niri("windows")
+        owned_markers = {item["marker"] for item in receipt["owned"]}
+        receipt["cleanup"] = {
+            "ownedWindowsRemaining": sum(w.get("app_id") in owned_markers for w in current),
+            "unrelatedWindowIdsPreserved": {w["id"] for w in before} <= {w["id"] for w in current},
+        }
+        if original_focus in {w["id"] for w in current}:
+            niri("action", "focus-window", "--id", str(original_focus))
+        save(root / "receipt.json", receipt)
+        assert receipt["cleanup"]["ownedWindowsRemaining"] == 0
+        assert receipt["cleanup"]["unrelatedWindowIdsPreserved"]
+    print(
+        json.dumps(
+            {
+                "receipt": str(root / "receipt.json"),
+                **receipt["mechanical"],
+                "cleanup": receipt["cleanup"],
+            }
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

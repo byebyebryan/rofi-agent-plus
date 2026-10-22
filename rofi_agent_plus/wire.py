@@ -58,28 +58,33 @@ def decode_document(raw: bytes, *, limit: int) -> object:
             parse_constant=_reject_constant,
         )
         value, end = decoder.raw_decode(text)
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError) as error:
         raise WireError("invalid JSON document") from error
     if end != len(text):
         raise WireError("trailing byte or extra document")
+    validate_string_bounds(value, limit=limit)
     return value
 
 
 def validate_string_bounds(value: object, *, limit: int) -> None:
     """Apply a code-point bound to every known and extension string value."""
 
-    if isinstance(value, str):
-        if len(value) > limit:
-            raise WireError("response string exceeded its limit")
-        return
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            if not isinstance(key, str):
-                raise WireError("response object key is not a string")
-            if len(key) > limit:
-                raise WireError("response object key exceeded its limit")
-            validate_string_bounds(child, limit=limit)
-        return
-    if isinstance(value, (list, tuple)):
-        for child in value:
-            validate_string_bounds(child, limit=limit)
+    pending = [(value, 0)]
+    count = 0
+    while pending:
+        item, depth = pending.pop()
+        count += 1
+        if depth > 64 or count > 100_000:
+            raise WireError("response nesting or item count exceeded its limit")
+        if isinstance(item, str):
+            if len(item) > limit:
+                raise WireError("response string exceeded its limit")
+        elif isinstance(item, Mapping):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise WireError("response object key is not a string")
+                if len(key) > limit:
+                    raise WireError("response object key exceeded its limit")
+                pending.append((child, depth + 1))
+        elif isinstance(item, (list, tuple)):
+            pending.extend((child, depth + 1) for child in item)

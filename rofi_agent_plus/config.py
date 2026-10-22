@@ -1,228 +1,253 @@
-"""Strict provider-owned configuration for Rofi Agent Plus."""
+"""Direct-TUI configuration, independent of the legacy session picker."""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import re
+import pwd
+import stat
 import tomllib
+import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .engine import DEFAULT_LIMIT, PickerError
-
-DEFAULT_REFRESH_SECONDS = 30
-MIN_MAX_SESSIONS = 1
-MAX_MAX_SESSIONS = 100
-MIN_REFRESH_SECONDS = 5
-MAX_REFRESH_SECONDS = 300
-MAX_HOST_PROVIDER_ENTRIES = 128
-MAX_HOST_ID_LENGTH = 256
+DIRECT_CONFIG_RELATIVE_PATH = Path("rofi-agent-plus") / "direct.toml"
+MAX_CONFIG_BYTES = 256 << 10
+MAX_ENVIRONMENTS = 128
+MAX_PATH_LENGTH = 4096
+MAX_LABEL_LENGTH = 256
+MAX_DECLARATION_ID_LENGTH = 128
 SUPPORTED_PROVIDERS = ("codex", "claude")
-_HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
-CONFIG_RELATIVE_PATH = Path("rofi-agent-plus") / "config.toml"
-CONFIG_KEYS = frozenset({"max_sessions", "refresh_seconds", "host_providers"})
+DEFAULT_TERMINAL = ("kitty",)
+DEFAULT_CATALOG_TTL_SECONDS = 30
 
 
-class ConfigError(PickerError):
-    """A user-facing configuration error."""
-
-
-def _config_path() -> Path:
-    config_home = os.environ.get("XDG_CONFIG_HOME")
-    root = Path(config_home) if config_home else Path.home() / ".config"
-    return root / CONFIG_RELATIVE_PATH
-
-
-def _integer(value: Any, key: str, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigError(f"config {key} must be an integer")
-    if value < minimum or value > maximum:
-        raise ConfigError(f"config {key} must be between {minimum} and {maximum}")
-    return value
-
-
-def _host_providers(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    if not isinstance(value, Mapping):
-        raise ConfigError("config host_providers must be a table")
-    if not value:
-        raise ConfigError("config host_providers must contain at least one host")
-    if len(value) > MAX_HOST_PROVIDER_ENTRIES:
-        raise ConfigError(
-            f"config host_providers must contain at most {MAX_HOST_PROVIDER_ENTRIES} hosts"
-        )
-
-    normalized: dict[str, tuple[str, ...]] = {}
-    for host_id, selected in value.items():
-        if (
-            not isinstance(host_id, str)
-            or len(host_id) > MAX_HOST_ID_LENGTH
-            or not _HOST_ID.fullmatch(host_id)
-        ):
-            raise ConfigError("config host_providers contains an invalid host id")
-        key = host_id.casefold()
-        if key in normalized:
-            raise ConfigError("config host_providers contains case-colliding host ids")
-        if not isinstance(selected, (list, tuple)) or not selected:
-            raise ConfigError(f"config host_providers.{host_id} must select at least one provider")
-
-        selected_providers: set[str] = set()
-        for provider in selected:
-            if not isinstance(provider, str) or provider not in SUPPORTED_PROVIDERS:
-                raise ConfigError(
-                    f"config host_providers.{host_id} contains an unsupported provider"
-                )
-            if provider in selected_providers:
-                raise ConfigError(f"config host_providers.{host_id} contains a duplicate provider")
-            selected_providers.add(provider)
-        normalized[key] = tuple(
-            provider for provider in SUPPORTED_PROVIDERS if provider in selected_providers
-        )
-    return tuple(sorted(normalized.items()))
+class ConfigError(ValueError):
+    """A malformed top-level direct configuration."""
 
 
 @dataclass(frozen=True)
-class PickerConfig:
-    """Only the provider cache's durable settings belong to Agent Plus."""
-
-    max_sessions: int = DEFAULT_LIMIT
-    refresh_seconds: int = DEFAULT_REFRESH_SECONDS
-    host_providers: tuple[tuple[str, tuple[str, ...]], ...] = ()
-
-    def validate(self) -> None:
-        _integer(self.max_sessions, "max_sessions", MIN_MAX_SESSIONS, MAX_MAX_SESSIONS)
-        _integer(
-            self.refresh_seconds,
-            "refresh_seconds",
-            MIN_REFRESH_SECONDS,
-            MAX_REFRESH_SECONDS,
-        )
-        if not isinstance(self.host_providers, tuple):
-            raise ConfigError("config host_providers must use an immutable canonical value")
-        if len(self.host_providers) > MAX_HOST_PROVIDER_ENTRIES:
-            raise ConfigError(
-                f"config host_providers must contain at most {MAX_HOST_PROVIDER_ENTRIES} hosts"
-            )
-        seen: set[str] = set()
-        previous_host: str | None = None
-        for entry in self.host_providers:
-            if not isinstance(entry, tuple) or len(entry) != 2:
-                raise ConfigError("config host_providers must use an immutable canonical value")
-            host_id, selected = entry
-            if (
-                not isinstance(host_id, str)
-                or len(host_id) > MAX_HOST_ID_LENGTH
-                or not _HOST_ID.fullmatch(host_id)
-                or host_id != host_id.casefold()
-                or not isinstance(selected, tuple)
-                or not selected
-            ):
-                raise ConfigError("config host_providers must use an immutable canonical value")
-            if host_id in seen or (previous_host is not None and host_id <= previous_host):
-                raise ConfigError("config host_providers must use an immutable canonical value")
-            if any(provider not in SUPPORTED_PROVIDERS for provider in selected):
-                raise ConfigError("config host_providers contains an unsupported provider")
-            if len(set(selected)) != len(selected):
-                raise ConfigError("config host_providers contains a duplicate provider")
-            canonical = tuple(provider for provider in SUPPORTED_PROVIDERS if provider in selected)
-            if selected != canonical:
-                raise ConfigError("config host_providers must use an immutable canonical value")
-            seen.add(host_id)
-            previous_host = host_id
-
-    def providers_for(self, host_id: str) -> tuple[str, ...]:
-        """Return the configured provider set, defaulting to both supported providers."""
-
-        self.validate()
-        if (
-            not isinstance(host_id, str)
-            or len(host_id) > MAX_HOST_ID_LENGTH
-            or not _HOST_ID.fullmatch(host_id)
-        ):
-            raise ConfigError("host id is invalid")
-        wanted = host_id.casefold()
-        for configured_host, providers in self.host_providers:
-            if configured_host == wanted:
-                return providers
-        return SUPPORTED_PROVIDERS
-
-    @property
-    def fingerprint(self) -> str:
-        """Fingerprint only settings that alter provider discovery results."""
-
-        self.validate()
-        encoded = json.dumps(
-            {
-                "max_sessions": self.max_sessions,
-                "host_providers": [
-                    [host_id, list(providers)] for host_id, providers in self.host_providers
-                ],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        return hashlib.sha256(encoded).hexdigest()
-
-    def with_overrides(self, **values: Any) -> PickerConfig:
-        unknown = sorted(set(values) - CONFIG_KEYS)
-        if unknown:
-            raise ConfigError(f"unknown config key(s): {', '.join(unknown)}")
-        candidate = self
-        for field, minimum, maximum in (
-            ("max_sessions", MIN_MAX_SESSIONS, MAX_MAX_SESSIONS),
-            ("refresh_seconds", MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS),
-        ):
-            value = values.get(field)
-            if value is not None:
-                candidate = replace(candidate, **{field: _integer(value, field, minimum, maximum)})
-        if "host_providers" in values:
-            candidate = replace(candidate, host_providers=_host_providers(values["host_providers"]))
-        candidate.validate()
-        return candidate
+class DesktopConfig:
+    terminal: tuple[str, ...] = DEFAULT_TERMINAL
+    catalog_ttl_seconds: int = DEFAULT_CATALOG_TTL_SECONDS
 
 
-def load_config(path: Path | None = None) -> PickerConfig:
-    """Load the optional strict TOML config, or provider defaults."""
+@dataclass(frozen=True)
+class EnvironmentDeclaration:
+    provider: str
+    home: str
+    label: str
+    declaration_id: str | None = None
 
-    path = path or _config_path()
-    if not path.exists():
-        return PickerConfig()
+
+@dataclass(frozen=True)
+class DeclarationIssue:
+    index: int
+    code: str
+    message: str
+    provider: str | None = None
+    home: str | None = None
+
+
+@dataclass(frozen=True)
+class DirectConfig:
+    desktop: DesktopConfig
+    environments: tuple[EnvironmentDeclaration, ...]
+    issues: tuple[DeclarationIssue, ...] = ()
+
+
+def _check_text(value: object, label: str, limit: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > limit
+        or any(unicodedata.category(char).startswith("C") for char in value)
+    ):
+        raise ConfigError(f"{label} is invalid")
+    return value
+
+
+def _integer(value: object, label: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ConfigError(f"{label} must be between {minimum} and {maximum}")
+    return value
+
+
+def owning_user_home(*, uid: int | None = None) -> Path:
+    effective_uid = os.geteuid() if uid is None else uid
     try:
-        with path.open("rb") as stream:
-            raw = tomllib.load(stream)
-    except OSError as exc:
-        raise ConfigError(f"cannot read config {path}: {exc}") from exc
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ConfigError("config root must be a TOML table")
-    unknown = sorted(set(raw) - CONFIG_KEYS)
+        return Path(pwd.getpwuid(effective_uid).pw_dir)
+    except KeyError as error:
+        raise ConfigError("the effective user has no account home") from error
+
+
+def default_config_path(
+    *, env: Mapping[str, str] | None = None, user_home: Path | str | None = None
+) -> Path:
+    environment = os.environ if env is None else env
+    configured = environment.get("XDG_CONFIG_HOME")
+    if configured:
+        root = Path(configured)
+        if not root.is_absolute():
+            raise ConfigError("XDG_CONFIG_HOME must be absolute")
+    else:
+        root = Path(user_home) if user_home is not None else owning_user_home()
+        root = root / ".config"
+    return root / DIRECT_CONFIG_RELATIVE_PATH
+
+
+def canonical_native_home(value: str, *, user_home: Path | str) -> str:
+    """Resolve a native selector using only the owning account's path rules."""
+
+    raw = _check_text(value, "environment home", MAX_PATH_LENGTH)
+    if "$" in raw:
+        raise ConfigError("environment home cannot contain shell variables")
+    home = Path(user_home)
+    if raw == "~":
+        candidate = home
+    elif raw.startswith("~/"):
+        candidate = home / raw[2:]
+    elif raw.startswith("~"):
+        raise ConfigError("named-user home expansion is unsupported")
+    else:
+        candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise ConfigError("environment home must be absolute or start with `~/`")
+    try:
+        return str(candidate.resolve(strict=False))
+    except (OSError, RuntimeError) as error:
+        raise ConfigError("environment home cannot be canonicalized") from error
+
+
+def expand_native_home(value: str, *, user_home: Path | str) -> str:
+    """Expand only a leading `~` using the owning account's home."""
+    return canonical_native_home(value, user_home=user_home)
+
+
+def _default_label(provider: str, home: str) -> str:
+    basename = PurePosixPath(home).name
+    if provider == "codex" and basename == ".codex":
+        scope = "OSS"
+    elif provider == "claude" and basename == ".claude":
+        scope = "Default"
+    else:
+        scope = basename or "Home"
+    return f"{provider.capitalize()} · {scope}"
+
+
+def _parse_desktop(value: object) -> DesktopConfig:
+    if not isinstance(value, Mapping):
+        raise ConfigError("desktop must be a table")
+    unknown = set(value) - {"terminal", "catalog_ttl_seconds"}
     if unknown:
-        raise ConfigError(f"unknown config key(s): {', '.join(unknown)}")
-    overrides: dict[str, Any] = {
-        "max_sessions": raw.get("max_sessions"),
-        "refresh_seconds": raw.get("refresh_seconds"),
-    }
-    if "host_providers" in raw:
-        overrides["host_providers"] = raw["host_providers"]
-    return PickerConfig().with_overrides(
-        **overrides,
+        raise ConfigError("desktop contains an unsupported setting")
+    terminal = value.get("terminal", list(DEFAULT_TERMINAL))
+    if (
+        not isinstance(terminal, list)
+        or not 1 <= len(terminal) <= 16
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > 4096
+            or any(unicodedata.category(char).startswith("C") for char in item)
+            for item in terminal
+        )
+    ):
+        raise ConfigError("desktop terminal must be a bounded argument vector")
+    if Path(terminal[0]).name != "kitty":
+        raise ConfigError("desktop terminal must select the supported Kitty backend")
+    ttl = _integer(
+        value.get("catalog_ttl_seconds", DEFAULT_CATALOG_TTL_SECONDS), "catalog_ttl_seconds", 1, 300
     )
+    return DesktopConfig(tuple(terminal), ttl)
 
 
-def config_from_mapping(values: Mapping[str, Any]) -> PickerConfig:
-    """Build config from a mapping, primarily for deterministic tests."""
-
-    unknown = sorted(set(values) - CONFIG_KEYS)
+def _parse_declaration(value: object, index: int) -> EnvironmentDeclaration:
+    if not isinstance(value, Mapping):
+        raise ConfigError("environment declaration must be a table")
+    unknown = set(value) - {"provider", "home", "label", "id"}
     if unknown:
-        raise ConfigError(f"unknown config key(s): {', '.join(unknown)}")
-    overrides: dict[str, Any] = {
-        "max_sessions": values.get("max_sessions"),
-        "refresh_seconds": values.get("refresh_seconds"),
-    }
-    if "host_providers" in values:
-        overrides["host_providers"] = values["host_providers"]
-    return PickerConfig().with_overrides(**overrides)
+        raise ConfigError("environment declaration contains an unsupported setting")
+    provider = value.get("provider")
+    if not isinstance(provider, str) or provider not in SUPPORTED_PROVIDERS:
+        raise ConfigError("environment provider is unsupported")
+    home = _check_text(value.get("home"), "environment home", MAX_PATH_LENGTH)
+    if "$" in home:
+        raise ConfigError("environment home cannot contain shell variables")
+    if not (home.startswith("~/") or home == "~" or Path(home).is_absolute()):
+        raise ConfigError("environment home must be absolute or start with `~/`")
+    if home.startswith("~") and home not in {"~"} and not home.startswith("~/"):
+        raise ConfigError("named-user home expansion is unsupported")
+    label_value = value.get("label")
+    if label_value is None:
+        label = _default_label(provider, home)
+    else:
+        label = _check_text(label_value, "environment label", MAX_LABEL_LENGTH)
+    declaration_id_value = value.get("id")
+    declaration_id = (
+        None
+        if declaration_id_value is None
+        else _check_text(declaration_id_value, "environment id", MAX_DECLARATION_ID_LENGTH)
+    )
+    return EnvironmentDeclaration(provider, home, label, declaration_id)
+
+
+def parse_direct_config(value: object) -> DirectConfig:
+    if not isinstance(value, Mapping):
+        raise ConfigError("direct configuration must be a table")
+    unknown = set(value) - {"schema_version", "desktop", "environments"}
+    if unknown:
+        raise ConfigError("direct configuration contains an unsupported setting")
+    version = value.get("schema_version")
+    if isinstance(version, bool) or version != 1 or not isinstance(version, int):
+        raise ConfigError("unsupported direct configuration schema version")
+    desktop = _parse_desktop(value.get("desktop", {}))
+    environments_value = value.get("environments", [])
+    if not isinstance(environments_value, list) or len(environments_value) > MAX_ENVIRONMENTS:
+        raise ConfigError("environments must be a bounded array of tables")
+    environments: list[EnvironmentDeclaration] = []
+    issues: list[DeclarationIssue] = []
+    for index, item in enumerate(environments_value):
+        provider = item.get("provider") if isinstance(item, Mapping) else None
+        home = item.get("home") if isinstance(item, Mapping) else None
+        try:
+            environments.append(_parse_declaration(item, index))
+        except ConfigError as error:
+            safe_provider = provider if provider in SUPPORTED_PROVIDERS else None
+            safe_home = home if isinstance(home, str) and len(home) <= MAX_PATH_LENGTH else None
+            issues.append(
+                DeclarationIssue(index, "invalid_declaration", str(error), safe_provider, safe_home)
+            )
+    return DirectConfig(desktop, tuple(environments), tuple(issues))
+
+
+def load_direct_config(
+    path: Path | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    user_home: Path | str | None = None,
+) -> DirectConfig:
+    """Read only the new direct.toml; an absent file means native defaults."""
+
+    config_path = (
+        Path(path) if path is not None else default_config_path(env=env, user_home=user_home)
+    )
+    try:
+        descriptor = os.open(config_path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ConfigError("direct configuration is not a regular file")
+            raw = stream.read(MAX_CONFIG_BYTES + 1)
+    except FileNotFoundError:
+        return DirectConfig(DesktopConfig(), ())
+    except OSError as error:
+        raise ConfigError("direct configuration cannot be read") from error
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError("direct configuration exceeds its byte limit")
+    try:
+        text = raw.decode("utf-8", "strict")
+        document: Any = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ConfigError("direct configuration is not valid UTF-8 TOML") from error
+    return parse_direct_config(document)

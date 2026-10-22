@@ -1,0 +1,1476 @@
+#!/usr/bin/env python3
+"""Exercise the installed direct picker against one owned local Codex fixture."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Mapping
+from contextlib import redirect_stdout
+from pathlib import Path
+
+from rofi_agent_plus import __file__ as package_file
+from rofi_agent_plus import launcher
+from rofi_agent_plus.actions import ActionError
+from rofi_agent_plus.cache import CacheError
+from rofi_agent_plus.config import (
+    ConfigError,
+    expand_native_home,
+    load_direct_config,
+    owning_user_home,
+)
+from rofi_agent_plus.desktop import (
+    Desktop,
+    DesktopError,
+    ProcessIdentity,
+    kitty_control_command,
+    observe_process,
+    validate_kitty_layout,
+)
+from rofi_agent_plus.process import ProcessError, passive_probe_signals, run_bounded
+from rofi_agent_plus.registry import Instance, Registry, RegistryError, target_storage_key
+from rofi_agent_plus.rofi import PickerContext, _parse_state, build_context, run_rofi
+from rofi_agent_plus.transport import Transport, TransportError
+
+MAX_JSON_BYTES = 1 << 20
+MAX_EVENT_BYTES = 16 << 10
+MAX_WAIT_SECONDS = 45.0
+_HEX_64 = re.compile(r"[a-f0-9]{64}\Z", re.ASCII)
+_HEX_32 = re.compile(r"[a-f0-9]{32}\Z", re.ASCII)
+_ALLOWED_FIXTURE_LABELS = {"Local"}
+
+
+class ProofError(RuntimeError):
+    """The selected fixture or one of the direct-picker proof assertions failed."""
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ProofError("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def _read_json(path: Path, *, limit: int = MAX_JSON_BYTES, private: bool = False) -> object:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise ProofError("proof record ownership or type is invalid")
+            if private and stat.S_IMODE(info.st_mode) != 0o600:
+                raise ProofError("proof record mode is not private")
+            if info.st_size > limit:
+                raise ProofError("proof record exceeds its byte limit")
+            raw = stream.read(limit + 1)
+    except OSError as error:
+        raise ProofError("proof record is unavailable") from error
+    if len(raw) > limit:
+        raise ProofError("proof record exceeds its byte limit")
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ProofError("proof record is malformed JSON") from error
+
+
+def _save_json(path: Path, value: object) -> None:
+    temporary = path.with_name("." + path.name + ".tmp")
+    data = (json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode()
+    if len(data) > MAX_JSON_BYTES:
+        raise ProofError("proof receipt exceeds its byte limit")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _append_json(path: Path, value: object) -> None:
+    data = (json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+    if len(data) > MAX_EVENT_BYTES:
+        raise ProofError("proof event exceeds its byte limit")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size + len(data) > 1 << 20
+        ):
+            raise ProofError("proof event log is not a bounded private file")
+        os.write(descriptor, data)
+    finally:
+        os.close(descriptor)
+
+
+def _read_events(path: Path) -> list[dict[str, object]]:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    if len(raw) > 1 << 20:
+        raise ProofError("proof event log exceeds its byte limit")
+    events: list[dict[str, object]] = []
+    for line in raw.splitlines():
+        try:
+            value = json.loads(line, object_pairs_hook=_unique_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ProofError("proof event log is malformed") from error
+        if not isinstance(value, dict):
+            raise ProofError("proof event is not an object")
+        events.append(value)
+    return events
+
+
+def _private_directory(path: Path) -> None:
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+        info = path.lstat()
+    except OSError as error:
+        raise ProofError("private proof directory is unavailable") from error
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise ProofError("private proof directory ownership or mode is invalid")
+
+
+def _canonical_existing(value: str | Path, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise ProofError(f"{label} must be absolute")
+    try:
+        canonical = path.resolve(strict=True)
+    except OSError as error:
+        raise ProofError(f"{label} does not exist") from error
+    if canonical != path:
+        raise ProofError(f"{label} must be canonical and contain no symlink")
+    return path
+
+
+def _proofs_root(path: Path) -> Path:
+    for candidate in (path, *path.parents):
+        if candidate.name != "proofs":
+            continue
+        try:
+            info = candidate.lstat()
+        except OSError as error:
+            raise ProofError("private proofs directory is unavailable") from error
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ProofError("proofs directory is not owned")
+        return candidate
+    raise ProofError("fixture and output must live below the private proofs directory")
+
+
+def _private_path_chain(root: Path, leaf: Path) -> None:
+    try:
+        relative = leaf.relative_to(root)
+    except ValueError as error:
+        raise ProofError("proof path escaped the private proofs directory") from error
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as error:
+            raise ProofError("proof path component is unavailable") from error
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ProofError("proof path component is not a private owned directory")
+
+
+def _fixture(native_root_value: str | Path) -> tuple[Path, dict[str, object], Path]:
+    native_root = _canonical_existing(native_root_value, "native fixture root")
+    proof_root = _proofs_root(native_root)
+    _private_path_chain(proof_root, native_root)
+    if native_root.name not in {"native-local", "native-local-r1"}:
+        raise ProofError("native fixture root is not the declared Local candidate fixture")
+    manifest_value = _read_json(native_root / "fixture.json", private=True)
+    if not isinstance(manifest_value, dict):
+        raise ProofError("native fixture manifest is invalid")
+    manifest = manifest_value
+    if (
+        type(manifest.get("schemaVersion")) is not int
+        or manifest.get("schemaVersion") != 1
+        or manifest.get("root") != str(native_root)
+        or type(manifest.get("uid")) is not int
+        or manifest.get("uid") != os.getuid()
+        or manifest.get("provider") != "codex"
+        or manifest.get("label") not in _ALLOWED_FIXTURE_LABELS
+    ):
+        raise ProofError("native fixture identity, provider, or label does not match")
+    native_home = native_root / "native"
+    try:
+        home_info = native_home.lstat()
+    except OSError as error:
+        raise ProofError("owned Codex home is unavailable") from error
+    if (
+        not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid != os.getuid()
+        or home_info.st_mode & 0o077
+    ):
+        raise ProofError("owned Codex home is not private")
+    config_path = native_root / "direct.toml"
+    try:
+        config_info = config_path.lstat()
+    except OSError as error:
+        raise ProofError("native fixture direct.toml is unavailable") from error
+    if (
+        not stat.S_ISREG(config_info.st_mode)
+        or config_info.st_uid != os.getuid()
+        or config_info.st_size > 256 << 10
+    ):
+        raise ProofError("native fixture direct.toml is not a bounded owned file")
+    user_home = owning_user_home()
+    try:
+        config = load_direct_config(config_path, user_home=user_home)
+    except ConfigError as error:
+        raise ProofError("native fixture direct.toml is invalid") from error
+    declarations = [
+        item
+        for item in config.environments
+        if item.provider == "codex"
+        and expand_native_home(item.home, user_home=user_home) == str(native_home)
+        and item.label == "Owned Local"
+    ]
+    if len(declarations) != 1:
+        raise ProofError("direct.toml must declare the owned Codex home as Owned Local")
+    return native_root, manifest, config_path
+
+
+def _candidate_prefix() -> tuple[Path, Path]:
+    package = Path(package_file).absolute()
+    for parent in package.parents:
+        python = parent / "bin" / "python"
+        if python.is_file() and os.access(python, os.X_OK) and package.is_relative_to(parent):
+            return parent, python
+    raise ProofError("installed candidate package has no matching prefix interpreter")
+
+
+def _environment(output: Path) -> tuple[dict[str, str], Path, Path]:
+    home = owning_user_home()
+    original_path = os.environ.get("PATH", "")
+    codex = shutil.which("codex", path=original_path)
+    if codex is None:
+        raise ProofError("the native Codex executable is unavailable on the owning host")
+    codex_path = Path(codex).resolve(strict=True)
+    if not codex_path.is_file() or not os.access(codex_path, os.X_OK):
+        raise ProofError("the selected Codex executable is not a real executable file")
+
+    config_home = output / "xdg" / "config"
+    cache_home = output / "xdg" / "cache"
+    state_home = output / "xdg" / "state"
+    runtime_root = output / "private-registry"
+    for path in (output / "xdg", config_home, cache_home, state_home, runtime_root):
+        _private_directory(path)
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(config_home),
+            "XDG_CACHE_HOME": str(cache_home),
+            "XDG_STATE_HOME": str(state_home),
+        }
+    )
+    for key in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "CODEX_PLUS_SOCKET"):
+        env.pop(key, None)
+    return env, runtime_root, codex_path
+
+
+def _mesh_shim(output: Path, env: dict[str, str]) -> tuple[dict[str, str], Path]:
+    shim_dir = output / "bin"
+    _private_directory(shim_dir)
+    document = {
+        "schemaVersion": 1,
+        "generatedAt": time.time_ns() // 1_000_000,
+        "meshRevision": "sha256:" + hashlib.sha256(b"direct-picker-controlled-mesh").hexdigest(),
+        "localHostId": "starship",
+        "sshPolicy": {
+            "executable": "ssh",
+            "connectTimeoutSeconds": 3,
+            "connectionAttempts": 1,
+            "routeHealthTtlSeconds": 60,
+        },
+        "hosts": [
+            {
+                "id": "starship",
+                "display": "Starship · controlled local mesh",
+                "local": True,
+                "aliases": ["starship"],
+                "routes": [],
+            }
+        ],
+    }
+    mesh_path = output / "controlled-mesh.json"
+    _save_json(mesh_path, document)
+    shim = shim_dir / "rofi-ssh-plus"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$#" -ne 3 ] || [ "$1" != mesh ] || [ "$2" != list ] || [ "$3" != --json ]; then\n'
+        "  exit 64\n"
+        "fi\n"
+        "exec /bin/cat " + shlex.quote(str(mesh_path)) + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o700)
+    env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
+    return env, shim
+
+
+def _session_data(
+    output: Path,
+    native_root: Path,
+    env: Mapping[str, str],
+    registry_root: Path,
+    host_helper: Path,
+    desktop: Desktop,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "uid": os.getuid(),
+        "output": str(output),
+        "nativeRoot": str(native_root),
+        "registryRoot": str(registry_root),
+        "hostHelper": str(host_helper),
+        "desktopGeneration": desktop.generation,
+        "environment": {
+            key: env[key]
+            for key in (
+                "HOME",
+                "PATH",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+                "NIRI_SOCKET",
+                "WAYLAND_DISPLAY",
+            )
+            if key in env
+        },
+    }
+
+
+def _target_from_context(
+    context: PickerContext, native_root: Path
+) -> tuple[str, dict[str, object]]:
+    try:
+        snapshot = context.cache.load()
+    except CacheError as error:
+        raise ProofError("candidate picker did not publish its local inventory") from error
+    hosts = [host for host in snapshot.hosts if host.host_id == "starship" and host.local]
+    if len(hosts) != 1 or hosts[0].user is None or hosts[0].user.uid != os.getuid():
+        raise ProofError("controlled local mesh did not produce the current user identity")
+    home = str(native_root / "native")
+    matches = [
+        target
+        for provider in hosts[0].providers
+        if provider.provider == "codex"
+        for target in provider.targets
+        if target.key.home == home
+        and target.key.provider == "codex"
+        and target.key.uid == os.getuid()
+        and target.label == "Owned Local"
+    ]
+    if len(matches) != 1 or matches[0].capability.status != "supported":
+        raise ProofError("candidate inventory omitted the supported Owned Local Codex target")
+    target = matches[0]
+    target_id = target_storage_key(target.key.identity)
+    return target_id, target.to_json()
+
+
+def _candidate_transport(output: Path, env: Mapping[str, str], helper: Path) -> Transport:
+    expected = helper.resolve()
+
+    def observed_runner(argv: tuple[str, ...], **kwargs: object) -> object:
+        if argv and Path(argv[0]).resolve() == expected:
+            _append_json(
+                output / "host-helper-events.jsonl",
+                {"executable": str(expected), "arguments": list(argv[1:])},
+            )
+        return run_bounded(argv, **kwargs)
+
+    return Transport(env=env, local_helper=helper, runner=observed_runner)
+
+
+def _safe_info(environ: Mapping[str, str]) -> dict[str, str] | None:
+    raw = environ.get("ROFI_INFO", "")
+    if not raw or len(raw) > 1024:
+        return None
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or type(value.get("schemaVersion")) is not int
+        or not isinstance(value.get("kind"), str)
+    ):
+        return None
+    kind, target_id, instance_id = value.get("kind"), value.get("targetId"), value.get("instanceId")
+    if (
+        value.get("schemaVersion") != 1
+        or kind not in {"target", "instance"}
+        or not isinstance(target_id, str)
+        or not _HEX_64.fullmatch(target_id)
+        or (
+            kind == "instance"
+            and (not isinstance(instance_id, str) or not _HEX_32.fullmatch(instance_id))
+        )
+    ):
+        return None
+    result = {"kind": kind, "targetId": target_id}
+    if kind == "instance":
+        result["instanceId"] = instance_id
+    return result
+
+
+def _registry_snapshot(
+    output: Path, env: Mapping[str, str], target_id: str | None
+) -> tuple[list[dict[str, object]], str | None]:
+    if target_id is None:
+        return [], None
+    desktop = Desktop(dict(env))
+    registry = Registry(desktop.generation, output / "private-registry")
+    windows = desktop.windows()
+    records = registry.records(target_id)
+    values = []
+    focused_instance = None
+    for record in records:
+        window_id = None
+        focused = False
+        if record.state == "live":
+            terminal = record.process("terminal")
+            if terminal is not None:
+                window = desktop.match(windows, record.marker, terminal)
+                if window is not None:
+                    window_id = window.window_id
+                    focused = window.focused
+                    if focused:
+                        focused_instance = record.instance_id
+        values.append(
+            {
+                "instanceId": record.instance_id,
+                "ordinal": record.value["ordinal"],
+                "state": record.state,
+                "marker": record.marker,
+                "windowId": window_id,
+                "focused": focused,
+                "processes": {
+                    role: record.value.get(role) for role in ("terminal", "wrapper", "client")
+                },
+            }
+        )
+    return values, focused_instance
+
+
+def _callback(args: argparse.Namespace) -> int:
+    native_root, _manifest, _config_path = _fixture(args.native_root)
+    output = _canonical_existing(args.output, "proof output root")
+    proof_root = _proofs_root(output)
+    _private_path_chain(proof_root, output)
+    session_path = output / "session.json"
+    session_value = _read_json(session_path, private=True)
+    if not isinstance(session_value, dict) or session_value.get("uid") != os.getuid():
+        raise ProofError("proof session identity is invalid")
+    if session_value.get("nativeRoot") != str(native_root):
+        raise ProofError("proof session fixture path changed")
+    helper_value = session_value.get("hostHelper")
+    if not isinstance(helper_value, str):
+        raise ProofError("candidate host helper path is unavailable")
+    helper_path = Path(helper_value)
+    if (
+        not helper_path.is_absolute()
+        or not helper_path.is_file()
+        or not os.access(helper_path, os.X_OK)
+    ):
+        raise ProofError("candidate host helper is not executable")
+    env = dict(os.environ)
+    retv_raw = env.get("ROFI_RETV", "0")
+    try:
+        retv = int(retv_raw)
+    except ValueError:
+        retv = 0
+    frame = launcher.initial_frame(env)
+    if frame is not None:
+        print(frame, end="")
+        _append_json(
+            output / "callback-events.jsonl",
+            {"retv": retv, "phase": "initial-frame", "packageFile": str(package_file)},
+        )
+        return 0
+
+    state = _parse_state(env.get("ROFI_DATA"))
+    action = state.action
+    selected_info = _safe_info(env)
+    target_id = session_value.get("targetId")
+    if not isinstance(target_id, str) or not _HEX_64.fullmatch(target_id):
+        target_id = None
+    captured = io.StringIO()
+    error_name = None
+    result = 1
+    try:
+        with passive_probe_signals(), redirect_stdout(captured):
+            result = run_rofi(
+                env,
+                transport=_candidate_transport(output, env, helper_path),
+                registry_root=Path(str(session_value["registryRoot"])),
+            )
+    except (
+        ActionError,
+        CacheError,
+        DesktopError,
+        OSError,
+        RegistryError,
+        TransportError,
+        ValueError,
+    ) as error:
+        error_name = type(error).__name__
+    rendered = captured.getvalue()
+    if rendered:
+        print(rendered, end="")
+    instances, focused_instance = _registry_snapshot(output, env, target_id)
+    request_exists = False
+    if target_id is not None and _HEX_32.fullmatch(state.request_id):
+        try:
+            registry = Registry(
+                Desktop(env).generation,
+                Path(str(session_value["registryRoot"])),
+            )
+            request_exists = registry.find_request(target_id, state.request_id) is not None
+        except (DesktopError, RegistryError):
+            error_name = error_name or "RegistryError"
+    kind = selected_info.get("kind") if selected_info else None
+    action_kind = (
+        "additional" if action == "additional" else ("focus" if kind == "instance" else "open")
+    )
+    _append_json(
+        output / "callback-events.jsonl",
+        {
+            "retv": retv,
+            "launchOrdinal": session_value.get("launchOrdinal"),
+            "action": action_kind,
+            "success": retv == 1 and not rendered and error_name is None,
+            "info": selected_info,
+            "requestId": state.request_id if _HEX_32.fullmatch(state.request_id) else None,
+            "requestExists": request_exists,
+            "instances": instances,
+            "focusedInstance": focused_instance,
+            "packageFile": str(package_file),
+            "error": error_name,
+            "result": result,
+        },
+    )
+    return result if error_name is not None else 0
+
+
+def _close_first(args: argparse.Namespace) -> int:
+    native_root, _manifest, _config = _fixture(args.native_root)
+    output = _canonical_existing(args.output, "proof output root")
+    proof_root = _proofs_root(output)
+    _private_path_chain(proof_root, output)
+    session = _read_json(output / "session.json", private=True)
+    if (
+        not isinstance(session, dict)
+        or session.get("schemaVersion") != 1
+        or session.get("uid") != os.getuid()
+        or session.get("nativeRoot") != str(native_root)
+        or not isinstance(session.get("targetId"), str)
+        or not _HEX_64.fullmatch(session["targetId"])
+    ):
+        raise ProofError("proof session does not own a target")
+    env_value = session.get("environment")
+    if not isinstance(env_value, dict) or not isinstance(env_value.get("PATH"), str):
+        raise ProofError("proof session environment is invalid")
+    env = dict(env_value)
+    desktop = Desktop(env)
+    if desktop.generation != session.get("desktopGeneration"):
+        raise ProofError("proof desktop generation changed")
+    registry_root = Path(str(session.get("registryRoot", "")))
+    if not registry_root.is_absolute() or not registry_root.is_relative_to(output):
+        raise ProofError("proof registry escaped its output directory")
+    registry = Registry(desktop.generation, registry_root)
+    windows = desktop.windows()
+    records = registry.reconcile(session["targetId"], desktop, windows)
+    record = next(
+        (item for item in records if item.value.get("ordinal") == 1 and item.state == "live"),
+        None,
+    )
+    if record is None:
+        raise ProofError("owned first Codex window is no longer live")
+    terminal, wrapper, client = (record.process(role) for role in ("terminal", "wrapper", "client"))
+    if terminal is None or wrapper is None or client is None:
+        raise ProofError("owned first Codex window lacks current process identities")
+    window = desktop.match(windows, record.marker, terminal)
+    if window is None:
+        raise ProofError("owned first Codex window is not mapped")
+    control = registry.control_path(record.instance_id)
+    validate_kitty_layout(control, wrapper, client)
+    command = kitty_control_command(
+        control,
+        ["close-window"],
+    )
+    try:
+        result = run_bounded(command, env=env, timeout=4.0, stdout_limit=64 << 10)
+    except (OSError, ProcessError) as error:
+        raise ProofError("owned first Codex window close request failed") from error
+    if result.returncode != 0:
+        raise ProofError("owned first Codex window close request failed")
+    _append_json(
+        output / "control-events.jsonl",
+        {
+            "operation": "close-first",
+            "instanceId": record.instance_id,
+            "windowId": window.window_id,
+            "packageFile": str(package_file),
+        },
+    )
+    print(json.dumps({"closedInstance": record.instance_id, "windowId": window.window_id}))
+    return 0
+
+
+def _confirm_stale_open(args: argparse.Namespace) -> int:
+    native_root, _manifest, _config = _fixture(args.native_root)
+    output = _canonical_existing(args.output, "proof output root")
+    proof_root = _proofs_root(output)
+    _private_path_chain(proof_root, output)
+    session = _read_json(output / "session.json", private=True)
+    receipt = _read_json(output / "receipt.json", private=True)
+    if (
+        not isinstance(session, dict)
+        or session.get("schemaVersion") != 1
+        or session.get("uid") != os.getuid()
+        or session.get("nativeRoot") != str(native_root)
+        or not isinstance(session.get("targetId"), str)
+        or not _HEX_64.fullmatch(session["targetId"])
+        or not isinstance(session.get("desktopGeneration"), str)
+        or not isinstance(receipt, dict)
+    ):
+        raise ProofError("proof session or receipt identity is invalid")
+    launches = receipt.get("pickerLaunches")
+    if not isinstance(launches, list) or not launches or not isinstance(launches[-1], dict):
+        raise ProofError("proof has no current picker process")
+    picker = launches[-1]
+    if "exitCode" in picker:
+        raise ProofError("the latest picker has already exited")
+    try:
+        picker_identity = ProcessIdentity.parse(picker.get("identity"))
+        current_picker = observe_process(picker_identity.pid)
+    except DesktopError as error:
+        raise ProofError("latest picker process identity is invalid") from error
+    if current_picker != picker_identity:
+        raise ProofError("latest picker process is no longer alive")
+
+    target_id = session["targetId"]
+    events = _read_events(output / "callback-events.jsonl")
+    selection_events = [
+        event for event in events if type(event.get("retv")) is int and event["retv"] == 1
+    ]
+    if not selection_events:
+        raise ProofError("proof has no selected picker callback")
+    stale = selection_events[-1]
+    info = stale.get("info")
+    if (
+        stale.get("success") is not False
+        or stale.get("requestExists") is not False
+        or stale.get("launchOrdinal") != picker.get("launchOrdinal")
+        or not isinstance(info, dict)
+        or info.get("kind") != "instance"
+        or info.get("targetId") != target_id
+        or not isinstance(info.get("instanceId"), str)
+        or not _HEX_32.fullmatch(info["instanceId"])
+    ):
+        raise ProofError("latest selection is not the refused stale instance")
+    snapshots = stale.get("instances")
+    if not isinstance(snapshots, list) or len(snapshots) != 1 or not isinstance(snapshots[0], dict):
+        raise ProofError("stale selection did not retain exactly one survivor")
+    survivor = snapshots[0]
+    survivor_id = survivor.get("instanceId")
+    if (
+        survivor.get("state") != "live"
+        or survivor.get("ordinal") != 2
+        or not isinstance(survivor_id, str)
+        or not _HEX_32.fullmatch(survivor_id)
+        or survivor_id == info["instanceId"]
+    ):
+        raise ProofError("stale selection survivor is not the live second window")
+
+    registry_value = session.get("registryRoot")
+    if not isinstance(registry_value, str):
+        raise ProofError("proof registry path is invalid")
+    registry_root = Path(registry_value)
+    if not registry_root.is_absolute() or not registry_root.is_relative_to(output):
+        raise ProofError("proof registry escaped its output directory")
+    registry = Registry(session["desktopGeneration"], registry_root)
+    records = registry.records(target_id)
+    if (
+        len(records) != 1
+        or records[0].instance_id != survivor_id
+        or records[0].state != "live"
+        or records[0].value.get("ordinal") != 2
+    ):
+        raise ProofError("private registry does not confirm the sole live survivor")
+    survivor_processes = {
+        role: records[0].process(role) for role in ("terminal", "wrapper", "client")
+    }
+    if any(
+        process is None or observe_process(process.pid) != process
+        for process in survivor_processes.values()
+    ):
+        raise ProofError("the surviving native client is no longer live")
+
+    confirmation_path = output / "confirmation-events.jsonl"
+    if _read_events(confirmation_path):
+        raise ProofError("stale-open confirmation was already recorded")
+    confirmation = {
+        "schemaVersion": 1,
+        "kind": "stale-open-confirmed",
+        "observedAtNs": time.time_ns(),
+        "pickerIdentity": picker_identity.wire(),
+        "pickerLaunchOrdinal": picker.get("launchOrdinal"),
+        "pickerWasLive": True,
+        "targetId": target_id,
+        "staleInstanceId": info["instanceId"],
+        "staleRequestId": stale.get("requestId"),
+        "requestExists": False,
+        "survivorCount": 1,
+        "survivorInstanceId": survivor_id,
+        "survivorOrdinal": 2,
+        "survivorProcessIdentities": {
+            role: process.wire()
+            for role, process in survivor_processes.items()
+            if process is not None
+        },
+    }
+    _append_json(confirmation_path, confirmation)
+    print(json.dumps({"confirmed": "stale-open", "pickerPid": picker_identity.pid}))
+    return 0
+
+
+def _read_target_id(output: Path) -> str:
+    value = _read_json(output / "session.json", private=True)
+    if not isinstance(value, dict):
+        raise ProofError("proof session is malformed")
+    target_id = value.get("targetId")
+    if not isinstance(target_id, str) or not _HEX_64.fullmatch(target_id):
+        raise ProofError("proof target id is unavailable")
+    return target_id
+
+
+def _wait_live(
+    desktop: Desktop, registry: Registry, target_id: str, instance_ids: set[str]
+) -> list[Instance]:
+    deadline = time.monotonic() + MAX_WAIT_SECONDS
+    latest: list[Instance] = []
+    while time.monotonic() < deadline:
+        windows = desktop.windows()
+        latest = registry.reconcile(target_id, desktop, windows)
+        by_id = {record.instance_id: record for record in latest}
+        ready = True
+        for instance_id in instance_ids:
+            record = by_id.get(instance_id)
+            if record is None or record.state != "live":
+                ready = False
+                break
+            terminal = record.process("terminal")
+            wrapper = record.process("wrapper")
+            client = record.process("client")
+            if terminal is None or wrapper is None or client is None:
+                ready = False
+                break
+            window = desktop.match(windows, record.marker, terminal)
+            if window is None:
+                ready = False
+                break
+            validate_kitty_layout(registry.control_path(instance_id), wrapper, client)
+        if ready:
+            return latest
+        time.sleep(0.15)
+    raise ProofError("owned native windows did not become live and mapped before deadline")
+
+
+def _wait_and_close_owned(
+    output: Path,
+    env: dict[str, str],
+    registry: Registry,
+    target_id: str,
+    known_instance_ids: set[str],
+    process_wires: list[dict[str, object]],
+    pickers_closed: bool,
+) -> dict[str, object]:
+    desktop = Desktop(env)
+    owned_markers = {
+        "org.agentplus." + item for item in known_instance_ids if _HEX_32.fullmatch(item)
+    }
+    cleanup_errors: list[str] = []
+    known_processes: set[ProcessIdentity] = set()
+    for value in process_wires:
+        try:
+            known_processes.add(ProcessIdentity.parse(value))
+        except DesktopError:
+            cleanup_errors.append("invalid_owned_process_identity")
+    close_requested: set[str] = set()
+    cleanup_deadline = time.monotonic() + 8.0
+    while time.monotonic() < cleanup_deadline:
+        windows = desktop.windows()
+        try:
+            records = registry.reconcile(target_id, desktop, windows)
+        except (RegistryError, DesktopError) as error:
+            cleanup_errors.append(type(error).__name__)
+            break
+        for record in records:
+            if (
+                record.instance_id not in known_instance_ids
+                or record.instance_id in close_requested
+            ):
+                continue
+            terminal, wrapper, client = (
+                record.process(role) for role in ("terminal", "wrapper", "client")
+            )
+            known_processes.update(
+                process for process in (terminal, wrapper, client) if process is not None
+            )
+            if terminal is None or wrapper is None or client is None:
+                continue
+            try:
+                window = desktop.match(windows, record.marker, terminal)
+                if window is None:
+                    continue
+                validate_kitty_layout(registry.control_path(record.instance_id), wrapper, client)
+                command = kitty_control_command(
+                    registry.control_path(record.instance_id),
+                    ["close-window"],
+                )
+                result = run_bounded(command, env=env, timeout=4.0, stdout_limit=64 << 10)
+                if result.returncode != 0:
+                    cleanup_errors.append("kitty_close_failed")
+                else:
+                    close_requested.add(record.instance_id)
+            except (DesktopError, ProcessError, OSError, RegistryError):
+                cleanup_errors.append("owned_window_close_failed")
+        current = desktop.windows()
+        if not any(window.app_id in owned_markers for window in current):
+            break
+        time.sleep(0.25)
+
+    current = desktop.windows()
+    remaining = [window for window in current if window.app_id in owned_markers]
+    before = _read_json(output / "desktop-before.json", private=True)
+    if not isinstance(before, dict) or not isinstance(before.get("windowIds"), list):
+        raise ProofError("saved baseline window inventory is invalid")
+    before_ids = set(item for item in before["windowIds"] if type(item) is int)
+    current_ids = {window.window_id for window in current}
+    unrelated_preserved = before_ids <= current_ids
+    focus_id = before.get("focusedWindowId")
+    focus_restored = focus_id is None
+    if type(focus_id) is int and focus_id in current_ids:
+        from rofi_agent_plus.desktop import run_json
+
+        run_json(
+            ["niri", "msg", "--json", "action", "focus-window", "--id", str(focus_id)],
+            env=env,
+        )
+        focused = next((window for window in desktop.windows() if window.focused), None)
+        focus_restored = focused is not None and focused.window_id == focus_id
+
+    process_deadline = time.monotonic() + 8.0
+    while time.monotonic() < process_deadline:
+        if all(observe_process(identity.pid) != identity for identity in known_processes):
+            break
+        time.sleep(0.15)
+    live_processes = [
+        identity for identity in known_processes if observe_process(identity.pid) == identity
+    ]
+
+    controls_removed = not remaining and not live_processes and pickers_closed
+    registry_removed = not remaining and not live_processes and pickers_closed
+    if controls_removed:
+        control_dir = (
+            Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "rofi-agent-plus-sockets"
+        )
+        for instance_id in known_instance_ids:
+            if not _HEX_32.fullmatch(instance_id):
+                continue
+            control = registry.control_path(instance_id)
+            try:
+                info = control.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                controls_removed = False
+                continue
+            if (
+                control.parent != control_dir
+                or not stat.S_ISSOCK(info.st_mode)
+                or info.st_uid != os.getuid()
+            ):
+                controls_removed = False
+                continue
+            control.unlink()
+        registry_removed = controls_removed
+        try:
+            if registry_removed and registry.root.exists():
+                if registry.root.parent != output or registry.root.is_symlink():
+                    raise ProofError("private registry root changed before cleanup")
+                shutil.rmtree(registry.root)
+        except OSError:
+            registry_removed = False
+
+    return {
+        "ownedWindowsRemaining": len(remaining),
+        "ownedProcessesRemaining": len(live_processes),
+        "ownedPickersClosed": pickers_closed,
+        "unrelatedWindowIdsPreserved": unrelated_preserved,
+        "priorFocusRestored": focus_restored,
+        "privateControlSocketsRemoved": controls_removed,
+        "privateRegistryRemoved": registry_removed,
+        "cleanupErrors": cleanup_errors,
+    }
+
+
+def _receipt(output: Path, value: dict[str, object]) -> None:
+    _save_json(output / "receipt.json", value)
+
+
+def _run(args: argparse.Namespace) -> int:
+    native_root, manifest, source_config = _fixture(args.native_root)
+    output_path = Path(args.output)
+    if not output_path.is_absolute() or output_path.resolve(strict=False) != output_path:
+        raise ProofError("proof output root must be absolute and canonical")
+    proof_root = _proofs_root(output_path.parent)
+    _private_path_chain(proof_root, output_path.parent)
+    if output_path.exists() or output_path.is_symlink():
+        raise ProofError("proof output root already exists")
+    _private_directory(output_path)
+    _private_path_chain(proof_root, output_path)
+    candidate_prefix, candidate_python = _candidate_prefix()
+    package = Path(package_file).absolute()
+    if not package.is_relative_to(candidate_prefix):
+        raise ProofError("imported package is outside the selected candidate prefix")
+
+    env, registry_root, codex_path = _environment(output_path)
+    env, shim = _mesh_shim(output_path, env)
+    host_helper = candidate_prefix / "bin" / "rofi-agent-plus-host"
+    if not host_helper.is_file() or not os.access(host_helper, os.X_OK):
+        raise ProofError("matching candidate host helper is unavailable")
+    config_bytes = source_config.read_bytes()
+    private_config = Path(env["XDG_CONFIG_HOME"]) / "rofi-agent-plus"
+    _private_directory(private_config)
+    direct_config = private_config / "direct.toml"
+    direct_config.write_bytes(config_bytes)
+    direct_config.chmod(0o600)
+    env["ROFI_AGENT_PLUS_PROOF_MESH"] = "controlled"
+
+    desktop = Desktop(env)
+    baseline = desktop.windows()
+    focused = next((window.window_id for window in baseline if window.focused), None)
+    _save_json(
+        output_path / "desktop-before.json",
+        {"windowIds": [window.window_id for window in baseline], "focusedWindowId": focused},
+    )
+    registry = Registry(desktop.generation, registry_root)
+    transport = _candidate_transport(output_path, env, host_helper)
+    context = build_context(env, transport=transport, registry=registry)
+    if context.config_error or context.desktop is None or context.actions is None:
+        raise ProofError("candidate direct host services could not be initialized")
+
+    session = _session_data(output_path, native_root, env, registry_root, host_helper, desktop)
+    session["launchOrdinal"] = 0
+    _save_json(output_path / "session.json", session)
+    receipt: dict[str, object] = {
+        "schemaVersion": 1,
+        "outcome": "running",
+        "packageFile": str(package),
+        "candidatePrefix": str(candidate_prefix),
+        "nativeFixture": {
+            "root": str(native_root),
+            "runId": manifest.get("runId"),
+            "uid": os.getuid(),
+            "provider": "codex",
+            "label": "Owned Local",
+            "home": str(native_root / "native"),
+        },
+        "mesh": "controlled",
+        "meshShim": str(shim),
+        "nativeCodexExecutable": str(codex_path),
+        "candidateHostHelper": str(host_helper),
+        "checks": {},
+        "pickerLaunches": [],
+        "focusVerifications": [],
+        "selections": [],
+        "cleanup": {},
+        "providerInputSentByDriver": 0,
+        "human": "pending",
+    }
+    _receipt(output_path, receipt)
+
+    callback_path = Path(__file__).absolute()
+    callback = output_path / "candidate-callback"
+    callback_command = shlex.join(
+        [
+            str(candidate_python),
+            "-I",
+            "-B",
+            str(callback_path),
+            "--native-root",
+            str(native_root),
+            "--output",
+            str(output_path),
+            "--callback",
+        ]
+    )
+    callback.write_text("#!/bin/sh\nexec " + callback_command + ' "$@"\n', encoding="utf-8")
+    callback.chmod(0o700)
+
+    original_agent_executable = launcher._agent_executable
+    original_run_rofi = launcher.run_rofi
+    original_subprocess = launcher.subprocess
+    tracked_processes: list[subprocess.Popen[bytes]] = []
+    previous_signals: dict[int, object] = {}
+    initial_frame_seconds: dict[int, float] = {}
+
+    class _LauncherSubprocess:
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        @staticmethod
+        def Popen(*popen_args: object, **popen_kwargs: object) -> subprocess.Popen[bytes]:
+            process = subprocess.Popen(*popen_args, **popen_kwargs)  # type: ignore[arg-type]
+            tracked_processes.append(process)
+            identity = observe_process(process.pid)
+            launches = receipt["pickerLaunches"]
+            assert isinstance(launches, list)
+            launches.append(
+                {
+                    "pid": process.pid,
+                    "identity": identity.wire() if identity is not None else None,
+                    "argv": "rofi",
+                    "launchOrdinal": session.get("launchOrdinal"),
+                    "initialFrameSeconds": initial_frame_seconds.get(session.get("launchOrdinal")),
+                }
+            )
+            _receipt(output_path, receipt)
+            return process
+
+    def injected_run_rofi(environ: Mapping[str, str] | None = None) -> int:
+        captured = io.StringIO()
+        started = time.monotonic()
+        with redirect_stdout(captured), passive_probe_signals():
+            result = run_rofi(environ, context=context)
+        elapsed = time.monotonic() - started
+        rendered = captured.getvalue()
+        if environ is not None and environ.get("ROFI_RETV") == "0":
+            launch_ordinal = session.get("launchOrdinal")
+            if type(launch_ordinal) is int and launch_ordinal > 0:
+                initial_frame_seconds[launch_ordinal] = elapsed
+        if environ is not None and environ.get("ROFI_RETV") == "0":
+            target_id, target = _target_from_context(context, native_root)
+            session.update({"targetId": target_id, "target": target})
+            _save_json(output_path / "session.json", session)
+            checks = receipt["checks"]
+            assert isinstance(checks, dict)
+            checks.update(
+                {
+                    "controlledMeshResolvedToCurrentLocalUser": True,
+                    "ownedCodexTargetPublishedByCandidate": True,
+                    "candidatePackageImported": package.is_relative_to(candidate_prefix),
+                    "candidateHostHelperPinned": transport.local_helper
+                    == str(host_helper.resolve()),
+                }
+            )
+            _receipt(output_path, receipt)
+        print(rendered, end="")
+        return result
+
+    launcher._agent_executable = lambda: callback
+    launcher.run_rofi = injected_run_rofi
+    launcher.subprocess = _LauncherSubprocess  # type: ignore[assignment]
+    previous_env = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    failure: str | None = None
+
+    def _cancel(signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt(f"proof interrupted by signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        previous_signals[signum] = signal.signal(signum, _cancel)
+    try:
+        callback_cursor = 0
+        for _launch_index in range(5):
+            launch_number = len(receipt["pickerLaunches"]) + 1  # type: ignore[arg-type]
+            session["launchOrdinal"] = launch_number
+            _save_json(output_path / "session.json", session)
+            rofi_status = launcher.main([])
+            launches = receipt["pickerLaunches"]
+            assert isinstance(launches, list)
+            if launches:
+                launches[-1]["exitCode"] = rofi_status
+            events = _read_events(output_path / "callback-events.jsonl")
+            new_events = events[callback_cursor:]
+            callback_cursor = len(events)
+            successful = [
+                event
+                for event in new_events
+                if event.get("retv") == 1 and event.get("success") is True
+            ]
+            if not successful:
+                stale_action = next(
+                    (
+                        event
+                        for event in reversed(new_events)
+                        if event.get("retv") == 1
+                        and event.get("success") is False
+                        and isinstance(event.get("info"), dict)
+                        and event["info"].get("kind") == "instance"
+                    ),
+                    None,
+                )
+                if stale_action is not None:
+                    receipt["staleDialogExitCode"] = rofi_status
+                break
+            latest = successful[-1]
+            identifiers = {
+                item.get("instanceId")
+                for item in latest.get("instances", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("instanceId"), str)
+                and _HEX_32.fullmatch(item["instanceId"])
+            }
+            if latest.get("action") in {"open", "additional"} and not identifiers:
+                raise ProofError("successful open did not reserve an instance")
+            target_id = _read_target_id(output_path)
+            live_records = _wait_live(desktop, registry, target_id, identifiers)
+            ordinals = {record.value.get("ordinal") for record in live_records}
+            live_checks = receipt["checks"]
+            assert isinstance(live_checks, dict)
+            if latest.get("action") == "open":
+                if len(live_records) != 1 or ordinals != {1}:
+                    raise ProofError("first Open did not leave exactly window 1 live")
+                live_checks["firstWindowLiveMappedBeforeReopen"] = True
+            elif latest.get("action") in {"additional", "focus"}:
+                if len(live_records) != 2 or ordinals != {1, 2}:
+                    raise ProofError("expected exactly windows 1 and 2 to remain live")
+                live_checks["twoWindowsLiveMappedBeforeNextPicker"] = True
+            if latest.get("action") == "focus":
+                focused_info = latest.get("info")
+                focused_instance = (
+                    focused_info.get("instanceId") if isinstance(focused_info, dict) else None
+                )
+                focused_record = next(
+                    (
+                        item
+                        for item in registry.records(target_id)
+                        if item.instance_id == focused_instance
+                    ),
+                    None,
+                )
+                if focused_record is None:
+                    raise ProofError("focused window is missing from the private registry")
+                window = desktop.match(
+                    desktop.windows(),
+                    focused_record.marker,
+                    focused_record.process("terminal"),
+                )
+                if window is None or not window.focused:
+                    raise ProofError("Open did not focus the exact selected Kitty window")
+                terminal = focused_record.process("terminal")
+                if terminal is None:
+                    raise ProofError("focused window has no terminal process identity")
+                focus_verifications = receipt["focusVerifications"]
+                assert isinstance(focus_verifications, list)
+                focus_verifications.append(
+                    {
+                        "instanceId": focused_record.instance_id,
+                        "windowId": window.window_id,
+                        "terminalIdentity": terminal.wire(),
+                        "verified": True,
+                    }
+                )
+            selections = receipt["selections"]
+            assert isinstance(selections, list)
+            selections.extend(successful)
+            if len(selections) > 3:
+                raise ProofError("picker accepted more selections than the proof contract")
+            _receipt(output_path, receipt)
+
+        target_id = _read_target_id(output_path)
+        events = _read_events(output_path / "callback-events.jsonl")
+        selection_events = [
+            event for event in events if event.get("retv") == 1 and event.get("info") is not None
+        ]
+        successful = [event for event in selection_events if event.get("success") is True]
+        helper_events = _read_events(output_path / "host-helper-events.jsonl")
+        stale = next(
+            (
+                event
+                for event in reversed(selection_events)
+                if event.get("success") is False
+                and isinstance(event.get("info"), dict)
+                and event["info"].get("kind") == "instance"
+            ),
+            None,
+        )
+        action_sequence = [event.get("action") for event in successful]
+        receipt["selections"] = selection_events
+        checks = receipt["checks"]
+        assert isinstance(checks, dict)
+        checks["oneTargetOpen"] = len(successful) >= 1 and action_sequence[0] == "open"
+        checks["secondWindowExplicitAdditional"] = (
+            len(successful) >= 2 and action_sequence[1] == "additional"
+        )
+        first_info = successful[0].get("instances", [{}])[0] if successful else {}
+        focused_info = successful[2].get("info") if len(successful) >= 3 else None
+        focus_verifications = receipt.get("focusVerifications", [])
+        focus_verification = (
+            next(
+                (
+                    item
+                    for item in reversed(focus_verifications)
+                    if isinstance(item, dict)
+                    and item.get("verified") is True
+                    and item.get("instanceId") == focused_info.get("instanceId")
+                ),
+                None,
+            )
+            if isinstance(focus_verifications, list) and isinstance(focused_info, dict)
+            else None
+        )
+        focus_snapshot = (
+            next(
+                (
+                    item
+                    for item in successful[2].get("instances", [])
+                    if isinstance(item, dict)
+                    and focus_verification is not None
+                    and item.get("instanceId") == focus_verification.get("instanceId")
+                ),
+                None,
+            )
+            if len(successful) >= 3
+            else None
+        )
+        focus_process_snapshot = (
+            focus_snapshot.get("processes", {}).get("terminal")
+            if isinstance(focus_snapshot, dict)
+            and isinstance(focus_snapshot.get("processes"), dict)
+            else None
+        )
+        checks["exactFirstWindowFocus"] = bool(
+            len(successful) >= 3
+            and action_sequence[2] == "focus"
+            and isinstance(first_info, dict)
+            and isinstance(focused_info, dict)
+            and focused_info.get("instanceId") == first_info.get("instanceId")
+            # The callback snapshot is captured while Rofi still owns its
+            # modal keyboard grab. Focus is asserted independently after the
+            # picker exits, against the same window/process identity below.
+            and isinstance(focus_verification, dict)
+            and focus_verification.get("windowId")
+            == (focus_snapshot.get("windowId") if isinstance(focus_snapshot, dict) else None)
+            and isinstance(focus_snapshot, dict)
+            and focus_verification.get("terminalIdentity") == focus_process_snapshot
+        )
+        checks["staleSelectedWindowDidNotDispatch"] = (
+            stale is not None
+            and stale.get("requestExists") is False
+            and len(stale.get("instances", [])) == 1
+        )
+        confirmations = _read_events(output_path / "confirmation-events.jsonl")
+        receipt["confirmations"] = confirmations
+        latest_picker = receipt["pickerLaunches"][-1] if receipt["pickerLaunches"] else None
+        stale_confirmation = next(
+            (
+                item
+                for item in confirmations
+                if item.get("kind") == "stale-open-confirmed"
+                and item.get("pickerWasLive") is True
+                and item.get("requestExists") is False
+                and item.get("survivorCount") == 1
+                and isinstance(stale, dict)
+                and isinstance(latest_picker, dict)
+                and item.get("targetId") == target_id
+                and item.get("staleInstanceId") == stale.get("info", {}).get("instanceId")
+                and item.get("staleRequestId") == stale.get("requestId")
+                and item.get("pickerIdentity") == latest_picker.get("identity")
+                and item.get("pickerLaunchOrdinal") == latest_picker.get("launchOrdinal")
+            ),
+            None,
+        )
+        checks["staleSelectionKeptPickerOpenUntilEscape"] = stale is not None and bool(
+            stale_confirmation
+        )
+        checks["controlledMeshOnly"] = receipt.get("mesh") == "controlled"
+        checks["candidateHostHelperUsed"] = bool(helper_events) and all(
+            item.get("executable") == str(host_helper.resolve()) for item in helper_events
+        )
+        receipt["candidateHostHelperCalls"] = len(helper_events)
+        checks["staleSelectionKeptPickerOpenUntilEscape"] = checks[
+            "staleSelectionKeptPickerOpenUntilEscape"
+        ] and receipt.get("staleDialogExitCode") in {0, 1}
+        receipt["callbackEvents"] = len(events)
+        receipt["targetId"] = target_id
+        if not all(
+            checks.get(name) is True
+            for name in (
+                "controlledMeshResolvedToCurrentLocalUser",
+                "ownedCodexTargetPublishedByCandidate",
+                "candidatePackageImported",
+                "candidateHostHelperPinned",
+                "candidateHostHelperUsed",
+                "oneTargetOpen",
+                "secondWindowExplicitAdditional",
+                "firstWindowLiveMappedBeforeReopen",
+                "twoWindowsLiveMappedBeforeNextPicker",
+                "exactFirstWindowFocus",
+                "staleSelectedWindowDidNotDispatch",
+                "staleSelectionKeptPickerOpenUntilEscape",
+                "controlledMeshOnly",
+            )
+        ):
+            raise ProofError("interactive picker sequence did not satisfy every action check")
+        receipt["outcome"] = "pass"
+    except BaseException as error:
+        failure = type(error).__name__ + ": " + str(error)[:512]
+        receipt["outcome"] = "fail"
+        receipt["error"] = failure
+    finally:
+        for process in tracked_processes:
+            if process.poll() is None:
+                try:
+                    launcher._stop_rofi(process)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        pickers_closed = all(process.poll() is not None for process in tracked_processes)
+        launcher._agent_executable = original_agent_executable
+        launcher.run_rofi = original_run_rofi
+        launcher.subprocess = original_subprocess
+        os.environ.clear()
+        os.environ.update(previous_env)
+        try:
+            target_id = _read_target_id(output_path)
+            events = _read_events(output_path / "callback-events.jsonl")
+            known_ids = {
+                item.get("instanceId")
+                for event in events
+                for item in event.get("instances", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("instanceId"), str)
+                and _HEX_32.fullmatch(item["instanceId"])
+            }
+            process_wires = [
+                process
+                for event in events
+                for item in event.get("instances", [])
+                if isinstance(item, dict) and isinstance(item.get("processes"), dict)
+                for process in item["processes"].values()
+                if isinstance(process, dict)
+            ]
+            cleanup = _wait_and_close_owned(
+                output_path,
+                env,
+                registry,
+                target_id,
+                known_ids,
+                process_wires,
+                pickers_closed,
+            )
+            receipt["cleanup"] = cleanup
+            checks = receipt["checks"]
+            assert isinstance(checks, dict)
+            checks.update(
+                {
+                    "ownedWindowsClosed": cleanup["ownedWindowsRemaining"] == 0,
+                    "ownedProcessesClosed": cleanup["ownedProcessesRemaining"] == 0,
+                    "ownedPickersClosed": cleanup["ownedPickersClosed"],
+                    "unrelatedWindowIdsPreserved": cleanup["unrelatedWindowIdsPreserved"],
+                    "priorFocusRestored": cleanup["priorFocusRestored"],
+                    "privateControlSocketsRemoved": cleanup["privateControlSocketsRemoved"],
+                    "privateRegistryRemoved": cleanup["privateRegistryRemoved"],
+                }
+            )
+            if not all(
+                checks[name]
+                for name in (
+                    "ownedWindowsClosed",
+                    "ownedProcessesClosed",
+                    "ownedPickersClosed",
+                    "unrelatedWindowIdsPreserved",
+                    "priorFocusRestored",
+                    "privateControlSocketsRemoved",
+                    "privateRegistryRemoved",
+                )
+            ):
+                receipt["outcome"] = "fail"
+                receipt["error"] = receipt.get("error") or "owned cleanup checks failed"
+        except BaseException as error:
+            receipt["outcome"] = "fail"
+            receipt["error"] = receipt.get("error") or (
+                "cleanup " + type(error).__name__ + ": " + str(error)[:512]
+            )
+        _receipt(output_path, receipt)
+        for signum, handler in previous_signals.items():
+            signal.signal(signum, handler)
+
+    print(json.dumps({"receipt": str(output_path / "receipt.json"), "outcome": receipt["outcome"]}))
+    if receipt["outcome"] != "pass":
+        print(str(receipt.get("error", failure or "proof failed")), file=sys.stderr)
+        return 1
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--native-root", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--callback", action="store_true", help=argparse.SUPPRESS)
+    modes.add_argument(
+        "--close-first", action="store_true", help="close the owned first Kitty window"
+    )
+    modes.add_argument(
+        "--confirm-stale-open",
+        action="store_true",
+        help="confirm a live picker refused a stale window action",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = _build_parser()
+    args, _unknown = parser.parse_known_args()
+    try:
+        if args.callback:
+            return _callback(args)
+        if args.close_first:
+            return _close_first(args)
+        if args.confirm_stale_open:
+            return _confirm_stale_open(args)
+        return _run(args)
+    except (ProofError, ConfigError, DesktopError, OSError, RegistryError, TransportError) as error:
+        print(f"direct-picker-proof: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

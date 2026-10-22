@@ -1,1562 +1,668 @@
-"""Stale-while-revalidate cache for discovered agent sessions."""
+"""Private direct-v1 host catalog cache with partial, per-host publication."""
 
 from __future__ import annotations
 
 import fcntl
 import json
 import os
-import re
-import secrets
 import stat
-import subprocess
 import tempfile
 import time
-import unicodedata
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from . import engine
-from .config import PickerConfig
-from .observer_contract import retain_row, session_sort_key
+from .config import SUPPORTED_PROVIDERS
+from .model import Inventory, RecordError, Target, UserScope, parse_target
+from .transport import FleetSnapshot, HostResult, Transport
 
 if TYPE_CHECKING:
-    from .viewer_state import ViewerStateStore
+    from collections.abc import Callable
 
-# v7 cuts over to store-scoped Observer v2 references and phase/activity
-# semantics. Older private snapshots are invalidated as a whole.
-CACHE_VERSION = 7
-DEFAULT_CACHE_DIR = Path("rofi-agent-plus")
-SNAPSHOT_NAME = "snapshot.json"
-LOCK_NAME = "refresh.lock"
-BACKGROUND_MARKER_NAME = "refresh.background"
-LOCK_WAIT_SECONDS = 30.0
-_PROVIDER_FOR_STAGE = {"threads": "codex", "claude": "claude"}
-_OBSERVATION_STAGES = ("codex", "claude", "activity", "tmux")
-_OBSERVATION_STAGE_FOR_ERROR = {
-    "threads": "codex",
-    "claude": "claude",
-    "active": "activity",
-    "tmux": "tmux",
-}
-_OBSERVATION_OUTCOMES = {"ok", "failed", "unknown"}
-_SOURCE_OBSERVATIONS = {"current", "retained", "activity-only"}
-_ROFI_CALLBACK_ENVIRONMENT = (
-    "ROFI_DATA",
-    "ROFI_INFO",
-    "ROFI_INPUT",
-    "ROFI_OUTSIDE",
-    "ROFI_RETV",
-)
-_BACKGROUND_OWNER_ENV = "ROFI_AGENT_PLUS_REFRESH_OWNER"
-_HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
+SCHEMA_VERSION = 1
+MAX_CACHE_BYTES = 8 << 20
+MAX_HOSTS = 256
+MAX_PROVIDER_ERRORS = 256
+MAX_CACHE_AGE_SECONDS = 30
 
 
-@dataclass(frozen=True)
-class PresentationContext:
-    """One capability/revision observation reused by a Rofi callback."""
-
-    fingerprint: str
-    backend: dict[str, object]
-    error: str | None = None
-    selected: object | None = None
+class CacheError(RuntimeError):
+    """A malformed or inaccessible direct catalog cache."""
 
 
-def _valid_host_catalog(value: object) -> bool:
-    """Validate the private ordered Host Mesh catalog in a cache snapshot."""
-
-    if not isinstance(value, list):
-        return False
-    seen: set[str] = set()
-    local_count = 0
-    for item in value:
-        if not isinstance(item, Mapping):
-            return False
-        host_id = item.get("hostId")
-        display = item.get("display")
-        if (
-            not isinstance(host_id, str)
-            or not host_id
-            or len(host_id) > 256
-            or not _HOST_ID.fullmatch(host_id)
-            or host_id.casefold() in seen
-            or not isinstance(display, str)
-            or not display
-            or len(display) > 16 * 1024
-            or any(unicodedata.category(char).startswith("C") for char in display)
-            or not isinstance(item.get("local"), bool)
-        ):
-            return False
-        if item["local"]:
-            local_count += 1
-        seen.add(host_id.casefold())
-    # A non-empty Host Mesh always has exactly one local host and the Mesh
-    # contract requires it to be first.  Empty catalogs are reserved for the
-    # contract-error/no-authority snapshot.
-    return not value or (local_count == 1 and value[0].get("local") is True)
-
-
-def _host_catalog(value: object) -> list[dict[str, object]] | None:
-    """Copy a valid internal catalog while preserving Host Mesh order."""
-
-    if not _valid_host_catalog(value):
-        return None
-    assert isinstance(value, list)
-    return [
-        {
-            "hostId": str(item["hostId"]).casefold(),
-            "display": item["display"],
-            "local": item["local"],
-        }
-        for item in value
-        if isinstance(item, Mapping)
-    ]
-
-
-def cache_root() -> Path:
-    value = os.environ.get("XDG_CACHE_HOME")
-    root = Path(value) if value else Path.home() / ".cache"
-    return root / DEFAULT_CACHE_DIR
-
-
-def _safe_mode(path: Path, mode: int) -> None:
-    try:
-        current = stat.S_IMODE(path.stat().st_mode)
-    except OSError:
-        return
-    if current != mode:
-        try:
-            path.chmod(mode)
-        except OSError:
-            pass
-
-
-def _atomic_write_private(path: Path, content: str, prefix: str) -> None:
-    """Persist one private cache record with the same durability guarantees."""
-
-    descriptor, temporary = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=path.parent)
-    temporary_path = Path(temporary)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(content)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
-        _safe_mode(path, 0o600)
-    finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _as_session_key(session: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
-    return (
-        str(session.get("hostId") or session.get("windowHost") or session.get("host") or "local"),
-        str(session.get("kind") or ""),
-        str(session.get("id") or ""),
-        str(session.get("namespace") or ""),
-        str(session.get("nativeIdKind") or ""),
-    )
-
-
-def _provider_for_session(session: Mapping[str, Any]) -> str:
-    kind = str(session.get("kind") or "")
-    return kind if kind in {"codex", "claude"} else ""
-
-
-def _valid_provider_session(value: object) -> bool:
-    """Accept only a current Codex or Claude identity in private cache rows."""
-
-    if not isinstance(value, Mapping):
-        return False
-    kind = value.get("kind")
-    if not isinstance(kind, str) or kind not in {"codex", "claude"}:
-        return False
-    from .session_identity import logical_identity
-
-    return logical_identity(value) is not None
-
-
-def _filtered_host_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep only current provider rows when directly reusing prior cache data."""
-
-    host = dict(value)
-    rows = value.get("sessions")
-    host["sessions"] = (
-        [dict(row) for row in rows if _valid_provider_session(row)]
-        if isinstance(rows, list)
-        else []
-    )
-    return host
-
-
-def _timestamp(value: object, default: int = 0) -> int:
-    """Return a non-negative integer timestamp without accepting booleans."""
-
-    if isinstance(value, bool):
-        return default
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def _stage_observation(value: object) -> dict[str, object]:
-    """Copy one private stage observation, treating malformed history as unknown."""
-
-    if not isinstance(value, Mapping):
-        return {"lastAttemptAt": 0, "lastSuccessAt": 0, "outcome": "unknown"}
-    outcome = value.get("outcome")
-    if outcome not in _OBSERVATION_OUTCOMES:
-        outcome = "unknown"
-    return {
-        "lastAttemptAt": _timestamp(value.get("lastAttemptAt")),
-        "lastSuccessAt": _timestamp(value.get("lastSuccessAt")),
-        "outcome": outcome,
-    }
-
-
-def _host_observations(value: object) -> dict[str, dict[str, object]]:
-    """Copy every canonical stage while leaving absent legacy history unknown."""
-
-    raw = value if isinstance(value, Mapping) else {}
-    return {stage: _stage_observation(raw.get(stage)) for stage in _OBSERVATION_STAGES}
-
-
-def _error_stages(errors: object) -> set[str]:
-    """Return canonical stages whose host-wide observations failed."""
-
-    if not isinstance(errors, list):
-        return set()
-    return {
-        canonical
-        for error in errors
-        if isinstance(error, Mapping)
-        and isinstance(error.get("stage"), str)
-        and (canonical := _OBSERVATION_STAGE_FOR_ERROR.get(error["stage"])) is not None
-    }
-
-
-def _observation_outcome(errors: object) -> str:
-    """Classify a completed all-host transaction without counting diagnostics."""
-
-    if isinstance(errors, list) and any(
-        isinstance(error, Mapping) and error.get("stage") in {"contract", "refresh"}
-        for error in errors
-    ):
-        # These errors mean no complete authority-scoped transaction reached
-        # the cache. A retained generatedAt belongs to an older success and
-        # must not make this failed refresh look complete.
-        return "failed"
-    if _error_stages(errors):
-        return "partial"
-    if isinstance(errors, list) and any(
-        isinstance(error, Mapping) and error.get("stage") == "tmux-correlation" for error in errors
-    ):
-        # Correlation uncertainty is row-specific, but the all-host attempt is
-        # still not fully evidenced.  It must not downgrade the host-wide
-        # ``tmux`` observation itself.
-        return "partial"
-    return "complete"
-
-
-def _observations_for_attempt(
-    previous: Mapping[str, Any] | None,
-    errors: object,
-    observed_at: int,
-) -> dict[str, dict[str, object]]:
-    """Record one completed host attempt while retaining prior success times."""
-
-    prior = _host_observations(previous.get("observations") if previous else None)
-    failed = _error_stages(errors)
-    observations: dict[str, dict[str, object]] = {}
-    for stage in _OBSERVATION_STAGES:
-        if stage in failed:
-            observations[stage] = {
-                "lastAttemptAt": observed_at,
-                "lastSuccessAt": prior[stage]["lastSuccessAt"],
-                "outcome": "failed",
-            }
-        else:
-            # ``tmux-missing`` is a reached authoritative result, and
-            # ``tmux-correlation`` is a row-specific uncertainty.  Neither
-            # makes the host-wide inventory stage unavailable.
-            observations[stage] = {
-                "lastAttemptAt": observed_at,
-                "lastSuccessAt": observed_at,
-                "outcome": "ok",
-            }
-    return observations
-
-
-def _source_from_current_event(value: object) -> str:
-    """Accept only the backend's synthetic-row marker from current events."""
-
-    # ``retained`` is cache-owned history, never an event-stream claim.  This
-    # prevents a backend or malformed test event from blessing old provider
-    # data as retained without the merge preserving its observation history.
-    return "activity-only" if value == "activity-only" else "current"
-
-
-def _merge_host_snapshot(
-    previous: Mapping[str, Any] | None,
-    current: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Merge failed provider stages into the prior host snapshot.
-
-    A successful provider result replaces its old rows.  Rows belonging to a
-    provider that failed remain available until a later successful refresh.
-    An activity failure preserves the last known activity fields while using
-    current metadata for the row.
-    """
-
-    current_sessions = []
-    for item in current.get("sessions", []):
-        if not isinstance(item, dict):
-            continue
-        row = dict(item)
-        if not _valid_provider_session(row):
-            continue
-        if (
-            isinstance(row.get("observerSource"), Mapping)
-            and row.get("sourceObservation") == "retained"
-        ):
-            retain_row(row)
-        else:
-            row["sourceObservation"] = _source_from_current_event(row.get("sourceObservation"))
-        current_sessions.append(row)
-    current_errors = [dict(item) for item in current.get("errors", []) if isinstance(item, dict)]
-    failed_stages = {str(error.get("stage")) for error in current_errors if error.get("stage")}
-    incomplete = current.get("incompleteProviders", ())
-    incomplete = set(incomplete) if isinstance(incomplete, (list, tuple)) else set()
-    current_by_key = {_as_session_key(item): item for item in current_sessions}
-    tmux_failed = "tmux" in failed_stages
-
-    def retain_tmux(
-        old: Mapping[str, Any],
-        fresh: dict[str, Any],
-        *,
-        current_had_tmux: bool,
-    ) -> None:
-        """Keep old tmux evidence only when the current tmux stage failed.
-
-        An authoritative ``ok``/empty or ``tmux_missing`` result has already
-        disproved a fresh old association.  A failed/unreachable/error stage
-        may retain it, but only with an explicit stale marker.
-        """
-
-        if tmux_failed:
-            if isinstance(old.get("tmux"), dict) and "tmux" not in fresh:
-                fresh["tmux"] = dict(old["tmux"])
-                fresh["tmuxSession"] = old.get("tmuxSession")
-            if "tmux" in fresh:
-                if fresh.get("providerOptionVerified") is not True:
-                    fresh.pop("providerOptionVerified", None)
-                fresh["tmuxStale"] = True
-            else:
-                fresh.pop("providerOptionVerified", None)
-            return
-        if not current_had_tmux:
-            fresh.pop("tmux", None)
-            fresh.pop("tmuxSession", None)
-            fresh.pop("tmuxStale", None)
-            fresh.pop("providerOptionVerified", None)
-        elif fresh.get("providerOptionVerified") is not True:
-            # The marker is inseparable from an option-backed association.
-            # In particular, a provider-stage retention merge can overlay a
-            # fresh process-only association on an older option-backed row.
-            fresh.pop("providerOptionVerified", None)
-
-    if previous and isinstance(previous.get("sessions"), list):
-        for old in previous["sessions"]:
-            if not isinstance(old, dict):
-                continue
-            key = _as_session_key(old)
-            provider = _provider_for_session(old)
-            # A synthetic activity-only row has no provider-native metadata to
-            # retain.  Keeping it through a later provider failure would make
-            # an old process probe look like a current session listing.
-            preserve = old.get("sourceObservation") != "activity-only" and (
-                provider in incomplete
-                or any(_PROVIDER_FOR_STAGE.get(stage) == provider for stage in failed_stages)
-            )
-            fresh = current_by_key.get(key)
-            current_had_tmux = fresh is not None and "tmux" in fresh
-            if preserve and fresh is not None and isinstance(fresh.get("observerSource"), Mapping):
-                # Public rows already reconcile their independent evidence.
-                # A partial/history failure must not overlay old provider facts
-                # onto a healthy current row from the same collection.
-                pass
-            elif preserve and fresh is not None:
-                # The provider's list/details stage failed, but activity is a
-                # fresh independent observation.  Start from old provider
-                # metadata and overlay only current identity/activity and
-                # current tmux evidence; do not replace a useful name/cwd
-                # with an active-probe placeholder.
-                retained = dict(old)
-                for field in (
-                    "kind",
-                    "id",
-                    "host",
-                    "hostId",
-                    "windowHost",
-                    "connectHost",
-                    "route",
-                    "contractMode",
-                    "backend",
-                    "active",
-                    "activityState",
-                ):
-                    if field in fresh:
-                        retained[field] = fresh[field]
-                if "tmux" in fresh:
-                    retained["tmux"] = fresh["tmux"]
-                    retained["tmuxSession"] = fresh.get("tmuxSession")
-                    if fresh.get("providerOptionVerified") is True:
-                        retained["providerOptionVerified"] = True
-                    else:
-                        retained.pop("providerOptionVerified", None)
-                fresh.clear()
-                fresh.update(retained)
-                fresh["sourceObservation"] = "retained"
-            elif preserve and fresh is None:
-                fresh = dict(old)
-                fresh["sourceObservation"] = "retained"
-                if isinstance(fresh.get("observerSource"), Mapping):
-                    retain_row(fresh)
-                current_sessions.append(fresh)
-                current_by_key[key] = fresh
-            if "active" in failed_stages and key in current_by_key:
-                fresh = current_by_key[key]
-                # Activity is independent process evidence.  It may retain
-                # only its own state; an old tmux display name without the
-                # matching current nested reference would be false authority.
-                activity_fields = ("active", "activityState")
-                # Contract rows own tmux authority separately. Older cache
-                # records may still carry this display-only field, so do not
-                # reinterpret it as a current contract reference.
-                if old.get("contractMode") is not True and fresh.get("contractMode") is not True:
-                    activity_fields += ("tmuxSession",)
-                for field in activity_fields:
-                    if field in old:
-                        fresh[field] = old[field]
-            if key in current_by_key and (
-                old.get("contractMode") is True or current_by_key[key].get("contractMode") is True
-            ):
-                retain_tmux(old, current_by_key[key], current_had_tmux=current_had_tmux)
-
-    current_sessions.sort(key=session_sort_key)
-    result = {
-        "generatedAt": int(current.get("generatedAt") or time.time()),
-        "sessions": current_sessions,
-        "errors": current_errors,
-        "observations": _observations_for_attempt(
-            previous,
-            current_errors,
-            _timestamp(current.get("generatedAt"), int(time.time())),
-        ),
-    }
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("catalog contains a duplicate JSON field")
+        result[key] = value
     return result
 
 
-def _backend_identity(value: object) -> dict[str, object] | None:
-    if not isinstance(value, Mapping):
+def _timestamp(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
+        raise CacheError("catalog timestamp is invalid")
+    return value
+
+
+def _bounded_string(value: object, maximum: int, *, optional: bool = False) -> str | None:
+    if optional and value is None:
         return None
-    kind = value.get("kind")
-    capability = value.get("capability")
-    revision = value.get("meshRevision")
-    expected_capability = {
-        "contract": "host-mesh-v1+tmux-session-v1",
-        "contract-error": "host-mesh-v1+tmux-session-v1",
-    }.get(kind)
-    if expected_capability is None or capability != expected_capability:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise CacheError("catalog text field is invalid")
+    return value
+
+
+def _host_id(value: object) -> str:
+    result = _bounded_string(value, 256)
+    assert result is not None
+    if (
+        result.casefold() != result
+        or not result[0].isalnum()
+        or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_.-" for char in result)
+    ):
+        raise CacheError("catalog host identity is invalid")
+    return result
+
+
+def _diagnostic(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) - {"code", "stage", "message", "provider", "home"}:
+        raise CacheError("catalog diagnostic is invalid")
+    required = {"code", "stage", "message"}
+    if not required <= set(value):
+        raise CacheError("catalog diagnostic is incomplete")
+    result: dict[str, str] = {}
+    for key, maximum in (("code", 64), ("stage", 64), ("message", 4096)):
+        item = _bounded_string(value[key], maximum)
+        assert item is not None
+        result[key] = item
+    for key, maximum in (("provider", 16), ("home", 4096)):
+        if key in value:
+            item = _bounded_string(value[key], maximum)
+            assert item is not None
+            result[key] = item
+    if "provider" in result and result["provider"] not in SUPPORTED_PROVIDERS:
+        raise CacheError("catalog diagnostic provider is invalid")
+    return result
+
+
+def _bounded_hosts(hosts: list[HostCatalog]) -> list[HostCatalog]:
+    current = [item for item in hosts if item.status != "removed"]
+    removed = sorted(
+        (item for item in hosts if item.status == "removed"),
+        key=lambda item: (item.observed_at, item.host_id),
+        reverse=True,
+    )
+    if len(current) > MAX_HOSTS:
+        raise CacheError("current catalog host count exceeds its limit")
+    keep_removed = removed[: max(0, MAX_HOSTS - len(current))]
+    kept = current + keep_removed
+    positions = {item.host_id: index for index, item in enumerate(hosts)}
+    return sorted(kept, key=lambda item: positions.get(item.host_id, len(positions)))
+
+
+def _user_json(value: UserScope | None) -> dict[str, object] | None:
+    return value.to_json() if value is not None else None
+
+
+def _parse_user(value: object) -> UserScope | None:
+    if value is None:
         return None
+    if not isinstance(value, dict) or set(value) != {"uid", "account"}:
+        raise CacheError("catalog user scope is invalid")
+    uid, account = value.get("uid"), value.get("account")
+    if type(uid) is not int or not 0 <= uid <= 2**32 - 1:
+        raise CacheError("catalog user scope is invalid")
+    account = _bounded_string(account, 256)
+    assert account is not None
+    return UserScope(uid, account)
+
+
+@dataclass(frozen=True)
+class ProviderCatalog:
+    provider: str
+    status: str
+    observed_at: int
+    last_complete_at: int | None
+    reason: str | None
+    targets: tuple[Target, ...]
+    errors: tuple[dict[str, str], ...] = ()
+
+    def freshness(self, now_ms: int, ttl_seconds: int = MAX_CACHE_AGE_SECONDS) -> str:
+        if self.status in {"missing", "unsupported"}:
+            reference = self.observed_at
+        else:
+            reference = self.last_complete_at
+        if reference is None:
+            return "unknown"
+        return "fresh" if max(0, now_ms - reference) <= ttl_seconds * 1000 else "stale"
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "status": self.status,
+            "observedAt": self.observed_at,
+            "lastCompleteAt": self.last_complete_at,
+            "reason": self.reason,
+            "targets": [target.to_json() for target in self.targets],
+            "errors": list(self.errors),
+        }
+
+
+@dataclass(frozen=True)
+class HostCatalog:
+    host_id: str
+    display: str
+    local: bool
+    status: str
+    observed_at: int
+    route: str | None
+    user: UserScope | None
+    providers: tuple[ProviderCatalog, ...]
+    errors: tuple[dict[str, str], ...] = ()
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "hostId": self.host_id,
+            "display": self.display,
+            "local": self.local,
+            "status": self.status,
+            "observedAt": self.observed_at,
+            "route": self.route,
+            "user": _user_json(self.user),
+            "providers": [provider.to_json() for provider in self.providers],
+            "errors": list(self.errors),
+        }
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    observed_at: int
+    mesh_revision: str | None
+    hosts: tuple[HostCatalog, ...]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "observedAt": self.observed_at,
+            "meshRevision": self.mesh_revision,
+            "hosts": [host.to_json() for host in self.hosts],
+        }
+
+    def is_stale(
+        self, ttl_seconds: int = MAX_CACHE_AGE_SECONDS, *, now_ms: int | None = None
+    ) -> bool:
+        current = _now_ms() if now_ms is None else now_ms
+        active_hosts = [host for host in self.hosts if host.status != "removed"]
+        if not active_hosts:
+            return True
+        for host in active_hosts:
+            if host.status in {"error", "partial"}:
+                return True
+            for provider in host.providers:
+                if provider.status in {"unknown", "partial"}:
+                    return True
+                if provider.freshness(current, ttl_seconds) != "fresh":
+                    return True
+        return False
+
+
+def parse_snapshot(value: object) -> CatalogSnapshot:
+    if not isinstance(value, dict) or set(value) != {
+        "schemaVersion",
+        "observedAt",
+        "meshRevision",
+        "hosts",
+    }:
+        raise CacheError("catalog schema is invalid")
+    if type(value["schemaVersion"]) is not int or value["schemaVersion"] != SCHEMA_VERSION:
+        raise CacheError("catalog version is unsupported")
+    observed = _timestamp(value["observedAt"])
+    revision = value["meshRevision"]
     if revision is not None and (
         not isinstance(revision, str)
-        or not revision
-        or revision.strip() != revision
-        or any(char.isspace() or ord(char) < 32 for char in revision)
+        or len(revision) != 71
+        or not revision.startswith("sha256:")
+        or any(char not in "0123456789abcdef" for char in revision[7:])
     ):
-        return None
-    if kind == "contract-error" and revision is not None:
-        return None
-    return {"kind": kind, "capability": capability, "meshRevision": revision}
-
-
-def _last_refresh(
-    attempted_at: int,
-    *,
-    completed_at: int | None,
-    outcome: str,
-) -> dict[str, object]:
-    return {
-        "attemptedAt": attempted_at,
-        "completedAt": completed_at,
-        "outcome": outcome,
-    }
-
-
-def _valid_stage_observation(value: object) -> bool:
-    if not isinstance(value, Mapping) or value.get("outcome") not in _OBSERVATION_OUTCOMES:
-        return False
-    return all(
-        isinstance(value.get(key), int) and not isinstance(value.get(key), bool) and value[key] >= 0
-        for key in ("lastAttemptAt", "lastSuccessAt")
-    )
-
-
-def _valid_observations(value: object) -> bool:
-    return (
-        isinstance(value, Mapping)
-        and set(value) == set(_OBSERVATION_STAGES)
-        and all(_valid_stage_observation(value.get(stage)) for stage in _OBSERVATION_STAGES)
-    )
-
-
-def _valid_last_refresh(value: object) -> bool:
-    if not isinstance(value, Mapping) or value.get("outcome") not in {
-        "complete",
-        "partial",
-        "failed",
-    }:
-        return False
-    attempted = value.get("attemptedAt")
-    completed = value.get("completedAt")
-    if not isinstance(attempted, int) or isinstance(attempted, bool) or attempted < 0:
-        return False
-    if value["outcome"] == "failed":
-        # Failed attempts have no successful transaction completion.  This
-        # also keeps the empty, no-authority snapshot (0/None/failed) valid.
-        return completed is None
-    return isinstance(completed, int) and not isinstance(completed, bool) and completed >= attempted
-
-
-def _prior_last_refresh(previous: Mapping[str, Any] | None) -> dict[str, object]:
-    """Read current metadata or safely synthesize it for direct callers."""
-
-    if previous is not None and _valid_last_refresh(previous.get("lastRefresh")):
-        value = previous["lastRefresh"]
-        assert isinstance(value, Mapping)
-        return dict(value)
-    generated_at = _timestamp(previous.get("generatedAt") if previous else None)
-    backend = _backend_identity(previous.get("backend")) if previous else None
-    if generated_at and backend is not None and backend["kind"] == "contract":
-        outcome = _observation_outcome(previous.get("errors") if previous else None)
-        if outcome != "failed":
-            return _last_refresh(generated_at, completed_at=generated_at, outcome=outcome)
-    return _last_refresh(0, completed_at=None, outcome="failed")
-
-
-def _failed_contract_snapshot(
-    config: PickerConfig,
-    previous: Mapping[str, Any] | None,
-    backend: Mapping[str, object],
-    errors: list[dict[str, str]],
-    *,
-    attempted_at: int | None = None,
-    retain_unselected_hosts: bool = False,
-) -> dict[str, Any]:
-    """Retain only compatible cache data without advancing freshness."""
-
-    prior = (
-        previous
-        if previous is not None and _backend_identity(previous.get("backend")) == dict(backend)
-        else None
-    )
-    prior_hosts = prior.get("hosts") if isinstance(prior, Mapping) else None
-    hosts = (
-        {
-            key: _filtered_host_snapshot(value)
-            for key, value in prior_hosts.items()
-            if isinstance(key, str) and isinstance(value, Mapping)
-        }
-        if isinstance(prior_hosts, Mapping)
-        else {}
-    )
-    catalog = _host_catalog(prior.get("hostCatalog")) if isinstance(prior, Mapping) else None
-    if not retain_unselected_hosts:
-        for host in hosts.values():
-            for row in host.get("sessions", []):
-                if isinstance(row.get("observerSource"), Mapping):
-                    retain_row(row)
-    prior_refresh = _prior_last_refresh(prior)
-    if retain_unselected_hosts:
-        # A lifecycle revalidation is deliberately narrower than the picker
-        # transaction.  Its failure must not claim an all-host attempt.
-        last_refresh = prior_refresh
-    else:
-        last_refresh = _last_refresh(
-            _timestamp(attempted_at, int(time.time())),
-            completed_at=None,
-            outcome="failed",
-        )
-    snapshot = {
-        "version": CACHE_VERSION,
-        "fingerprint": config.fingerprint,
-        # Never bless a partial/stale contract result as freshly generated.
-        "generatedAt": int(prior.get("generatedAt", 0)) if isinstance(prior, Mapping) else 0,
-        "backend": dict(backend),
-        "hostCatalog": catalog or [],
-        "hosts": hosts,
-        "sessions": _flatten_hosts(hosts, config.max_sessions),
-        "errors": _flatten_errors(hosts) + errors,
-        "lastRefresh": last_refresh,
-    }
-    return snapshot
-
-
-def _flatten_hosts(hosts: Mapping[str, Mapping[str, Any]], limit: int) -> list[dict[str, Any]]:
-    sessions: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str, str]] = set()
-    for host in hosts.values():
-        for item in host.get("sessions", []):
-            if not isinstance(item, dict):
-                continue
-            key = _as_session_key(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            sessions.append(dict(item))
-    sessions.sort(key=session_sort_key)
-    return sessions[:limit]
-
-
-def _flatten_errors(hosts: Mapping[str, Mapping[str, Any]]) -> list[dict[str, str]]:
-    errors: list[dict[str, str]] = []
-    for key, host in hosts.items():
-        for error in host.get("errors", []):
-            if not isinstance(error, dict):
-                continue
-            errors.append(
-                {
-                    "host": str(error.get("host") or key),
-                    "stage": str(error.get("stage") or "refresh"),
-                    "message": str(error.get("message") or "unknown error"),
-                }
-            )
-    return errors
-
-
-def _scoped_generated_at(
-    previous: Mapping[str, Any] | None,
-    backend: Mapping[str, object],
-) -> int:
-    """Keep a partial lifecycle check from refreshing peer-host TTLs."""
-
-    if previous is None or _backend_identity(previous.get("backend")) != dict(backend):
-        return 0
-    value = previous.get("generatedAt")
-    if isinstance(value, bool):
-        return 0
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-
-
-def _require_complete_contract_transaction(snapshot: Mapping[str, Any]) -> None:
-    """Reject an aborted transaction before a lifecycle action uses old rows.
-
-    Provider and inventory failures are classified per host and remain useful
-    to ``ContractLifecycle._provider_row``. In contrast, refresh/contract
-    failures mean the selected host was never authoritatively revalidated, so
-    retaining its old row must not permit an open or create action.
-    """
-
-    backend = _backend_identity(snapshot.get("backend"))
-    if backend is None or backend["kind"] != "contract":
-        raise engine.PickerError("Agent Plus lifecycle revalidation has no current contract")
-    errors = snapshot.get("errors")
-    if not isinstance(errors, list):
-        raise engine.PickerError("Agent Plus lifecycle revalidation returned invalid errors")
-    for error in errors:
-        if not isinstance(error, Mapping):
-            raise engine.PickerError("Agent Plus lifecycle revalidation returned invalid errors")
-        stage = error.get("stage")
-        if stage in {"contract", "refresh"}:
-            message = str(error.get("message") or "transaction did not complete")
-            raise engine.PickerError(f"Agent Plus lifecycle revalidation failed: {message}")
-
-
-def build_snapshot(
-    config: PickerConfig,
-    events: Iterator[dict[str, Any]],
-    previous: Mapping[str, Any] | None = None,
-    now: int | None = None,
-    *,
-    retain_unselected_hosts: bool = False,
-) -> dict[str, Any]:
-    """Build a versioned snapshot from the engine's per-host event stream."""
-
-    attempted_at = int(now if now is not None else time.time())
-    hosts: dict[str, dict[str, Any]] = {}
-    refresh_errors: list[dict[str, str]] = []
-    backend: dict[str, object] = {
-        "kind": "contract",
-        "capability": "host-mesh-v1+tmux-session-v1",
-        "meshRevision": None,
-    }
-    expected_hosts: set[str] | None = None
-    completed_hosts: set[str] = set()
-    finished = False
-    contract_aborted = False
-    host_catalog: list[dict[str, object]] = []
-
-    def preserve_previous(expected: set[str] | None = None) -> None:
-        if not previous or not isinstance(previous.get("hosts"), dict):
-            return
-        for key, value in previous["hosts"].items():
+        raise CacheError("catalog mesh revision is invalid")
+    raw_hosts = value["hosts"]
+    if not isinstance(raw_hosts, list) or len(raw_hosts) > MAX_HOSTS:
+        raise CacheError("catalog host count is invalid")
+    hosts: list[HostCatalog] = []
+    seen_hosts: set[str] = set()
+    local_count = 0
+    for raw_host in raw_hosts:
+        if not isinstance(raw_host, dict) or set(raw_host) != {
+            "hostId",
+            "display",
+            "local",
+            "status",
+            "observedAt",
+            "route",
+            "user",
+            "providers",
+            "errors",
+        }:
+            raise CacheError("catalog host record is invalid")
+        host_id = _host_id(raw_host["hostId"])
+        if host_id in seen_hosts:
+            raise CacheError("catalog contains duplicate hosts")
+        seen_hosts.add(host_id)
+        display = _bounded_string(raw_host["display"], 16384)
+        assert display is not None
+        local = raw_host["local"]
+        if not isinstance(local, bool):
+            raise CacheError("catalog host locality is invalid")
+        local_count += int(local)
+        status = raw_host["status"]
+        if not isinstance(status, str) or status not in {"complete", "partial", "error", "removed"}:
+            raise CacheError("catalog host status is invalid")
+        route = _bounded_string(raw_host["route"], 4096, optional=True)
+        user = _parse_user(raw_host["user"])
+        raw_providers = raw_host["providers"]
+        if not isinstance(raw_providers, list) or len(raw_providers) > len(SUPPORTED_PROVIDERS):
+            raise CacheError("catalog provider count is invalid")
+        providers: list[ProviderCatalog] = []
+        seen_providers: set[str] = set()
+        for raw_provider in raw_providers:
+            if not isinstance(raw_provider, dict) or set(raw_provider) != {
+                "provider",
+                "status",
+                "observedAt",
+                "lastCompleteAt",
+                "reason",
+                "targets",
+                "errors",
+            }:
+                raise CacheError("catalog provider record is invalid")
+            provider_name = raw_provider["provider"]
             if (
-                isinstance(key, str)
-                and isinstance(value, dict)
-                and (expected is None or key in expected)
+                not isinstance(provider_name, str)
+                or provider_name not in SUPPORTED_PROVIDERS
+                or provider_name in seen_providers
             ):
-                hosts[key] = _filtered_host_snapshot(value)
-
-    try:
-        for event in events:
-            if not isinstance(event, dict):
-                refresh_errors.append(
-                    {"host": "local", "stage": "refresh", "message": "malformed refresh event"}
+                raise CacheError("catalog provider identity is invalid")
+            seen_providers.add(provider_name)
+            provider_status = raw_provider["status"]
+            if not isinstance(provider_status, str) or provider_status not in {
+                "complete",
+                "partial",
+                "missing",
+                "unsupported",
+                "unknown",
+            }:
+                raise CacheError("catalog provider status is invalid")
+            provider_observed = _timestamp(raw_provider["observedAt"])
+            last_complete = raw_provider["lastCompleteAt"]
+            if last_complete is not None:
+                last_complete = _timestamp(last_complete)
+            reason = _bounded_string(raw_provider["reason"], 64, optional=True)
+            raw_targets = raw_provider["targets"]
+            if not isinstance(raw_targets, list) or len(raw_targets) > 128:
+                raise CacheError("catalog target count is invalid")
+            targets: list[Target] = []
+            target_keys: set[str] = set()
+            for raw_target in raw_targets:
+                try:
+                    target = parse_target(raw_target)
+                except RecordError as error:
+                    raise CacheError("catalog target record is invalid") from error
+                key = target.key
+                if key.host_id != host_id or key.provider != provider_name:
+                    raise CacheError("catalog target scope is invalid")
+                if user is not None and (key.uid != user.uid or key.account != user.account):
+                    raise CacheError("catalog target user is invalid")
+                if user is None:
+                    raise CacheError("catalog targets require a known user scope")
+                if key.identity in target_keys:
+                    raise CacheError("catalog has duplicate targets")
+                target_keys.add(key.identity)
+                targets.append(target)
+            raw_errors = raw_provider["errors"]
+            if not isinstance(raw_errors, list) or len(raw_errors) > MAX_PROVIDER_ERRORS:
+                raise CacheError("catalog provider diagnostics are invalid")
+            providers.append(
+                ProviderCatalog(
+                    provider_name,
+                    provider_status,
+                    provider_observed,
+                    last_complete,
+                    reason,
+                    tuple(targets),
+                    tuple(_diagnostic(item) for item in raw_errors),
                 )
-                contract_aborted = backend["kind"] == "contract"
-                continue
-            kind = event.get("event")
-            if kind == "refresh-started":
-                declared = _backend_identity(event.get("backend"))
-                if event.get("backend") is not None and declared is None:
-                    refresh_errors.append(
-                        {"host": "local", "stage": "refresh", "message": "invalid backend identity"}
-                    )
-                    contract_aborted = True
-                    continue
-                backend = declared or backend
-                names = event.get("hosts")
-                if (
-                    not isinstance(names, list)
-                    or any(not isinstance(name, str) or not name for name in names)
-                    or len(set(names)) != len(names)
-                ):
-                    refresh_errors.append(
-                        {"host": "local", "stage": "refresh", "message": "invalid refresh host set"}
-                    )
-                    contract_aborted = backend["kind"] == "contract"
-                    continue
-                expected_hosts = set(names)
-                raw_catalog = event.get("hostCatalog")
-                parsed_catalog = _host_catalog(raw_catalog)
-                catalog_ids = (
-                    {str(item["hostId"]).casefold() for item in parsed_catalog}
-                    if parsed_catalog is not None
-                    else set()
-                )
-                expected_catalog_ids = {name.casefold() for name in expected_hosts}
-                if (
-                    parsed_catalog is None
-                    or not parsed_catalog
-                    or not expected_catalog_ids.issubset(catalog_ids)
-                    or (not retain_unselected_hosts and catalog_ids != expected_catalog_ids)
-                ):
-                    refresh_errors.append(
-                        {
-                            "host": "local",
-                            "stage": "refresh",
-                            "message": "invalid refresh host catalog",
-                        }
-                    )
-                    contract_aborted = backend["kind"] == "contract"
-                elif (
-                    retain_unselected_hosts
-                    and previous is not None
-                    and _backend_identity(previous.get("backend")) == backend
-                ):
-                    # A selected-host lifecycle refresh may update one host,
-                    # but the presentation ring must retain the full catalog
-                    # from the compatible prior authority.
-                    prior_catalog = _host_catalog(previous.get("hostCatalog"))
-                    host_catalog = prior_catalog if prior_catalog is not None else parsed_catalog
-                else:
-                    host_catalog = parsed_catalog
-                # Contract Mesh is authoritative for host membership.  Start
-                # from compatible old rows only for currently declared hosts,
-                # which prunes removed hosts before any cache merge.
-                if backend["kind"] == "contract" and (
-                    previous is not None and _backend_identity(previous.get("backend")) == backend
-                ):
-                    preserve_previous(None if retain_unselected_hosts else expected_hosts)
-            elif kind == "host-complete":
-                key = str(event.get("host") or "local")
-                if expected_hosts is not None and key not in expected_hosts:
-                    refresh_errors.append(
-                        {"host": key, "stage": "refresh", "message": "unexpected refresh host"}
-                    )
-                    contract_aborted = backend["kind"] == "contract"
-                    continue
-                current = {
-                    "generatedAt": int(
-                        event.get("generatedAt") or (now if now is not None else time.time())
-                    ),
-                    "sessions": event.get("sessions", []),
-                    "errors": event.get("errors", []),
-                    "incompleteProviders": event.get("incompleteProviders", []),
-                }
-                hosts[key] = _merge_host_snapshot(hosts.get(key), current)
-                completed_hosts.add(key)
-            elif kind == "refresh-finished":
-                declared = _backend_identity(event.get("backend"))
-                if event.get("backend") is not None and declared != backend:
-                    refresh_errors.append(
-                        {
-                            "host": "local",
-                            "stage": "refresh",
-                            "message": "backend changed during refresh",
-                        }
-                    )
-                    contract_aborted = backend["kind"] == "contract"
-                finished = True
-            else:
-                refresh_errors.append(
-                    {"host": "local", "stage": "refresh", "message": "unknown refresh event"}
-                )
-                contract_aborted = backend["kind"] == "contract"
-    except Exception as exc:  # preserve prior hosts if a refresh aborts unexpectedly
-        refresh_errors.append({"host": "local", "stage": "refresh", "message": str(exc)})
-        contract_aborted = backend["kind"] == "contract"
-
-    if backend["kind"] == "contract" and (
-        contract_aborted
-        or not finished
-        or expected_hosts is None
-        or completed_hosts != expected_hosts
-    ):
-        if expected_hosts is not None and completed_hosts != expected_hosts:
-            refresh_errors.append(
-                {
-                    "host": "local",
-                    "stage": "refresh",
-                    "message": "incomplete contract host coverage",
-                }
             )
-        return _failed_contract_snapshot(
-            config,
-            previous,
-            backend,
-            refresh_errors,
-            attempted_at=attempted_at,
-            retain_unselected_hosts=retain_unselected_hosts,
+        raw_errors = raw_host["errors"]
+        if not isinstance(raw_errors, list) or len(raw_errors) > MAX_PROVIDER_ERRORS:
+            raise CacheError("catalog host diagnostics are invalid")
+        hosts.append(
+            HostCatalog(
+                host_id,
+                display,
+                local,
+                status,
+                _timestamp(raw_host["observedAt"]),
+                route,
+                user,
+                tuple(providers),
+                tuple(_diagnostic(item) for item in raw_errors),
+            )
+        )
+    if local_count > 1:
+        raise CacheError("catalog contains multiple local hosts")
+    if local_count == 1 and not hosts[0].local:
+        raise CacheError("catalog local host must be first")
+    return CatalogSnapshot(observed, revision, tuple(hosts))
+
+
+def _now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _private_directory(path: Path) -> None:
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise CacheError("catalog directory is not private")
+    except OSError as error:
+        raise CacheError("catalog directory is unavailable") from error
+
+
+@contextmanager
+def _cache_lock(path: Path) -> Iterator[None]:
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "r+") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise CacheError("catalog lock is not private")
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            yield
+    except OSError as error:
+        raise CacheError("catalog lock is unavailable") from error
+
+
+def _target_union(previous: tuple[Target, ...], current: tuple[Target, ...]) -> tuple[Target, ...]:
+    by_identity = {item.key.identity: item for item in previous}
+    by_identity.update((item.key.identity, item) for item in current)
+    current_ids = {item.key.identity for item in current}
+    ordered = sorted(
+        by_identity.values(),
+        key=lambda item: (
+            item.key.identity not in current_ids,
+            item.key.home,
+            item.key.identity,
+        ),
+    )
+    return tuple(ordered[:128])
+
+
+def _old_provider(host: HostCatalog | None, provider: str) -> ProviderCatalog:
+    if host is not None:
+        for item in host.providers:
+            if item.provider == provider:
+                return item
+    return ProviderCatalog(provider, "unknown", 0, None, None, ())
+
+
+def _merge_host(previous: HostCatalog | None, result: HostResult) -> HostCatalog:
+    host_id = _host_id(result.host_id)
+    display = _bounded_string(result.display, 16384)
+    assert display is not None
+    if not isinstance(result.local, bool) or result.status not in {"complete", "partial", "error"}:
+        raise CacheError("host result status or locality is invalid")
+    old_providers = {item.provider: item for item in previous.providers} if previous else {}
+    if result.inventory is None:
+        errors = (result.error.to_json(),) if result.error is not None else ()
+        return HostCatalog(
+            host_id,
+            display,
+            result.local,
+            "error",
+            _timestamp(result.observed_at),
+            result.route,
+            previous.user if previous else None,
+            tuple(_old_provider(previous, name) for name in SUPPORTED_PROVIDERS),
+            errors,
         )
 
-    if (
-        not host_catalog
-        and previous is not None
-        and retain_unselected_hosts
-        and _backend_identity(previous.get("backend")) == backend
-    ):
-        prior_catalog = _host_catalog(previous.get("hostCatalog"))
-        if prior_catalog is not None:
-            host_catalog = prior_catalog
-
-    # A lifecycle revalidation only refreshes one host.  Its selected-host
-    # snapshot is current, but advancing the top-level timestamp would bless
-    # every retained peer as globally fresh and suppress the required next
-    # all-host discovery.  An absent/incompatible prior authority falls back
-    # to zero so this partial result is never treated as a full refresh.
-    completed_at = int(now if now is not None else time.time())
-    generated_at = (
-        _scoped_generated_at(previous, backend) if retain_unselected_hosts else completed_at
-    )
-    errors = _flatten_errors(hosts)
-    errors.extend(refresh_errors)
-    last_refresh = (
-        _prior_last_refresh(previous)
-        if retain_unselected_hosts
-        else _last_refresh(
-            attempted_at,
-            completed_at=completed_at,
-            outcome=_observation_outcome(errors),
+    inventory: Inventory = result.inventory
+    if inventory.host_id != host_id:
+        raise CacheError("inventory self identity does not match host result")
+    if previous is not None and previous.user is not None and previous.user != inventory.user:
+        old_providers = {}
+    covered = {item.provider: item for item in inventory.provider_coverage}
+    inventory_targets = {name: [] for name in SUPPORTED_PROVIDERS}
+    for target in inventory.targets:
+        if (
+            target.key.host_id != host_id
+            or target.key.uid != inventory.user.uid
+            or target.key.account != inventory.user.account
+        ):
+            raise CacheError("inventory target identity is outside host scope")
+        inventory_targets[target.key.provider].append(target)
+    providers: list[ProviderCatalog] = []
+    for name in SUPPORTED_PROVIDERS:
+        old = old_providers.get(name, ProviderCatalog(name, "unknown", 0, None, None, ()))
+        coverage = covered.get(name)
+        if coverage is None:
+            providers.append(
+                ProviderCatalog(
+                    name,
+                    "unknown",
+                    old.observed_at,
+                    old.last_complete_at,
+                    "provider_not_reported",
+                    old.targets,
+                    old.errors,
+                )
+            )
+            continue
+        matching_errors = tuple(
+            error.to_json() for error in inventory.errors if error.provider == name
         )
+        if coverage.status == "complete":
+            targets = tuple(
+                sorted(inventory_targets[name], key=lambda item: (item.key.home, item.key.identity))
+            )
+            complete_at = coverage.observed_at
+        elif coverage.status in {"missing", "unsupported"}:
+            targets = ()
+            complete_at = old.last_complete_at
+        else:
+            targets = _target_union(old.targets, tuple(inventory_targets[name]))
+            complete_at = old.last_complete_at
+        providers.append(
+            ProviderCatalog(
+                name,
+                coverage.status,
+                coverage.observed_at,
+                complete_at,
+                coverage.reason,
+                targets,
+                matching_errors,
+            )
+        )
+    host_errors = tuple(error.to_json() for error in inventory.errors if error.provider is None)
+    return HostCatalog(
+        host_id,
+        display,
+        result.local,
+        result.status,
+        _timestamp(result.observed_at),
+        result.route,
+        inventory.user,
+        tuple(providers),
+        host_errors,
     )
-    return {
-        "version": CACHE_VERSION,
-        "fingerprint": config.fingerprint,
-        "generatedAt": generated_at,
-        "backend": backend,
-        "hostCatalog": host_catalog,
-        "hosts": hosts,
-        "sessions": _flatten_hosts(hosts, config.max_sessions),
-        "errors": errors,
-        "lastRefresh": last_refresh,
-    }
 
 
 class CacheStore:
-    """Own cache files and serialized refresh operations."""
+    """Bounded private cache under ``$XDG_CACHE_HOME/rofi-agent-plus/direct-v1``."""
 
     def __init__(
-        self,
-        root: Path | None = None,
-        *,
-        backend_selector: Callable[[], object] | None = None,
+        self, root: str | Path | None = None, *, env: dict[str, str] | None = None
     ) -> None:
-        self.root = root or cache_root()
-        self.snapshot_path = self.root / SNAPSHOT_NAME
-        self.lock_path = self.root / LOCK_NAME
-        self.background_path = self.root / BACKGROUND_MARKER_NAME
-        self._backend_selector = backend_selector
-        self._last_refresh_scope: dict[str, object] | None = None
-        self._background_owner = os.environ.get(_BACKGROUND_OWNER_ENV)
+        if root is None:
+            environment = os.environ if env is None else env
+            configured = environment.get("XDG_CACHE_HOME", "")
+            base = Path(configured) if configured else Path.home() / ".cache"
+            if not base.is_absolute():
+                raise CacheError("XDG_CACHE_HOME must be absolute")
+            root = base / "rofi-agent-plus" / "direct-v1"
+        self.root = Path(root)
+        self.path = self.root / "catalog.json"
+        self.lock_path = self.root / ".catalog.lock"
 
-    def ensure_root(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _safe_mode(self.root, 0o700)
-
-    def load(
-        self,
-        fingerprint: str | None = None,
-        backend: Mapping[str, object] | None = None,
-    ) -> dict[str, Any] | None:
+    def _read_unlocked(self) -> CatalogSnapshot | None:
         try:
-            with self.snapshot_path.open(encoding="utf-8") as stream:
-                payload = json.load(stream)
-        except (OSError, ValueError, json.JSONDecodeError):
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077
+                    or info.st_size > MAX_CACHE_BYTES
+                ):
+                    raise CacheError("catalog file is not a bounded private regular file")
+                raw = stream.read(MAX_CACHE_BYTES + 1)
+        except FileNotFoundError:
             return None
-        if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION:
-            return None
-        if fingerprint is not None and payload.get("fingerprint") != fingerprint:
-            return None
-        stored_backend = _backend_identity(payload.get("backend"))
-        if stored_backend is None:
-            return None
-        if backend is not None and stored_backend != _backend_identity(backend):
-            return None
-        catalog_valid = _valid_host_catalog(payload.get("hostCatalog"))
-        if (
-            not isinstance(payload.get("sessions"), list)
-            or not isinstance(payload.get("errors", []), list)
-            or not isinstance(payload.get("hosts"), dict)
-            or not catalog_valid
-            or (stored_backend["kind"] == "contract" and not payload["hostCatalog"])
-        ):
-            return None
-        for key, host in payload["hosts"].items():
-            if not isinstance(key, str) or not isinstance(host, dict):
-                return None
-            host_rows = host.get("sessions", [])
-            if (
-                not isinstance(host_rows, list)
-                or any(not _valid_provider_session(row) for row in host_rows)
-                or not isinstance(host.get("errors", []), list)
-            ):
-                return None
-        if not _valid_last_refresh(payload.get("lastRefresh")):
-            return None
-        for host in payload["hosts"].values():
-            assert isinstance(host, dict)
-            if not _valid_observations(host.get("observations")):
-                return None
-            rows = host.get("sessions", [])
-            if any(
-                not isinstance(row, dict)
-                or row.get("sourceObservation") not in _SOURCE_OBSERVATIONS
-                for row in rows
-            ):
-                return None
-        rows = payload.get("sessions", [])
-        if any(
-            not _valid_provider_session(row)
-            or row.get("sourceObservation") not in _SOURCE_OBSERVATIONS
-            for row in rows
-        ):
-            return None
-        _safe_mode(self.snapshot_path, 0o600)
-        return payload
-
-    def _select_backend(self, *, deadline: float | None = None) -> tuple[object, dict[str, object]]:
-        if self._backend_selector is None:
-            from .contract_backend import select_backend
-
-            selected = select_backend()
-        else:
-            selected = self._backend_selector()
-        # Keep injected test seams compatible while ensuring a lifecycle
-        # authority re-check cannot create a second independent Mesh budget.
-        if deadline is not None:
-            from .contract_backend import ContractBackend
-
-            if isinstance(selected, ContractBackend):
-                selected.prepare(deadline=deadline)
-            else:
-                selected.prepare()  # type: ignore[union-attr]
-        else:
-            selected.prepare()  # type: ignore[union-attr]
-        identity = selected.identity  # type: ignore[union-attr]
-        if not isinstance(identity, Mapping) or _backend_identity(identity) is None:
-            raise engine.PickerError("Agent Plus backend returned an invalid identity")
-        return selected, dict(identity)
-
-    def presentation_context(self, config: PickerConfig) -> PresentationContext:
-        """Resolve exactly one presentation authority for a callback."""
-
+        except OSError as error:
+            raise CacheError("catalog file cannot be read") from error
+        if len(raw) > MAX_CACHE_BYTES:
+            raise CacheError("catalog file exceeds its size limit")
         try:
-            selected, identity = self._select_backend()
-        except Exception as error:
-            return PresentationContext(
-                config.fingerprint,
-                {
-                    "kind": "contract-error",
-                    "capability": "host-mesh-v1+tmux-session-v1",
-                    "meshRevision": None,
-                },
-                str(error)[:1024],
-            )
-        return PresentationContext(config.fingerprint, identity, selected=selected)
+            value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+            return parse_snapshot(value)
+        except (UnicodeError, ValueError, RecursionError) as error:
+            raise CacheError("catalog file is malformed") from error
 
-    def load_current(
-        self,
-        config: PickerConfig,
-        context: PresentationContext | None = None,
-    ) -> dict[str, Any] | None:
-        """Load only data from the currently selected capability/revision."""
+    def load(self) -> CatalogSnapshot | None:
+        """Read the last published snapshot, rejecting unsafe or unknown versions."""
 
-        context = context or self.presentation_context(config)
-        return self.load(config.fingerprint, context.backend)
-
-    def cache_scope(
-        self,
-        config: PickerConfig,
-        context: PresentationContext | None = None,
-    ) -> dict[str, object]:
-        """Return the marker scope for the current capability observation."""
-
-        context = context or self.presentation_context(config)
-        return {"fingerprint": config.fingerprint, "backend": context.backend}
-
-    def viewer_store(self) -> ViewerStateStore:
-        from .viewer_state import ViewerStateStore
-
-        return ViewerStateStore(self.root / "viewer-state")
-
-    def viewer_scope(
-        self, config: PickerConfig, context: PresentationContext
-    ) -> dict[str, object] | None:
-        from .contract_backend import ContractBackend
-        from .viewer_state import make_scope
-
-        selected = context.selected
-        if not isinstance(selected, ContractBackend) or selected.mesh is None:
+        if not self.root.exists():
             return None
-        return make_scope(config.fingerprint, context.backend, selected.mesh.local.host_id)
+        _private_directory(self.root)
+        return self._read_unlocked()
 
-    def refresh_viewers(self, config: PickerConfig, request_id: str) -> bool:
-        """Run the finite viewer helper without touching provider discovery/cache."""
-        from .contract_backend import ContractBackend
-        from .viewer_state import desktop_context, make_scope
-
-        viewers = self.viewer_store()
-        pending = viewers.pending()
-        if pending is None or pending.get("requestId") != request_id:
-            return False
-        expected = pending["scope"]
-        deadline = time.monotonic() + 25.0
-        try:
-            selected, identity = self._select_backend(deadline=deadline)
-            if not isinstance(selected, ContractBackend) or selected.mesh is None:
-                return False
-            scope = make_scope(config.fingerprint, identity, selected.mesh.local.host_id)
-            if scope != expected:
-                return False
-            inventory = selected.viewer_inventory()
-            current, current_identity = self._select_backend(deadline=deadline)
-            if not isinstance(current, ContractBackend) or current.mesh is None:
-                return False
-            current_scope = make_scope(
-                config.fingerprint, current_identity, current.mesh.local.host_id
-            )
-            if current_scope != scope or selected.viewer_inventory_desktop != scope["desktop"]:
-                return False
-            return viewers.publish(request_id, scope, inventory)
-        except (engine.PickerError, OSError, ValueError):
-            if desktop_context() != expected.get("desktop"):
-                return False
-            return viewers.publish(request_id, expected, error="refresh_failed")
-
-    def _ingest_viewers(self, config: PickerConfig, selected: object) -> None:
-        from .contract_backend import ContractBackend
-        from .viewer_state import make_scope
-
-        if not isinstance(selected, ContractBackend) or selected.mesh is None:
-            return
-        try:
-            scope = make_scope(config.fingerprint, selected.identity, selected.mesh.local.host_id)
-            if selected.viewer_inventory_desktop != scope["desktop"]:
-                return
-            viewers = self.viewer_store()
-            if selected.viewer_inventory_result is not None:
-                viewers.ingest(selected.viewer_inventory_result, scope)
-            elif selected.viewer_inventory_started_at is not None:
-                viewers.ingest_failure(scope, selected.viewer_inventory_started_at)
-        except (engine.PickerError, OSError, ValueError):
-            # This optional display cache never makes valid provider facts fail.
-            pass
-
-    def age(self, snapshot: Mapping[str, Any] | None, now: float | None = None) -> float:
-        if not snapshot:
-            return float("inf")
-        try:
-            generated = float(snapshot.get("generatedAt", 0))
-        except (TypeError, ValueError):
-            return float("inf")
-        return max(0.0, (now if now is not None else time.time()) - generated)
-
-    def is_fresh(
-        self,
-        snapshot: Mapping[str, Any] | None,
-        refresh_seconds: int,
-        now: float | None = None,
-    ) -> bool:
-        return self.age(snapshot, now) <= refresh_seconds
-
-    def write(self, snapshot: Mapping[str, Any]) -> None:
-        self.ensure_root()
-        encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
-        _atomic_write_private(self.snapshot_path, encoded, ".snapshot.")
-
-    def reconcile_contract_reference(
-        self,
-        config: PickerConfig,
-        context: PresentationContext,
-        *,
-        host_id: str,
-        kind: str,
-        identifier: str,
-        reference: Mapping[str, object],
-        namespace: str | None = None,
-        native_id_kind: str | None = None,
-        wait_seconds: float = 1.0,
-        deadline: float | None = None,
-    ) -> bool:
-        """Atomically retain one successful public lifecycle descriptor.
-
-        This is deliberately a narrow, non-authoritative cache update.  It
-        neither manufactures provider data nor advances ``generatedAt``.  The
-        cache is re-read under the lock and must still have the same capability
-        and Mesh revision, so a result from an older authority cannot overwrite
-        a newer discovery snapshot.
-        """
-
-        if context.error is not None or _backend_identity(context.backend) is None:
-            return False
-        wanted_backend = _backend_identity(context.backend)
-        assert wanted_backend is not None
-        if not namespace or not native_id_kind:
-            return False
-        wanted = (host_id, kind, identifier, namespace, native_id_kind)
-        wait_deadline = time.monotonic() + max(0.0, wait_seconds)
-        if deadline is not None:
-            wait_deadline = min(wait_deadline, deadline)
-        while True:
-            if time.monotonic() >= wait_deadline:
-                return False
-            with self.lock(blocking=False) as acquired:
-                if acquired:
-                    snapshot = self.load(config.fingerprint, wanted_backend)
-                    if snapshot is None:
-                        return False
-                    # JSON round-tripping gives a deep copy without carrying
-                    # references from callers into the atomic persisted value.
-                    candidate = json.loads(json.dumps(snapshot, ensure_ascii=False))
-                    rows = candidate.get("sessions")
-                    hosts = candidate.get("hosts")
-                    if not isinstance(rows, list) or not isinstance(hosts, dict):
-                        return False
-
-                    def matches(row: object) -> bool:
-                        return (
-                            isinstance(row, dict)
-                            and row.get("contractMode") is True
-                            and row.get("backend") == wanted_backend
-                            and _as_session_key(row) == wanted
-                        )
-
-                    flattened = [row for row in rows if matches(row)]
-                    host = hosts.get(host_id)
-                    host_rows = host.get("sessions") if isinstance(host, dict) else None
-                    retained = (
-                        [row for row in host_rows if matches(row)]
-                        if isinstance(host_rows, list)
-                        else []
-                    )
-                    if len(flattened) != 1 or len(retained) != 1:
-                        return False
-                    for row in (*flattened, *retained):
-                        assert isinstance(row, dict)
-                        row["tmux"] = dict(reference)
-                        row["tmuxSession"] = reference.get("observedName")
-                        row.pop("tmuxStale", None)
-                        row.pop("tmuxAmbiguous", None)
-                    self.write(candidate)
-                    return True
-            if time.monotonic() >= wait_deadline:
-                return False
-            time.sleep(0.05)
-
-    @contextmanager
-    def lock(self, blocking: bool = True) -> Iterator[bool]:
-        self.ensure_root()
-        descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    def _write_unlocked(self, snapshot: CatalogSnapshot) -> None:
+        value = parse_snapshot(snapshot.to_json()).to_json()
+        content = json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+        encoded = content.encode("utf-8")
+        if len(encoded) > MAX_CACHE_BYTES:
+            raise CacheError("catalog snapshot exceeds its size limit")
+        descriptor, name = tempfile.mkstemp(prefix=".catalog-", suffix=".tmp", dir=self.root)
+        temporary = Path(name)
         try:
             os.fchmod(descriptor, 0o600)
-            flags = fcntl.LOCK_EX
-            if not blocking:
-                flags |= fcntl.LOCK_NB
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            directory = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
-                fcntl.flock(descriptor, flags)
-            except BlockingIOError:
-                yield False
-                return
-            yield True
-        finally:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.fsync(directory)
             finally:
-                os.close(descriptor)
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _mutate(
+        self, mutate: Callable[[CatalogSnapshot | None], CatalogSnapshot]
+    ) -> CatalogSnapshot:
+        _private_directory(self.root)
+        with _cache_lock(self.lock_path):
+            current = self._read_unlocked()
+            updated = mutate(current)
+            self._write_unlocked(updated)
+            return updated
+
+    def publish_host(self, result: HostResult, *, mesh_revision: str | None) -> CatalogSnapshot:
+        """Merge a completed host while preserving other hosts and partial targets."""
+
+        def merge(current: CatalogSnapshot | None) -> CatalogSnapshot:
+            hosts = list(current.hosts if current is not None else ())
+            found = next(
+                (index for index, item in enumerate(hosts) if item.host_id == result.host_id), None
+            )
+            previous = hosts[found] if found is not None else None
+            updated = _merge_host(previous, result)
+            if found is None:
+                # Host Mesh keeps the local machine first; a newly seen local
+                # result must also lead a cache assembled from earlier remotes.
+                hosts.insert(0 if result.local else len(hosts), updated)
+            else:
+                hosts[found] = updated
+            hosts = _bounded_hosts(hosts)
+            return CatalogSnapshot(_now_ms(), mesh_revision, tuple(hosts))
+
+        return self._mutate(merge)
+
+    def finish_fleet(self, fleet: FleetSnapshot) -> CatalogSnapshot:
+        """Mark hosts absent from the completed current Mesh as removed."""
+
+        present = {host.host_id for host in fleet.hosts}
+        current_order = {host.host_id: index for index, host in enumerate(fleet.hosts)}
+
+        def merge(current: CatalogSnapshot | None) -> CatalogSnapshot:
+            hosts = list(current.hosts if current is not None else ())
+            hosts = [
+                HostCatalog(
+                    item.host_id,
+                    item.display,
+                    item.local,
+                    "removed",
+                    fleet.observed_at,
+                    None,
+                    item.user,
+                    item.providers,
+                    item.errors,
+                )
+                if item.host_id not in present
+                else item
+                for item in hosts
+            ]
+            hosts.sort(
+                key=lambda item: (
+                    0 if item.host_id in current_order else 1,
+                    current_order.get(item.host_id, len(current_order)),
+                    item.host_id,
+                )
+            )
+            hosts = _bounded_hosts(hosts)
+            return CatalogSnapshot(fleet.observed_at, fleet.mesh_revision, tuple(hosts))
+
+        return self._mutate(merge)
 
     def refresh(
         self,
-        config: PickerConfig,
-        discover: Callable[[PickerConfig, Mapping[str, Any] | None], Iterator[dict[str, Any]]]
-        | None = None,
+        transport: Transport,
         *,
-        force: bool = False,
-        require_fresh: bool = False,
-        wait_seconds: float = LOCK_WAIT_SECONDS,
-        context: PresentationContext | None = None,
-        deadline: float | None = None,
-        host_ids: tuple[str, ...] | None = None,
-        retry_stale_mesh: bool = True,
-    ) -> dict[str, Any]:
-        """Synchronously refresh, with bounded lock waiting and safe fallback."""
+        on_host: Callable[[HostResult], None] | None = None,
+    ) -> FleetSnapshot:
+        """Publish every host completion, then commit the completed Mesh membership."""
 
-        uses_selected_backend = discover is None
-        selected_backend: object | None = None
-        backend_identity: Mapping[str, object] | None = None
-        if discover is None:
-            if context is not None and context.error is not None:
-                failure_backend = {
-                    "kind": "contract-error",
-                    "capability": "host-mesh-v1+tmux-session-v1",
-                    "meshRevision": None,
-                }
-                snapshot = _failed_contract_snapshot(
-                    config,
-                    None,
-                    failure_backend,
-                    [{"host": "local", "stage": "contract", "message": context.error[:1024]}],
-                )
-                self.write(snapshot)
-                self._last_refresh_scope = {
-                    "fingerprint": config.fingerprint,
-                    "backend": failure_backend,
-                }
-                if require_fresh:
-                    _require_complete_contract_transaction(snapshot)
-                return snapshot
-            try:
-                if context is not None:
-                    selected_backend = context.selected
-                    identity = context.backend
-                    if selected_backend is None:
-                        raise engine.PickerError("Agent Plus backend context is unavailable")
-                else:
-                    selected_backend, identity = self._select_backend()
-            except Exception as error:  # never quietly fall back from a selected pair
-                failure_backend = {
-                    "kind": "contract-error",
-                    "capability": "host-mesh-v1+tmux-session-v1",
-                    "meshRevision": None,
-                }
-                snapshot = _failed_contract_snapshot(
-                    config,
-                    None,
-                    failure_backend,
-                    [{"host": "local", "stage": "contract", "message": str(error)[:1024]}],
-                )
-                self.write(snapshot)
-                self._last_refresh_scope = {
-                    "fingerprint": config.fingerprint,
-                    "backend": failure_backend,
-                }
-                if require_fresh:
-                    _require_complete_contract_transaction(snapshot)
-                return snapshot
-            backend_identity = dict(identity)
+        def publish(result: HostResult) -> None:
+            self.publish_host(result, mesh_revision=transport.current_mesh_revision)
+            if on_host is not None:
+                on_host(result)
 
-            def backend_discover(
-                discovery_config: PickerConfig,
-                _previous: Mapping[str, Any] | None,
-            ) -> Iterator[dict[str, Any]]:
-                assert selected_backend is not None
-                kwargs: dict[str, object] = {}
-                if deadline is not None:
-                    kwargs["deadline"] = deadline
-                if host_ids is not None:
-                    kwargs["host_ids"] = host_ids
-                if not retry_stale_mesh:
-                    # A guarded lifecycle action needs the typed stale-Mesh
-                    # result itself so it can refresh the whole authority
-                    # before deciding whether a source row is still usable.
-                    kwargs["retry_stale_mesh"] = False
-                return iter(selected_backend.stream(discovery_config, **kwargs))  # type: ignore[union-attr]
-
-            discover = backend_discover
-        previous = self.load(config.fingerprint, backend_identity)
-        lock_deadline = time.monotonic() + wait_seconds
-        if deadline is not None:
-            lock_deadline = min(lock_deadline, deadline)
-        while True:
-            with self.lock(blocking=False) as acquired:
-                if acquired:
-                    # Re-read after acquiring: another process may have
-                    # completed the refresh while we were waiting.
-                    previous = self.load(config.fingerprint, backend_identity)
-                    if not force and self.is_fresh(previous, config.refresh_seconds):
-                        cached = previous or _empty_snapshot(config)
-                        if require_fresh:
-                            _require_complete_contract_transaction(cached)
-                        return cached
-                    snapshot = build_snapshot(
-                        config,
-                        discover(config, previous),
-                        previous,
-                        retain_unselected_hosts=host_ids is not None,
-                    )
-                    if uses_selected_backend:
-                        # An old detached owner may finish after Mesh/capability
-                        # changed.  Re-observe while still holding the mutation
-                        # lock and never let its stale discovery overwrite the
-                        # current authority's snapshot.
-                        try:
-                            _current_backend, current_identity = self._select_backend(
-                                deadline=deadline
-                            )
-                        except Exception:
-                            current_identity = {
-                                "kind": "contract-error",
-                                "capability": "host-mesh-v1+tmux-session-v1",
-                                "meshRevision": None,
-                            }
-                        if _backend_identity(snapshot.get("backend")) != current_identity:
-                            current = self.load(config.fingerprint, current_identity)
-                            authority_changed = current or {
-                                "version": CACHE_VERSION,
-                                "fingerprint": config.fingerprint,
-                                "generatedAt": 0,
-                                "backend": current_identity,
-                                "hostCatalog": [],
-                                "hosts": {},
-                                "sessions": [],
-                                "errors": [
-                                    {
-                                        "host": "local",
-                                        "stage": "contract",
-                                        "message": "discovery authority changed; refresh again",
-                                    }
-                                ],
-                                "lastRefresh": _last_refresh(
-                                    int(time.time()), completed_at=None, outcome="failed"
-                                ),
-                            }
-                            if require_fresh:
-                                _require_complete_contract_transaction(authority_changed)
-                            return authority_changed
-                    self.write(snapshot)
-                    if uses_selected_backend:
-                        self._ingest_viewers(config, selected_backend)
-                    backend = _backend_identity(snapshot.get("backend"))
-                    self._last_refresh_scope = (
-                        {"fingerprint": config.fingerprint, "backend": backend}
-                        if backend is not None
-                        else None
-                    )
-                    if require_fresh:
-                        _require_complete_contract_transaction(snapshot)
-                    return snapshot
-            current = self.load(config.fingerprint, backend_identity)
-            # A lifecycle action must not reinterpret any lock-contended cache
-            # snapshot as its selected-host revalidation. Ordinary picker
-            # callbacks may consume a just-completed same-authority refresh;
-            # older data remains ordinary picker fallback only.
-            if (
-                current is not None
-                and not require_fresh
-                and (not force or self.age(current) <= 1.0)
-            ):
-                return current
-            if time.monotonic() >= lock_deadline:
-                if require_fresh:
-                    raise engine.PickerError(
-                        "Agent Plus lifecycle revalidation is already in progress"
-                    )
-                if current is not None:
-                    return current
-                if previous is not None:
-                    return previous
-                raise engine.PickerError("Agent Plus refresh is already in progress")
-            time.sleep(0.05)
-
-    @staticmethod
-    def _marker_matches(
-        payload: object,
-        scope: Mapping[str, object] | None,
-        owner: str | None = None,
-    ) -> bool:
-        if scope is None and owner is None:
-            # Preserve this unscoped test seam; production Rofi passes a typed
-            # capability scope and owned cleanup always passes an owner.
-            return True
-        if not isinstance(payload, Mapping):
-            return False
-        if scope is not None and payload.get("scope") != dict(scope):
-            return False
-        return owner is None or payload.get("owner") == owner
-
-    def _read_marker(self) -> object | None:
-        try:
-            with self.background_path.open(encoding="utf-8") as stream:
-                return json.load(stream)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
-
-    def _write_marker(self, payload: Mapping[str, object]) -> None:
-        encoded = json.dumps(payload, separators=(",", ":"))
-        _atomic_write_private(self.background_path, encoded, ".refresh.")
-
-    def _clear_marker_if_owned(self, owner: str, scope: Mapping[str, object] | None) -> None:
-        payload = self._read_marker()
-        if not self._marker_matches(payload, scope, owner):
-            return
-        try:
-            self.background_path.unlink()
-        except FileNotFoundError:
-            pass
-
-    def spawn_background(
-        self,
-        command: list[str],
-        *,
-        scope: Mapping[str, object] | None = None,
-    ) -> bool:
-        """Start at most one detached refresh process using a marker claim."""
-
-        self.ensure_root()
-        with self.lock(blocking=False) as acquired:
-            if not acquired:
-                return False
-            payload = self._read_marker()
-            try:
-                stale = (
-                    self.background_path.exists()
-                    and time.time() - self.background_path.stat().st_mtime > LOCK_WAIT_SECONDS * 4
-                )
-            except OSError:
-                stale = False
-            if payload is not None and self._marker_matches(payload, scope) and not stale:
-                return False
-            # Replace atomically while holding the refresh lock.  There is no
-            # unlink/create gap in which another callback can claim the same
-            # scope.  A prior worker cannot clear this new marker because its
-            # owner token differs.
-            owner = secrets.token_hex(16)
-            self._write_marker({"pid": os.getpid(), "scope": dict(scope or {}), "owner": owner})
-        try:
-            environment = os.environ.copy()
-            for key in _ROFI_CALLBACK_ENVIRONMENT:
-                environment.pop(key, None)
-            environment[_BACKGROUND_OWNER_ENV] = owner
-            subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                env=environment,
-            )
-        except OSError:
-            self._clear_marker_if_owned(owner, scope)
-            return False
-        return True
-
-    def background_age(self, now: float | None = None) -> float | None:
-        """Return the age of the detached-refresh marker, if it is valid."""
-
-        try:
-            metadata = self.background_path.stat()
-        except OSError:
-            return None
-        if not stat.S_ISREG(metadata.st_mode):
-            return None
-        return max(0.0, (now if now is not None else time.time()) - metadata.st_mtime)
-
-    def background_active(
-        self,
-        max_age: float = LOCK_WAIT_SECONDS * 4,
-        now: float | None = None,
-        scope: Mapping[str, object] | None = None,
-    ) -> bool:
-        """Report whether a detached refresh marker is recent enough to poll."""
-
-        if not self._marker_matches(self._read_marker(), scope):
-            return False
-        age = self.background_age(now)
-        return age is not None and age <= max_age
-
-    def clear_background_marker(
-        self,
-        *,
-        scope: Mapping[str, object] | None = None,
-        owner: str | None = None,
-    ) -> None:
-        if scope is None:
-            scope = self._last_refresh_scope
-        owner = owner or self._background_owner
-        payload = self._read_marker()
-        if owner is not None:
-            if not self._marker_matches(payload, scope, owner):
-                return
-        elif isinstance(payload, Mapping) and payload.get("pid") != os.getpid():
-            return
-        try:
-            self.background_path.unlink()
-        except FileNotFoundError:
-            pass
-
-    def clear_owned_background_marker(self) -> None:
-        """Clear only a marker whose authority this refresh observed."""
-
-        if self._background_owner is not None:
-            self.clear_background_marker(owner=self._background_owner)
-        elif self._last_refresh_scope is not None:
-            self.clear_background_marker(scope=self._last_refresh_scope)
+        fleet = transport.read_fleet(on_result=publish)
+        self.finish_fleet(fleet)
+        return fleet
 
 
-def _empty_snapshot(config: PickerConfig) -> dict[str, Any]:
-    return {
-        "version": CACHE_VERSION,
-        "fingerprint": config.fingerprint,
-        "generatedAt": int(time.time()),
-        "backend": {
-            "kind": "contract-error",
-            "capability": "host-mesh-v1+tmux-session-v1",
-            "meshRevision": None,
-        },
-        "hostCatalog": [],
-        "hosts": {},
-        "sessions": [],
-        "errors": [],
-        "lastRefresh": _last_refresh(0, completed_at=None, outcome="failed"),
-    }
+def freshness(provider: ProviderCatalog, *, ttl_seconds: int = MAX_CACHE_AGE_SECONDS) -> str:
+    return provider.freshness(_now_ms(), ttl_seconds)

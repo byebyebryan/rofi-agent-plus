@@ -1,4 +1,4 @@
-"""Offline conformance checks for the vendored Host Mesh and Tmux bundles."""
+"""Offline conformance checks for the vendored public Host Mesh bundle."""
 
 from __future__ import annotations
 
@@ -9,25 +9,17 @@ import stat
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
+from unittest.mock import patch
 
-from rofi_agent_plus.contract_backend import (
-    CommandOutput,
-    ContractError,
-    _inventory,
-    _local_mesh,
-    parse_mesh,
-)
-from rofi_agent_plus.contract_lifecycle import LifecycleError, _success_response
+from rofi_agent_plus.host_mesh import HostMeshError, local_only_mesh, parse_mesh
 from rofi_agent_plus.wire import WireError, decode_document
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS = {
     "host-mesh-v1": ROOT / "contracts" / "host-mesh-v1",
-    "tmux-session-v1": ROOT / "contracts" / "tmux-session-v1",
 }
 UPSTREAM = {
     "host-mesh-v1": "https://github.com/byebyebryan/rofi-ssh-plus",
-    "tmux-session-v1": "https://github.com/byebyebryan/rofi-tmux-plus",
 }
 HEX_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 
@@ -291,103 +283,19 @@ class ContractBundleTest(unittest.TestCase):
                 self.assertEqual(expected, set(references))
                 self.assertEqual(len(expected), len(references))
 
-    def test_inventory_enforces_session_and_aggregate_pane_caps(self) -> None:
-        mesh = parse_mesh(_json(ROOT / "tests/fixtures/contract/mesh-v1.json"))
-        source = _json(ROOT / "tests/fixtures/contract/tmux-inventory-v1.json")
-        assert isinstance(source, dict)
-
-        too_many_sessions = json.loads(json.dumps(source))
-        sessions = too_many_sessions["hosts"][0]["sessions"]
-        sessions.extend(json.loads(json.dumps(sessions[0])) for _ in range(256))
-        with self.assertRaisesRegex(ContractError, "too many sessions"):
-            _inventory(too_many_sessions, mesh)
-
-        too_many_panes = json.loads(json.dumps(source))
-        host = too_many_panes["hosts"][0]
-        original = host["sessions"][0]
-        first = json.loads(json.dumps(original))
-        first["createdAt"] = 10
-        first["panes"] = [
-            {**json.loads(json.dumps(original["panes"][0])), "paneId": f"%{index}"}
-            for index in range(512)
-        ]
-        second = json.loads(json.dumps(original))
-        second["sessionId"] = "$5"
-        second["createdAt"] = 11
-        second["panes"] = [{**json.loads(json.dumps(original["panes"][0])), "paneId": "%512"}]
-        host["sessions"] = [first, second]
-        with self.assertRaisesRegex(ContractError, "too many panes for host"):
-            _inventory(too_many_panes, mesh)
-
-    def test_raw_fixture_index_covers_all_public_lifecycle_commands(self) -> None:
-        index = _json(CONTRACTS["tmux-session-v1"] / "fixtures/index.json")
-        assert isinstance(index, dict)
-        commands = {
-            "inventory",
-            "open",
-            "viewers",
-            "close-viewer",
-            "create",
-            "rename",
-            "kill",
-        }
-        raw_cases = [case for case in index["cases"] if case["kind"] == "raw"]
-        self.assertGreaterEqual(len(raw_cases), 2)
-        for case in raw_cases:
-            self.assertEqual(commands, set(case["appliesTo"]))
-        names = {case["name"] for case in raw_cases}
-        self.assertIn("raw-extra-final-lf", names)
-        self.assertIn("raw-space-after-final-lf", names)
-
     def test_known_bool_and_integer_schema_types_are_not_cross_coerced(self) -> None:
-        validator = LocalSchemaValidator(CONTRACTS["tmux-session-v1"])
-        for value in (True, False):
+        validator = LocalSchemaValidator(CONTRACTS["host-mesh-v1"])
+        for value in (True, False, 1.0):
             with self.assertRaises(SchemaError):
                 validator._validate(value, {"type": "integer"}, Path("inline"), {})
-        with self.assertRaises(SchemaError):
-            validator._validate(1.0, {"type": "integer"}, Path("inline"), {})
         for value in (0, 1):
             with self.assertRaises(SchemaError):
                 validator._validate(value, {"type": "boolean"}, Path("inline"), {})
-        inventory = _json(
-            CONTRACTS["tmux-session-v1"] / "fixtures" / "valid/inventory-multiple-sessions.json"
-        )
-        assert isinstance(inventory, dict)
-        inventory["hosts"][0]["sessions"][0]["pending"] = 1
-        with self.assertRaises(ContractError):
-            _inventory(inventory, _local_mesh("local.example"))
-        opened = _json(CONTRACTS["tmux-session-v1"] / "fixtures" / "valid/open-success.json")
-        assert isinstance(opened, dict)
-        opened["focused"] = 1
-        with self.assertRaises(LifecycleError):
-            _success_response(
-                CommandOutput((), 0, json.dumps(opened) + "\n", ""),
-                "local",
-                None,
-                opening=True,
-            )
-
-    def test_lifecycle_rejects_oversized_known_string(self) -> None:
-        opened = _json(CONTRACTS["tmux-session-v1"] / "fixtures/valid/open-success.json")
-        assert isinstance(opened, dict)
-        opened["session"]["name"] = "x" * 4097
-        with self.assertRaises(LifecycleError):
-            _success_response(
-                CommandOutput((), 0, json.dumps(opened) + "\n", ""),
-                "local",
-                None,
-                opening=True,
-            )
-        opened["focused"] = False
-        opened["terminalLaunched"] = True
-        opened["schemaVersion"] = 1.0
-        with self.assertRaises(LifecycleError):
-            _success_response(
-                CommandOutput((), 0, json.dumps(opened) + "\n", ""),
-                "local",
-                None,
-                opening=True,
-            )
+        for value in (True, 1.0):
+            inventory = _json(CONTRACTS["host-mesh-v1"] / "fixtures/valid/list-local-only.json")
+            inventory["schemaVersion"] = value
+            with self.assertRaises(HostMeshError):
+                parse_mesh(inventory)
 
     def test_wire_rejects_float_overflow_as_nonfinite(self) -> None:
         with self.assertRaises(WireError):
@@ -398,37 +306,34 @@ class ContractBundleTest(unittest.TestCase):
         assert isinstance(mesh, dict)
         invalid = json.loads(json.dumps(mesh))
         invalid["hosts"][1]["id"] = "alpha.example"
-        with self.assertRaisesRegex(ContractError, "ambiguous"):
+        with self.assertRaisesRegex(HostMeshError, "ambiguous"):
             parse_mesh(invalid)
 
         route_collision = json.loads(json.dumps(mesh))
         route_collision["hosts"][1]["routes"][0]["destination"] = "alpha.example"
-        with self.assertRaisesRegex(ContractError, "ambiguous"):
+        with self.assertRaisesRegex(HostMeshError, "ambiguous"):
             parse_mesh(route_collision)
 
     def test_unknown_nested_fields_remain_extensible(self) -> None:
         mesh = _json(CONTRACTS["host-mesh-v1"] / "fixtures/valid/list-local-only.json")
-        assert isinstance(mesh, dict)
         mesh["extension"] = {"nested": ["accepted"]}
         mesh["hosts"][0]["extension"] = {"nested": {"field": "accepted"}}
         parse_mesh(mesh)
-        inventory = _json(
-            CONTRACTS["tmux-session-v1"] / "fixtures/valid/inventory-running-empty.json"
-        )
-        assert isinstance(inventory, dict)
-        inventory["extension"] = {"nested": ["accepted"]}
-        inventory["hosts"][0]["extension"] = {"nested": {"field": "accepted"}}
-        _inventory(inventory, _local_mesh("local.example"))
 
-    def test_shared_local_identity_matrix_matches_the_fallback(self) -> None:
-        matrix = _json(CONTRACTS["tmux-session-v1"] / "fixtures/local-identity-matrix.json")
-        assert isinstance(matrix, dict)
-        for case in matrix["cases"]:
-            with self.subTest(hostname=case["hostname"]):
-                identity = _local_mesh(case["hostname"]).local
-                self.assertEqual(case["hostId"], identity.host_id)
-                self.assertEqual(case["display"], identity.display)
-                self.assertEqual(set(case["aliases"]), set(identity.aliases))
+    def test_local_only_identity_matches_public_fallback_rules(self) -> None:
+        for hostname, expected in (
+            ("Alpha.Example", "alpha"),
+            ("work-station", "work-station"),
+            ("invalid hostname", "localhost"),
+        ):
+            with self.subTest(hostname=hostname):
+                with (
+                    patch("rofi_agent_plus.host_mesh.socket.gethostname", return_value=hostname),
+                    patch("rofi_agent_plus.host_mesh.socket.getfqdn", return_value=hostname),
+                ):
+                    local = local_only_mesh().local
+                self.assertEqual(local.host_id, expected)
+                self.assertEqual(local.routes, ())
 
     def test_sync_script_is_executable_and_bundle_sources_are_public_only(self) -> None:
         mode = (ROOT / "scripts/check-contract-sync").stat().st_mode

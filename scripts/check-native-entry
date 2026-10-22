@@ -1,253 +1,370 @@
 #!/usr/bin/env python3
-import importlib.metadata
+"""Exercise two owned native manager windows; never submit an agent turn."""
+
+from __future__ import annotations
+
+import argparse
 import json
 import os
+import shlex
+import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
-from rofi_agent_plus.cache import CacheStore, PresentationContext
-from rofi_agent_plus.config import PickerConfig
-from rofi_agent_plus.contract_backend import (
-    ContractBackend,
-    _run_bounded,
-)
-from rofi_agent_plus.contract_lifecycle import ContractLifecycle, LifecycleError
+if not sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-ROOT = Path(sys.argv[1])
-HOST = "snap"
-MODE = sys.argv[2]
-OBSERVER = Path("/home/bryan/.local/share/agent-observer/0.2.0a3-6aa793e6a0ba5ae3")
-PLUS = Path("/home/bryan/.local/share/rofi-agent-plus/0.14.0a1-8ba19a0eba87944a")
-PEER = Path(json.loads((ROOT / "peer.json").read_text())["root"])
-for distribution, version in (("rofi-agent-plus", "0.14.0a1"), ("agent-observer", "0.2.0a3")):
-    installed = importlib.metadata.distribution(distribution)
-    assert installed.version == version
-    assert Path(installed.locate_file("")).resolve().is_relative_to(PLUS)
-base = ROOT / "native-snap"
-os.chdir(base / "workspace")
-
-out = {
-    "hostScope": "snap",
-    "mode": MODE,
-    "consumerSource": "90e5b4f",
-    "observerVersion": "0.2.0a3",
-    "actualTmux": True,
-    "actualSsh": MODE == "initial",
-    "meshAuthority": "copied_configured_host_mesh_with_owned_namespace_transport",
-    "terminalAdapter": "owned_pty_and_private_user_scope_adapter",
-    "ordinaryProviderPathsMasked": True,
-    "cases": {},
-}
-writes = []
-handoffs = []
+from rofi_agent_plus import __file__ as package_file  # noqa: E402
+from rofi_agent_plus.actions import Actions  # noqa: E402
+from rofi_agent_plus.desktop import Desktop, kitty_control_command, run_json  # noqa: E402
+from rofi_agent_plus.model import EntryReference  # noqa: E402
+from rofi_agent_plus.registry import Registry  # noqa: E402
+from rofi_agent_plus.transport import Transport  # noqa: E402
 
 
-def runner(argv, **kwargs):
-    if argv[0] == "agent-observer-write":
-        writes.append(("snap", argv[1]))
-    elif argv[0].endswith("/ssh"):
-        if "agent-observer-write prepare" in argv[-1]:
-            writes.append(("starship", "prepare"))
-        if "agent-observer-write execute" in argv[-1]:
-            writes.append(("starship", "execute"))
-    if argv[0] == "rofi-tmux-plus" and argv[1] == "create":
-        native = argv[argv.index("--") + 1 :]
-        assert native[:3] == ["agent-observer-write", "enter", "--plan-json"]
-        handoffs.append(json.loads(native[-1]))
-    return _run_bounded(argv, **kwargs)
+def wait(read, predicate, timeout=30):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = read()
+        if predicate(last):
+            return last
+        time.sleep(0.15)
+    raise RuntimeError("owned observation deadline")
 
 
-backend = ContractBackend("rofi-ssh-plus", "rofi-tmux-plus", runner=runner)
-backend.prepare()
-assert backend.mesh.local.host_id == "snap"
-assert any(
-    h.host_id == "starship" and h.routes[0].destination == "starship" for h in backend.mesh.hosts
-)
-config = PickerConfig(host_providers=(("starship", ("codex",)),))
-store = CacheStore(base / ("real-plus-cache-" + MODE), backend_selector=lambda: backend)
-context = PresentationContext(config.fingerprint, backend.identity, selected=backend)
-
-
-def lifecycle():
-    return ContractLifecycle(store, config, context, timeout=75)
-
-
-def control(request):
-    value = subprocess.run(
-        ["python3", "-I", str(ROOT / "native-fixture"), "control", str(ROOT), json.dumps(request)],
-        capture_output=True,
-        timeout=8,
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--home", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--provider", choices=("codex", "claude"), required=True)
+    parser.add_argument("--helper", help="explicit private remote candidate helper")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected", action="append", default=[])
+    parser.add_argument("--exercise-client-state", action="store_true")
+    parser.add_argument("--fixture-script", type=Path)
+    parser.add_argument("--disconnect-first", action="store_true")
+    args = parser.parse_args()
+    output = args.output.resolve()
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    env = dict(os.environ)
+    desktop = Desktop(env)
+    registry = Registry(desktop.generation, output / "runtime")
+    transport = Transport(
+        env=env,
+        config_paths={args.host: args.config},
+        remote_helpers={args.host: args.helper} if args.helper else {},
     )
-    if value.returncode:
-        raise RuntimeError("terminal_control_failed")
-
-
-def wait_ui(seconds):
-    time.sleep(seconds)
-
-
-def projected(provider, host="snap", reference=None):
-    target = next(h for h in backend.mesh.hosts if h.host_id == host)
-    _, value = backend._observer_snapshot(target, time.monotonic() + 30, providers=(provider,))
-    if not hasattr(value, "sessions"):
-        raise RuntimeError("public_snapshot_failed")
-    rows = [
-        dict(row)
-        for row in value.sessions
-        if reference is None or row["observerIdentity"] == reference
-    ]
-    for row in rows:
-        row.update(hostId=host, host=host, contractMode=True, backend=backend.identity)
-    return rows
-
-
-def new(provider, host="snap"):
-    owning = ROOT if host == "snap" else PEER
-    request = {
-        "schemaVersion": 1,
-        "operation": "new",
-        "hostScope": host,
-        "provider": provider,
-        "configHome": str(owning / ("native-" + host) / provider),
-        "configHomeKind": "explicit",
-        "cwd": str(owning / ("native-" + host) / "workspace"),
-        "reference": None,
+    fleet = transport.read_fleet()
+    observed = next(host for host in fleet.hosts if host.host_id == args.host)
+    if observed.inventory is None:
+        raise RuntimeError(f"fixture inventory unavailable: {observed.error}")
+    inventory = observed.inventory
+    target = next(
+        item
+        for item in inventory.targets
+        if item.key.home == str(args.home) and item.key.provider == args.provider
+    )
+    reference = EntryReference(inventory.host_id, inventory.user, target.key, target.spec_revision)
+    actions = Actions(desktop, registry, transport, env=env)
+    target_id = actions.target_id(target)
+    before = desktop.windows()
+    focus = next((w for w in before if w.focused), None)
+    receipt = {
+        "package": str(package_file),
+        "target": target.key.wire,
+        "fixture": "synthetic native rollouts; zero submitted turns"
+        if args.provider == "codex"
+        else "empty owned native home; zero submitted turns",
+        "checks": {},
+        "human": "pending",
+        "owned": [],
     }
-    result = backend.observer_write(request, deadline=time.monotonic() + 75)
-    lifecycle()._create_handoff({"name": "Owned real Tmux proof"}, result)
-    return result
 
+    def save():
+        path = output / "receipt.json"
+        path.write_text(json.dumps(receipt, indent=2) + "\n")
+        path.chmod(0o600)
 
-def stop_viewer():
-    control({"close": True})
-    time.sleep(0.8)
+    def records():
+        return registry.reconcile(target_id, desktop, desktop.windows())
 
+    def rc(record, *argv):
+        return subprocess.run(
+            kitty_control_command(registry.control_path(record.instance_id), list(argv)),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=4,
+        ).stdout
 
-try:
-    if MODE == "saved":
-        reference = json.loads((base / "claude-target.json").read_text())
-        rows = projected("claude", reference=reference)
-        assert (
-            len(rows) == 1
-            and rows[0]["inventory"] == "saved"
-            and rows[0]["runtime"]["value"] == "unknown"
+    def screen(record):
+        value = rc(record, "get-text")
+        path = output / (record.instance_id + ".screen.private")
+        path.write_text(value)
+        path.chmod(0o600)
+        return value
+
+    owned = []
+
+    def restore_ordinary_focus():
+        current = desktop.windows()
+        focused = next((window for window in current if window.focused), None)
+        markers = {record.marker for record in owned}
+        if focused is not None and focused.app_id not in markers:
+            return
+        if focus and any(
+            window.window_id == focus.window_id and window.pid == focus.pid for window in current
+        ):
+            run_json(
+                ["niri", "msg", "action", "focus-window", "--id", str(focus.window_id)], env=env
+            )
+
+    try:
+        first = actions.open_target(target, reference, request_id=uuid.uuid4().hex)
+        owned.append(first)
+        second_request = uuid.uuid4().hex
+        second = actions.open_target(target, reference, additional=True, request_id=second_request)
+        owned.append(second)
+        receipt["owned"] = [item.value for item in owned]
+        save()
+        live = wait(
+            records, lambda values: len(values) == 2 and all(v.state == "live" for v in values)
         )
-        before = len(writes)
-        lifecycle().open_or_create(rows[0])
-        wait_ui(5)
-        actual = handoffs[-1]["request"]["reference"]
-        matched = projected("claude", reference=actual)
-        assert len(matched) == 1 and matched[0]["worker"]["value"] == "present"
-        out["cases"]["claudeSavedResume"] = {
-            "status": "accepted",
-            "historyOnlyPreflight": True,
-            "actualFullReferenceResolved": True,
-            "copiedIdentity": actual != reference,
-            "publicWriteOnce": writes[before:] == [("snap", "prepare"), ("snap", "execute")],
-            "realTmuxNativeEntry": True,
+        receipt["owned"] = [item.value for item in live]
+        save()
+        restore_ordinary_focus()
+        for record in live:
+            returned_to_center = False
+
+            def ready(record=record):
+                nonlocal returned_to_center
+                value = screen(record)
+                if (
+                    args.provider == "codex"
+                    and "Back to Agent Command Center" in value
+                    and not returned_to_center
+                ):
+                    rc(record, "send-key", "Escape")
+                    returned_to_center = True
+                return value
+
+            wait(
+                ready,
+                lambda value: all(text in value for text in args.expected) and bool(value.strip()),
+            )
+        if args.fixture_script:
+            native_root = args.home.parent
+            command = ["python3", str(args.fixture_script), "observe", str(native_root)]
+            pin = first.value["transport"]
+            if pin["kind"] == "ssh":
+                command = [
+                    pin["sshExecutable"],
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=2",
+                    pin["route"],
+                    shlex.join(command),
+                ]
+            observed_fixture = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=True, timeout=10
+            )
+            receipt["ownedNativeDaemon"] = json.loads(observed_fixture.stdout)
+        receipt["checks"]["twoNativeManagersReady"] = True
+        replay = actions.open_target(target, reference, additional=True, request_id=second_request)
+        assert replay.instance_id == second.instance_id and len(records()) == 2
+        receipt["checks"]["additionalRequestReplayCoalesced"] = True
+        for record in live:
+            actions.focus_instance(target_id, record.instance_id)
+            window = desktop.match(desktop.windows(), record.marker, record.process("terminal"))
+            assert window is not None and window.focused
+            restore_ordinary_focus()
+        receipt["checks"]["exactWindowFocus"] = True
+        if args.exercise_client_state:
+            # Only the two synthetic fixture rows are eligible for controlled
+            # selection. Never type Return after a draft has been entered.
+            if args.provider == "codex":
+                assert len(args.expected) == 2
+
+                def selected_thread(value):
+                    matches = [
+                        name
+                        for line in value.splitlines()
+                        if line.lstrip().startswith("›")
+                        for name in args.expected
+                        if name in line
+                    ]
+                    return matches[0] if len(matches) == 1 else None
+
+                first_selection = selected_thread(screen(first))
+                assert first_selection is not None
+                second_selection = selected_thread(screen(second))
+                if second_selection == first_selection:
+                    rc(second, "send-key", "Down")
+                    value = wait(
+                        lambda: screen(second),
+                        lambda value: selected_thread(value) not in (None, first_selection),
+                    )
+                    second_selection = selected_thread(value)
+                assert second_selection is not None and second_selection != first_selection
+                assert selected_thread(screen(first)) == first_selection
+                selected_sessions = {
+                    first.instance_id: first_selection,
+                    second.instance_id: second_selection,
+                }
+                receipt["sessionSelections"] = selected_sessions
+                for record in live:
+                    rc(record, "send-key", "Enter")
+                for record in live:
+                    cwd_accepted = False
+
+                    def composer(record=record):
+                        nonlocal cwd_accepted
+                        value = screen(record)
+                        if "Working directory · resume" in value and not cwd_accepted:
+                            rc(record, "send-key", "Escape")
+                            cwd_accepted = True
+                        return value
+
+                    wait(
+                        composer,
+                        lambda value, record=record: (
+                            "? for shortcuts" in value
+                            and selected_sessions[record.instance_id] in value
+                            and all(
+                                name not in value
+                                for name in args.expected
+                                if name != selected_sessions[record.instance_id]
+                            )
+                        ),
+                    )
+            for index, record in enumerate(live):
+                window = desktop.match(desktop.windows(), record.marker, record.process("terminal"))
+                run_json(
+                    [
+                        "niri",
+                        "msg",
+                        "action",
+                        "set-window-width",
+                        "--id",
+                        str(window.window_id),
+                        str(800 + index * 400),
+                    ],
+                    env=env,
+                )
+
+            def sizes():
+                return [
+                    json.loads(rc(record, "ls"))[0]["tabs"][0]["windows"][0]["columns"]
+                    for record in live
+                ]
+
+            dimensions = wait(sizes, lambda values: values[0] != values[1])
+            receipt["checks"]["independentResize"] = dimensions
+            for index, record in enumerate(live):
+                rc(
+                    record,
+                    "send-text",
+                    "--bracketed-paste",
+                    "enable",
+                    "--",
+                    f"owned-unsent-draft-{index}",
+                )
+            for index, record in enumerate(live):
+                value = wait(
+                    lambda record=record: screen(record),
+                    lambda value, index=index: f"owned-unsent-draft-{index}" in value,
+                )
+                assert f"owned-unsent-draft-{1 - index}" not in value
+            for record in live:
+                actions.focus_instance(target_id, record.instance_id)
+                restore_ordinary_focus()
+            for index, record in enumerate(live):
+                assert f"owned-unsent-draft-{index}" in screen(record)
+            receipt["checks"]["independentUnsentDrafts"] = True
+            if args.provider == "codex":
+                receipt["checks"]["independentSessionSelection"] = True
+            save()
+        if args.disconnect_first:
+            assert first.value["transport"]["kind"] == "ssh"
+            current = next(item for item in records() if item.instance_id == first.instance_id)
+            client = current.process("client")
+            assert client is not None and client.alive()
+            descriptor = os.pidfd_open(client.pid)
+            try:
+                assert client.alive()
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            finally:
+                os.close(descriptor)
+        else:
+            rc(first, "close-window")
+        wait(
+            records, lambda values: len(values) == 1 and values[0].instance_id == second.instance_id
+        )
+        actions.focus_instance(target_id, second.instance_id)
+        restore_ordinary_focus()
+        survivor_screen = screen(second)
+        assert (
+            "owned-unsent-draft-1" in survivor_screen
+            if args.exercise_client_state
+            else all(text in survivor_screen for text in args.expected)
+        )
+        receipt["checks"]["independentExitAndSurvivorFocus"] = True
+        if args.disconnect_first:
+            time.sleep(1.5)
+            assert [item.instance_id for item in records()] == [second.instance_id]
+            previous = registry.find_request(target_id, first.value["requestId"])
+            assert previous.state in {"failed", "exited"}
+            receipt["checks"]["ownedSshDisconnectWithoutReplay"] = True
+        save()
+    finally:
+        cleanup_records = {record.instance_id: record for record in owned}
+        for record in registry.records(target_id):
+            cleanup_records[record.instance_id] = record
+        # A dispatch can fail after Kitty starts, before open_target returns.
+        # This registry was created exclusively for this proof, so its exact
+        # archived request records also belong to the cleanup set.
+        for path in (registry.target_directory(target_id) / "retired").glob("*.json"):
+            record = registry.find_request(target_id, path.stem)
+            if record is not None:
+                cleanup_records[record.instance_id] = record
+        for record in cleanup_records.values():
+            try:
+                rc(record, "close-window")
+            except (OSError, subprocess.SubprocessError):
+                pass
+        remaining = wait(records, lambda values: not values, timeout=10)
+        current = desktop.windows()
+        markers = {record.marker for record in cleanup_records.values()}
+        receipt["cleanup"] = {
+            "ownedClientsRemaining": len(remaining),
+            "ownedWindowsRemaining": sum(window.app_id in markers for window in current),
+            "ordinaryWindowIdsPreserved": {w.window_id for w in before}
+            <= {w.window_id for w in current},
         }
-        stop_viewer()
-    else:
-        for host in ("snap", "starship"):
-            old = {
-                json.dumps(row["observerIdentity"], sort_keys=True)
-                for row in projected("codex", host)
+        if focus and focus.window_id in {w.window_id for w in current}:
+            run_json(
+                ["niri", "msg", "action", "focus-window", "--id", str(focus.window_id)], env=env
+            )
+        save()
+        assert receipt["cleanup"]["ownedClientsRemaining"] == 0
+        assert receipt["cleanup"]["ownedWindowsRemaining"] == 0
+        assert receipt["cleanup"]["ordinaryWindowIdsPreserved"]
+    print(
+        json.dumps(
+            {
+                "receipt": str(output / "receipt.json"),
+                "checks": receipt["checks"],
+                "cleanup": receipt["cleanup"],
             }
-            before = len(writes)
-            result = new("codex", host)
-            wait_ui(6)
-            rows = [
-                row
-                for row in projected("codex", host)
-                if json.dumps(row["observerIdentity"], sort_keys=True) not in old
-                and row["runtime"]["value"] == "running"
-            ]
-            assert len(rows) == 1
-            reference = rows[0]["observerIdentity"]
-            out["cases"][host + "CodexNew"] = {
-                "status": "accepted",
-                "identityPendingBeforeEntry": result["identityPending"],
-                "actualFullReferenceResolved": True,
-                "publicWriteOnce": writes[before:] == [(host, "prepare"), (host, "execute")],
-                "realTmuxNativeEntry": True,
-                "realSsh": host == "starship",
-            }
-            control({"write": "Reply with OK.\r"})
-            time.sleep(1)
-            control({"write": "\r"})
-            wait_ui(12)
-            stop_viewer()
-            before = len(writes)
-            lifecycle().open_or_create(projected("codex", host, reference)[0])
-            wait_ui(5)
-            assert len(projected("codex", host, reference)) == 1
-            out["cases"][host + "CodexResume"] = {
-                "status": "accepted",
-                "sameFullReference": True,
-                "publicWriteOnce": writes[before:] == [(host, "prepare"), (host, "execute")],
-                "realTmuxNativeEntry": True,
-                "realSsh": host == "starship",
-            }
-            stop_viewer()
-        before = len(writes)
-        result = new("claude")
-        wait_ui(6)
-        reference = result["resultingIdentity"]
-        rows = projected("claude", reference=reference)
-        assert len(rows) == 1 and rows[0]["worker"]["value"] == "present"
-        (base / "claude-target.json").write_text(json.dumps(reference))
-        out["cases"]["claudeNew"] = {
-            "status": "accepted",
-            "effect": result["effect"],
-            "actualFullReferenceResolved": True,
-            "publicWriteOnce": writes[before:] == [("snap", "prepare"), ("snap", "execute")],
-            "realTmuxNativeEntry": True,
-            "privateTrustFixture": True,
-        }
-        control({"write": "Reply with OK.\r"})
-        time.sleep(1)
-        control({"write": "\r"})
-        deadline = time.monotonic() + 35
-        while time.monotonic() < deadline:
-            rows = projected("claude", reference=reference)
-            if (
-                rows
-                and rows[0]["phase"]["value"] == "waiting"
-                and rows[0]["outcome"]["value"] == "completed"
-            ):
-                break
-            time.sleep(0.4)
-        assert rows[0]["phase"]["value"] == "waiting" and rows[0]["outcome"]["value"] == "completed"
-        clock = rows[0]["phase"]["observedAt"]
-        time.sleep(1)
-        assert projected("claude", reference=reference)[0]["phase"]["observedAt"] == clock
-        stop_viewer()
-        before = len(writes)
-        lifecycle().open_or_create(projected("claude", reference=reference)[0])
-        wait_ui(5)
-        rows = projected("claude", reference=reference)
-        assert rows[0]["worker"]["value"] == "present"
-        out["cases"]["claudeLiveResume"] = {
-            "status": "accepted",
-            "sameFullReference": True,
-            "publicWriteOnce": writes[before:] == [("snap", "prepare"), ("snap", "execute")],
-            "realTmuxNativeEntry": True,
-            "phase": rows[0]["phase"]["value"],
-            "outcome": rows[0]["outcome"]["value"],
-            "nativePhaseClockPreserved": True,
-        }
-        stop_viewer()
-    assert out["cases"] and all(case["publicWriteOnce"] for case in out["cases"].values())
-    out["status"] = "accepted"
-except Exception as exc:
-    out["status"] = "pending"
-    out["reason"] = type(exc).__name__
-    if isinstance(exc, LifecycleError):
-        out["consumerReason"] = str(exc)[:240]
-finally:
-    (ROOT / ("real-consumer-" + MODE + ".json")).write_text(json.dumps(out, indent=2) + "\n")
-    print(json.dumps(out), flush=True)
-if out["status"] != "accepted":
-    raise SystemExit(1)
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

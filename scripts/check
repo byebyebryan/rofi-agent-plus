@@ -23,14 +23,15 @@ test -x scripts/check-contract-sync
 test -f README.md
 test -f LICENSE
 test -f pyproject.toml
-test -f examples/config.toml
+test -f examples/direct.toml
 test -f .github/workflows/ci.yml
-test -f rofi_agent_plus/contract_backend.py
-test -f rofi_agent_plus/contract_lifecycle.py
-test -f tests/test_contract_backend.py
-test -f tests/test_contract_lifecycle.py
-test -f tests/fixtures/contract/README.md
-test -f tests/fixtures/contract/lifecycle/README.md
+test -x bin/rofi-agent-plus-host
+test -x bin/rofi-agent-plus-viewer
+test -x scripts/direct-picker-proof
+test -f rofi_agent_plus/host.py
+test -f rofi_agent_plus/registry.py
+test -f tests/test_direct_host.py
+test -f tests/test_direct_ui.py
 
 # Check this gate itself even before the initial commit, then inspect every
 # tracked or candidate-untracked shell file.  The latter is deliberately based
@@ -106,9 +107,8 @@ root = Path.cwd()
 digest_pattern = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 repositories = {
     "host-mesh-v1": "https://github.com/byebyebryan/rofi-ssh-plus",
-    "tmux-session-v1": "https://github.com/byebyebryan/rofi-tmux-plus",
 }
-for contract in ("host-mesh-v1", "tmux-session-v1"):
+for contract in ("host-mesh-v1",):
     directory = root / "contracts" / contract
     manifest_path = directory / "SHA256SUMS"
     raw = manifest_path.read_bytes()
@@ -164,16 +164,11 @@ PY
 git diff --check
 git diff --cached --check
 
-if find . -type d -name __pycache__ -print -quit | grep -q .; then
+if find rofi_agent_plus tests bin scripts -type d -name __pycache__ -print -quit | grep -q .; then
     echo "unexpected __pycache__ directory" >&2
     exit 1
 fi
 
-python3 scripts/check-installed --self-test
-python3 scripts/check-public-contract --self-test
 python3 scripts/check-installed-artifact --self-test
-
-ruff check scripts/check-installed scripts/check-public-contract scripts/check-installed-artifact scripts/managed-selection-rollback
-ruff format --check scripts/check-installed scripts/check-public-contract scripts/check-installed-artifact scripts/managed-selection-rollback
-
-python3 scripts/check-installed --self-test --legacy-profile
+ruff check scripts/check-installed-artifact scripts/managed-selection-rollback scripts/native-fixture scripts/check-native-entry scripts/direct-window-proof scripts/direct-rofi-proof scripts/direct-picker-proof
+ruff format --check scripts/check-installed-artifact scripts/managed-selection-rollback scripts/native-fixture scripts/check-native-entry scripts/direct-window-proof scripts/direct-rofi-proof scripts/direct-picker-proof

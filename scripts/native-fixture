@@ -1,110 +1,170 @@
 #!/usr/bin/env python3
-"""Owned native-proof fixture; no ordinary session operations or provider payload logging."""
+"""Prepare and clean a same-host, private native home for explicit proofs."""
 
-import fcntl
+from __future__ import annotations
+
+import argparse
+import datetime as dt
 import hashlib
 import json
 import os
-import pty
-import select
+import pwd
+import re
 import shlex
 import shutil
-import signal
-import socket
-import struct
+import stat
 import subprocess
-import sys
-import termios
 import time
+import uuid
 from pathlib import Path
-
-OBSERVER = Path("/home/bryan/.local/share/agent-observer/0.2.0a3-6aa793e6a0ba5ae3")
-PLUS = Path("/home/bryan/.local/share/rofi-agent-plus/0.14.0a1-8ba19a0eba87944a")
-ORDINARY = Path("/home/bryan")
 
 
 def save(path, value):
-    path.write_text(json.dumps(value) + "\n")
+    path.write_text(json.dumps(value, indent=2) + "\n")
     path.chmod(0o600)
 
 
-def ticks(pid):
-    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+def private_root(root):
+    if not root.is_absolute() or root.resolve() != root:
+        raise RuntimeError("fixture_path_not_canonical")
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError("fixture_root_not_private")
+    manifest = json.loads((root / "fixture.json").read_text())
+    if manifest.get("root") != str(root) or manifest.get("uid") != os.getuid():
+        raise RuntimeError("fixture_ownership_changed")
+    return manifest
 
 
-def environment(root, host):
-    base = root / ("native-" + host)
-    return {
-        "HOME": str(base / "home"),
-        "CODEX_HOME": str(base / "codex"),
-        "CLAUDE_CONFIG_DIR": str(base / "claude"),
-        "TERM": "xterm-256color",
-        "COLORTERM": "truecolor",
-        "PATH": f"{root}/bin:{OBSERVER}/bin:{PLUS}/bin:{ORDINARY}/.local/bin:/usr/bin:/bin",
-        "XDG_CONFIG_HOME": str(base / "config"),
-        "XDG_CACHE_HOME": str(base / "cache"),
-        "XDG_STATE_HOME": str(base / "state"),
-        "XDG_RUNTIME_DIR": str(base / "runtime"),
-        "TMUX_TMPDIR": str(base / "runtime"),
-        "NATIVE_PROOF_ROOT": str(root),
-        "NATIVE_PROOF_HOST": host,
-    }
+def process(pid):
+    try:
+        path = Path(f"/proc/{pid}")
+        if path.stat().st_uid != os.getuid():
+            raise RuntimeError("process_owner_changed")
+        fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+        if fields[0] == "Z":
+            return None
+        return {
+            "pid": pid,
+            "ticks": fields[19],
+            "boot": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        }
+    except FileNotFoundError:
+        return None
 
 
-def prepare(root, host):
-    assert root.resolve() == root and root.stat().st_uid == os.getuid()
-    base = root / ("native-" + host)
-    base.mkdir(mode=0o700)
-    for name in (
-        "codex",
-        "claude",
-        "home",
-        "workspace",
-        "config",
-        "cache",
-        "state",
-        "runtime",
-        "terminals",
-    ):
-        (base / name).mkdir(mode=0o700)
-    (root / "bin").mkdir(mode=0o700)
-    source = Path(__file__).resolve()
-    if source != root / "native-fixture":
-        shutil.copyfile(source, root / "native-fixture")
-    for role in ("ssh", "systemd-run", "terminal"):
-        script = (
-            '#!/usr/bin/python3\nimport os,sys\nos.execv("/usr/bin/python3", ["python3", "-I", '
-            + repr(str(root / "native-fixture"))
-            + ", "
-            + repr(role)
-            + ", "
-            + repr(str(root))
-            + ", *sys.argv[1:]])\n"
+def env_for(root, provider):
+    env = dict(os.environ)
+    env.update(HOME=str(root / "user"), XDG_CACHE_HOME=str(root / "cache"))
+    env.pop("CODEX_PLUS_SOCKET", None)
+    env["CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"] = str(root / "native")
+    return env
+
+
+def ordinary_runtime(ordinary):
+    """Observe only the three declared ordinary homes, without a process scan."""
+    identities = {}
+    for home in (ordinary / ".codex", ordinary / ".codex-work"):
+        pidfile = home / "app-server-daemon/daemon.pid"
+        if pidfile.is_file():
+            identity = process(json.loads(pidfile.read_text())["pid"])
+            if identity:
+                identities[str(home)] = identity
+    if shutil.which("claude"):
+        env = dict(os.environ, HOME=str(ordinary), CLAUDE_CONFIG_DIR=str(ordinary / ".claude"))
+        result = subprocess.run(
+            ["claude", "daemon", "status"], env=env, capture_output=True, text=True, timeout=5
         )
-        path = root / "bin" / role
-        path.write_text(script)
-        path.chmod(0o700)
-    shutil.copyfile(ORDINARY / ".codex/auth.json", base / "codex/auth.json")
-    (base / "codex/auth.json").chmod(0o600)
-    config = (
-        'model = "gpt-6.1-sol"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n[features]\ndaemon_auto_start = true\n[projects.'
-        + json.dumps(str(base / "workspace"))
-        + ']\ntrust_level = "trusted"\n'
+        match = re.search(r"^pid:\s+(\d+)", result.stdout, re.M)
+        if match:
+            identity = process(int(match[1]))
+            if identity:
+                identities[str(ordinary / ".claude")] = identity
+    return identities
+
+
+def prepare(root, provider, label, helper, auth_home=None):
+    root = root.absolute()
+    if root.resolve() != root:
+        raise RuntimeError("fixture_path_not_canonical")
+    root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    info = root.lstat()
+    incarnation = (info.st_dev, info.st_ino)
+    try:
+        _prepare_new_root(root, provider, label, helper, auth_home)
+    except BaseException:
+        current = root.lstat()
+        if (current.st_dev, current.st_ino) == incarnation and not root.is_symlink():
+            shutil.rmtree(root)
+        raise
+
+
+def _prepare_new_root(root, provider, label, helper, auth_home=None):
+    ordinary = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    native = root / "native"
+    for name in ("native", "user", "cache", "workspace", "bin"):
+        (root / name).mkdir(mode=0o700)
+    source = auth_home or ordinary / (".codex" if provider == "codex" else ".claude")
+    auth = source / ("auth.json" if provider == "codex" else ".credentials.json")
+    version_result = subprocess.run(
+        [provider, "--version"], capture_output=True, text=True, timeout=5
     )
-    (base / "codex/config.toml").write_text(config)
-    version = "0.160.0-x86_64-unknown-linux-musl"
-    cache = base / "codex/packages/app-server-daemon"
-    cache.mkdir(parents=True)
-    shutil.copytree(
-        ORDINARY / ".codex/packages/app-server-daemon/releases" / version,
-        cache / "releases" / version,
-    )
-    (cache / "current").symlink_to("releases/" + version)
-    if host == "snap":
-        shutil.copyfile(ORDINARY / ".claude/.credentials.json", base / "claude/.credentials.json")
-        (base / "claude/.credentials.json").chmod(0o600)
-        original = json.loads((ORDINARY / ".claude.json").read_text())
-        private = {
+    version_match = re.search(r"[0-9]+\.[0-9]+\.[0-9]+", version_result.stdout)
+    version = version_match.group() if version_match else "unknown"
+    copied = []
+    if auth.is_file():
+        target = native / auth.name
+        shutil.copyfile(auth, target)
+        target.chmod(0o600)
+        copied.append(str(target.relative_to(root)))
+    if provider == "codex":
+        (native / "config.toml").write_text(
+            "[features]\ndaemon_auto_start = true\n[projects."
+            + json.dumps(str(root / "workspace"))
+            + ']\ntrust_level = "trusted"\n'
+        )
+        now = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        sessions = native / "sessions" / dt.datetime.now(dt.UTC).strftime("%Y/%m/%d")
+        sessions.mkdir(mode=0o700, parents=True)
+        for letter in ("A", "B"):
+            session = str(uuid.uuid4())
+            message = f"Owned {label} {letter}"
+            rows = [
+                {
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session,
+                        "timestamp": now,
+                        "cwd": str(root / "workspace"),
+                        "originator": "codex_cli_rs",
+                        "cli_version": version,
+                        "source": "cli",
+                        "model_provider": "openai",
+                    },
+                },
+                {
+                    "timestamp": now,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": message}],
+                    },
+                },
+                {
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": message, "images": []},
+                },
+            ]
+            path = sessions / ("rollout-" + now.replace(":", "-") + "-" + session + ".jsonl")
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            path.chmod(0o600)
+    else:
+        source_state = ordinary / ".claude.json"
+        original = json.loads(source_state.read_text()) if source_state.exists() else {}
+        selected = {
             key: original[key]
             for key in (
                 "oauthAccount",
@@ -116,311 +176,233 @@ def prepare(root, host):
             )
             if key in original
         }
-        private["projects"] = {
-            str(base / "workspace"): {
+        selected["projects"] = {
+            str(root / "workspace"): {
                 "hasTrustDialogAccepted": True,
                 "hasCompletedProjectOnboarding": True,
             }
         }
-        save(base / "home/.claude.json", private)
-        save(base / "claude/.claude.json", private)
+        save(native / ".claude.json", selected)
+        save(root / "user/.claude.json", selected)
         save(
-            base / "claude/settings.json",
-            {"disableAgentView": False, "disableAllHooks": True, "enabledPlugins": {}},
+            native / "settings.json",
+            {"disableAllHooks": True, "enabledPlugins": {}, "disableAgentView": False},
         )
-        for name in ("sessions", "jobs", "daemon"):
-            (base / "claude" / name).mkdir(mode=0o700)
-    subprocess.run(["git", "init", "-q", str(base / "workspace")], check=True)
-    for command in ("rofi-ssh-plus", "rofi-tmux-plus"):
-        directory = base / "config" / command
-        directory.mkdir()
-        if command == "rofi-ssh-plus":
-            config = (ORDINARY / ".config/rofi-ssh-plus/config.toml").read_text()
-            config = config.replace(
-                'executable = "ssh"', "executable = " + json.dumps(str(root / "bin/ssh"))
-            )
-        else:
-            config = (
-                "schema_version = 1\nterminal = ["
-                + json.dumps(str(root / "bin/terminal"))
-                + "]\nattach_timeout_seconds = 60\n"
-            )
-        (directory / "config.toml").write_text(config)
-    save(root / "fixture.json", {"root": str(root), "host": host, "prepared": True})
+    config = root / "direct.toml"
+    config.write_text(
+        "schema_version = 1\n[[environments]]\nprovider = "
+        + json.dumps(provider)
+        + "\nhome = "
+        + json.dumps(str(native))
+        + "\nlabel = "
+        + json.dumps("Owned " + label)
+        + "\n"
+    )
+    mesh_command = shutil.which("rofi-ssh-plus")
+    if mesh_command:
+        mesh_wrapper = root / "bin/rofi-ssh-plus"
+        mesh_wrapper.write_text(
+            "#!/bin/sh\nexport PATH="
+            + shlex.quote(str(root / "bin") + ":" + os.environ.get("PATH", ""))
+            + "\nexport HOME="
+            + shlex.quote(str(ordinary))
+            + "\nexec "
+            + shlex.quote(mesh_command)
+            + ' "$@"\n'
+        )
+        mesh_wrapper.chmod(0o700)
+    wrapper = root / "host-helper"
+    interpreter = helper.parent / "python"
+    helper_argv = (
+        [str(interpreter), "-I", "-B", str(helper)] if interpreter.is_file() else [str(helper)]
+    )
+    wrapper.write_text(
+        "#!/bin/sh\nexport PATH="
+        + shlex.quote(str(root / "bin") + ":" + os.environ.get("PATH", ""))
+        + "\nexport HOME="
+        + shlex.quote(str(root / "user"))
+        + "\nexport XDG_CONFIG_HOME="
+        + shlex.quote(str(ordinary / ".config"))
+        + "\nexport XDG_CACHE_HOME="
+        + shlex.quote(str(root / "cache"))
+        + "\nunset PYTHONPATH PYTHONHOME\nexec "
+        + shlex.join(helper_argv)
+        + ' "$@"\n'
+    )
+    wrapper.chmod(0o700)
+    tracked = [
+        ordinary / ".codex/config.toml",
+        ordinary / ".codex-work/config.toml",
+        ordinary / ".claude/settings.json",
+    ]
+    hashes = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        for path in tracked
+    }
+    global_state = ordinary / ".claude.json"
+    global_keys = (
+        {
+            key: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+            for key, value in json.loads(global_state.read_text()).items()
+        }
+        if global_state.exists()
+        else {}
+    )
+    manifest = {
+        "schemaVersion": 1,
+        "runId": uuid.uuid4().hex,
+        "root": str(root),
+        "uid": os.getuid(),
+        "provider": provider,
+        "version": version,
+        "label": label,
+        "credentials": copied,
+        "ordinaryHashes": hashes,
+        "ordinaryGlobalKeys": global_keys,
+        "ordinaryRuntime": ordinary_runtime(ordinary),
+        "processes": [],
+        "stopped": False,
+    }
+    save(root / "fixture.json", manifest)
     print(
         json.dumps(
-            {"privateStorePrepared": True, "hostScope": host, "ordinaryConfigChanged": False}
+            {
+                "prepared": str(root),
+                "provider": provider,
+                "credentialsCopied": bool(copied),
+                "helper": str(wrapper),
+            }
         )
     )
 
 
-def init(root, host):
-    anchor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    subprocess.run(["mount", "--make-rprivate", "/"], check=True)
-    subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=1777,size=1G", "tmpfs", "/tmp"], check=True)
-    root.mkdir(parents=True)
-    subprocess.run(
-        ["mount", "--no-canonicalize", "--bind", f"/proc/{os.getpid()}/fd/{anchor}", str(root)],
-        check=True,
+def observe(root):
+    state = private_root(root)
+    provider = state["provider"]
+    argv = (
+        ["codex", "app-server", "daemon", "version"]
+        if provider == "codex"
+        else ["claude", "daemon", "status"]
     )
-    os.close(anchor)
-    base = root / ("native-" + host)
-    mounts = [(base / "codex", ORDINARY / ".codex")]
-    if host == "snap":
-        mounts += [
-            (base / "claude", ORDINARY / ".claude"),
-            (base / "home/.claude.json", ORDINARY / ".claude.json"),
-        ]
-    for source, target in mounts:
-        subprocess.run(["mount", "--bind", str(source), str(target)], check=True)
-    save(
-        root / "ready.json",
-        {
-            "uid": os.getuid(),
-            "pid": os.getpid(),
-            "ordinaryProviderPathsMasked": True,
-            "privateTmp": True,
-        },
+    result = subprocess.run(
+        argv, env=env_for(root, provider), capture_output=True, timeout=8, text=True
     )
-    while True:
-        time.sleep(1)
-
-
-def start(root, host):
-    if root.resolve() != root or root.stat().st_uid != os.getuid():
-        raise RuntimeError("fixture_ownership_changed")
-    if (root / "runtime.json").exists():
-        previous = json.loads((root / "runtime.json").read_text())
-        if not previous.get("stopped"):
-            raise RuntimeError("fixture_must_be_stopped_before_restart")
-    (root / "ready.json").unlink(missing_ok=True)
-    child = subprocess.Popen(
-        [
-            "unshare",
-            "--user",
-            "--map-root-user",
-            "--mount",
-            "--pid",
-            "--fork",
-            "--mount-proc",
-            "/usr/bin/python3",
-            "-I",
-            str(root / "native-fixture"),
-            "init",
-            str(root),
-            host,
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if (root / "ready.json").exists():
-            pids = Path(f"/proc/{child.pid}/task/{child.pid}/children").read_text().split()
-            pid = int(pids[0])
-            save(
-                root / "runtime.json",
-                {
-                    "pid": pid,
-                    "ticks": ticks(pid),
-                    "namespaces": {
-                        name: os.readlink(f"/proc/{pid}/ns/{name}")
-                        for name in ("user", "mnt", "pid")
-                    },
-                    "host": host,
-                },
-            )
-            print(
-                json.dumps(
-                    {
-                        "isolationEstablished": json.loads((root / "ready.json").read_text()),
-                        "hostScope": host,
-                    }
-                )
-            )
-            return
-        if child.poll() is not None:
-            raise RuntimeError("namespace_failed")
-        time.sleep(0.1)
-    child.kill()
-    raise RuntimeError("namespace_timeout")
-
-
-def current(root):
-    if root.resolve() != root or root.stat().st_uid != os.getuid():
-        raise RuntimeError("fixture_ownership_changed")
-    state = json.loads((root / "runtime.json").read_text())
-    if state.get("stopped"):
-        raise RuntimeError("fixture_stopped")
-    pid = state["pid"]
-    if ticks(pid) != state["ticks"] or any(
-        os.readlink(f"/proc/{pid}/ns/{name}") != value
-        for name, value in state["namespaces"].items()
-    ):
-        raise RuntimeError("fixture_incarnation_changed")
+    pid = None
+    if provider == "codex":
+        path = root / "native/app-server-daemon/daemon.pid"
+        if path.is_file():
+            pid = json.loads(path.read_text()).get("pid")
+    else:
+        match = re.search(r"^pid:\s+(\d+)", result.stdout, re.M)
+        if match:
+            pid = int(match[1])
+    identity = process(pid) if isinstance(pid, int) else None
+    if identity:
+        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        expected = (
+            ("CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR")
+            + "="
+            + str(root / "native")
+        )
+        if expected.encode() not in environ:
+            raise RuntimeError("daemon_native_home_not_owned")
+        state["processes"] = [identity]
+    save(root / "fixture.json", state)
+    print(json.dumps({"ownedDaemon": identity, "nativeStatusExit": result.returncode}))
     return state
 
 
-def enter(root, argv):
-    state = current(root)
-    values = environment(root, state["host"])
-    clean = ["PYTHONPATH", "TMUX", "DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "WAYLAND_DISPLAY"]
-    env = ["env"]
-    for name in clean:
-        env += ["-u", name]
-    env += [key + "=" + value for key, value in values.items()]
-    os.execv(
-        "/usr/bin/nsenter",
-        [
-            "nsenter",
-            "--preserve-credentials",
-            "-t",
-            str(state["pid"]),
-            "-U",
-            "-m",
-            "-p",
-            "--",
-            *env,
-            *argv,
-        ],
+def cleanup(root):
+    state = private_root(root)
+    for identity in state["processes"]:
+        current = process(identity["pid"])
+        if current is not None and current != identity:
+            raise RuntimeError("fixture_incarnation_changed")
+    state = observe(root)
+    provider = state["provider"]
+    argv = (
+        ["codex", "app-server", "daemon", "stop"]
+        if provider == "codex"
+        else ["claude", "daemon", "stop", "--any"]
     )
-
-
-def ssh(root, argv):
-    mapping = json.loads((root / "peer.json").read_text())
-    # All proof SSH calls carry a final shell command. Preserve configured route
-    # and options; only wrap execution in the already owned peer namespace.
-    target = argv[-2]
-    if target != mapping["route"]:
-        raise RuntimeError("unexpected_proof_route")
-    remote = shlex.join(
-        [
-            "/usr/bin/python3",
-            "-I",
-            mapping["script"],
-            "enter",
-            mapping["root"],
-            "--",
-            "sh",
-            "-c",
-            argv[-1],
-        ]
-    )
-    os.execv(
-        "/usr/bin/ssh",
-        [
-            "ssh",
-            "-F",
-            str(ORDINARY / ".ssh/config"),
-            *mapping.get("resolvedSshOptions", []),
-            *argv[:-1],
-            remote,
-        ],
-    )
-
-
-def terminal(root, argv):
-    assert argv[0] == "-e"
-    base = root / ("native-" + os.environ["NATIVE_PROOF_HOST"])
-    key = hashlib.sha256(json.dumps(argv).encode()).hexdigest()[:24]
-    endpoint = base / "terminals" / (key + ".sock")
-    server = socket.socket(socket.AF_UNIX)
-    server.bind(str(endpoint))
-    server.listen(4)
-    server.setblocking(False)
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.execvp(argv[1], argv[1:])
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-    os.set_blocking(fd, False)
-    save(base / "terminals" / (key + ".json"), {"endpoint": str(endpoint), "argv": argv[1:]})
-    deadline = time.monotonic() + 480
-    try:
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([server, fd], [], [], 0.2)
-            if fd in ready:
-                try:
-                    data = os.read(fd, 65536)
-                except OSError:
-                    break
-                if not data:
-                    break
-                if b"\x1b[6n" in data:
-                    os.write(fd, b"\x1b[1;1R")
-                if b"\x1b[c" in data:
-                    os.write(fd, b"\x1b[?1;2c")
-            if server in ready:
-                connection, _ = server.accept()
-                request = json.loads(connection.recv(4096))
-                if "write" in request:
-                    os.write(fd, request["write"].encode())
-                connection.sendall(b"{}")
-                connection.close()
-                if request.get("close"):
-                    break
-    finally:
-        try:
-            os.kill(pid, signal.SIGHUP)
-            os.waitpid(pid, 0)
-        except ProcessLookupError:
-            pass
-        os.close(fd)
-        server.close()
-        endpoint.unlink(missing_ok=True)
-
-
-def control(root, request):
-    host = json.loads((root / "fixture.json").read_text())["host"]
-    base = root / ("native-" + host)
-    entries = sorted((base / "terminals").glob("*.json"), key=lambda p: p.stat().st_mtime_ns)
-    endpoint = json.loads(entries[-1].read_text())["endpoint"]
-    client = socket.socket(socket.AF_UNIX)
-    client.connect(endpoint)
-    client.sendall(json.dumps(request).encode())
-    client.recv(4096)
-    client.close()
-
-
-def stop(root):
-    state = current(root)
-    os.kill(state["pid"], signal.SIGKILL)
+    # Native scoped stop is allowed only for the unique prepared home. No PID
+    # signalling or whole-host daemon termination is ever used here.
+    result = subprocess.run(argv, env=env_for(root, provider), capture_output=True, timeout=20)
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if not Path(f"/proc/{state['pid']}/ns/pid").exists():
-            state["stopped"] = True
-            save(root / "runtime.json", state)
-            print(json.dumps({"ownedNamespaceStopped": True}))
-            return
-        time.sleep(0.05)
-    raise RuntimeError("owned_namespace_stop_timeout")
+    while (
+        any(process(item["pid"]) == item for item in state["processes"])
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.1)
+    if any(process(item["pid"]) == item for item in state["processes"]):
+        raise RuntimeError("owned_daemon_still_running")
+    for name in state["credentials"]:
+        path = root / name
+        if not path.is_relative_to(root / "native") or path.is_symlink():
+            raise RuntimeError("credential_cleanup_scope_changed")
+        path.unlink(missing_ok=True)
+    hashes = {
+        name: hashlib.sha256(Path(name).read_bytes()).hexdigest() if Path(name).is_file() else None
+        for name in state["ordinaryHashes"]
+    }
+    if hashes != state["ordinaryHashes"]:
+        raise RuntimeError("ordinary_configuration_changed")
+    ordinary = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if ordinary_runtime(ordinary) != state.get("ordinaryRuntime", {}):
+        raise RuntimeError("ordinary_daemon_generation_changed")
+    global_state = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".claude.json"
+    global_keys = (
+        {
+            key: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+            for key, value in json.loads(global_state.read_text()).items()
+        }
+        if global_state.exists()
+        else {}
+    )
+    baseline_keys = state.get("ordinaryGlobalKeys", {})
+    changed_keys = sorted(
+        key
+        for key in set(global_keys) | set(baseline_keys)
+        if global_keys.get(key) != baseline_keys.get(key)
+    )
+    if set(changed_keys) - {"promptQueueUseCount", "pluginUsage"}:
+        raise RuntimeError("ordinary_configuration_changed")
+    state.update(
+        stopped=True,
+        credentialsRemoved=True,
+        ordinaryConfigurationPreserved=True,
+        nativeStopExit=result.returncode,
+        concurrentRuntimeChanges=changed_keys,
+    )
+    save(root / "fixture.json", state)
+    print(
+        json.dumps(
+            {
+                "stopped": str(root),
+                "credentialsRemoved": True,
+                "ordinaryConfigurationPreserved": True,
+            }
+        )
+    )
 
 
 def main():
-    role, root, *args = sys.argv[1:]
-    root = Path(root)
-    if role == "prepare":
-        prepare(root, args[0])
-    elif role == "init":
-        init(root, args[0])
-    elif role == "start":
-        start(root, args[0])
-    elif role == "enter":
-        enter(root, args[1:] if args[0] == "--" else args)
-    elif role == "ssh":
-        ssh(root, args)
-    elif role == "systemd-run":
-        command = args[args.index("--") + 1 :]
-        os.execvp(command[0], command)
-    elif role == "terminal":
-        terminal(root, args)
-    elif role == "control":
-        control(root, json.loads(args[0]))
-    elif role == "stop":
-        stop(root)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("prepare", "observe", "cleanup"))
+    parser.add_argument("root", type=Path)
+    parser.add_argument("--provider", choices=("codex", "claude"))
+    parser.add_argument("--label", default="proof")
+    parser.add_argument("--helper", type=Path)
+    parser.add_argument("--auth-home", type=Path)
+    args = parser.parse_args()
+    if args.command == "prepare":
+        if args.provider is None or args.helper is None or not args.helper.is_absolute():
+            parser.error("prepare requires provider and absolute helper")
+        prepare(args.root, args.provider, args.label, args.helper, args.auth_home)
+    elif args.command == "observe":
+        observe(args.root)
     else:
-        raise RuntimeError("invalid_role")
+        cleanup(args.root)
 
 
 if __name__ == "__main__":

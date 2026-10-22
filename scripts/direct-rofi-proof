@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Owned Rofi wire/input proof with inert rows and zero provider actions."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import replace
+from pathlib import Path
+
+if not sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from rofi_agent_plus import __file__ as package_file  # noqa: E402
+from rofi_agent_plus.rofi import (  # noqa: E402
+    PickerRow,
+    PickerState,
+    _parse_state,
+    _render,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--callback", action="store_true")
+    args = parser.parse_args()
+    root = args.output.resolve()
+    if args.callback:
+        rows = tuple(
+            PickerRow(
+                "target",
+                "t:" + identifier * 64,
+                title,
+                title,
+                target_id=identifier * 64,
+                selectable=True,
+            )
+            for identifier, title in (("a", "First inert row"), ("b", "Second inert row"))
+        )
+        retv = int(os.environ["ROFI_RETV"])
+        with (root / "callbacks.jsonl").open("a") as stream:
+            stream.write(
+                json.dumps(
+                    {"retv": retv, "info": os.getenv("ROFI_INFO"), "package": str(package_file)}
+                )
+                + "\n"
+            )
+        if retv == 1:
+            return
+        state = (
+            _parse_state(os.getenv("ROFI_DATA"))
+            if retv
+            else PickerState(selected_key=rows[0].key, request_id="a" * 32)
+        )
+        if retv == 16:
+            state = replace(state, action="additional")
+        print(_render(rows, state, preserve=bool(retv), select=not retv), end="")
+        return
+    root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    callback = shlex.join(
+        [
+            sys.executable,
+            "-I" if sys.flags.isolated else "-B",
+            str(Path(__file__).resolve()),
+            str(root),
+            "--callback",
+        ]
+    )
+    wrapper = root / "callback"
+    wrapper.write_text("#!/bin/sh\nexec " + callback + "\n")
+    wrapper.chmod(0o700)
+    env = dict(os.environ, XDG_CACHE_HOME=str(root / "cache"))
+    process = subprocess.Popen(
+        [
+            "rofi",
+            "-no-config",
+            "-show",
+            "owned",
+            "-modes",
+            "owned:" + str(wrapper),
+            "-selected-row",
+            "0",
+            "-kb-custom-7",
+            "Tab",
+            "-kb-custom-8",
+            "ISO_Left_Tab",
+            "-kb-element-next",
+            "",
+            "-kb-element-prev",
+            "",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.5)
+        assert process.poll() is None
+        # This fresh modal window owns the keyboard grab. Its callbacks only
+        # return inert rows; Return can never launch an agent or submit a turn.
+        subprocess.run(["wtype", "Second"], env=env, check=True, capture_output=True)
+        time.sleep(2.5)
+        assert process.poll() is None, "Rofi closed during its idle snapshot"
+        subprocess.run(["wtype", "-k", "Tab"], env=env, check=True, capture_output=True)
+        time.sleep(0.3)
+        subprocess.run(["wtype", "-k", "Return"], env=env, check=True, capture_output=True)
+        _stdout, stderr = process.communicate(timeout=4)
+        (root / "rofi.log").write_bytes(_stdout + stderr)
+        assert process.returncode == 0, (
+            process.returncode,
+            (_stdout + stderr).decode(errors="replace")[-6000:],
+        )
+        events = [json.loads(line) for line in (root / "callbacks.jsonl").read_text().splitlines()]
+        assert [event["retv"] for event in events] == [0, 16, 1], events
+        accepted = [event for event in events if event["retv"] == 1]
+        assert len(accepted) == 1 and json.loads(accepted[0]["info"])["targetId"] == "b" * 64, (
+            events
+        )
+        receipt = {
+            "outcome": "pass",
+            "package": str(package_file),
+            "native": "Rofi with owned inert inventory",
+            "checks": {
+                "stableSnapshot": True,
+                "filterSurvivesActionChange": True,
+                "selectedIdentityPreserved": True,
+            },
+            "providerActions": 0,
+            "human": "pending",
+        }
+        (root / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        print(json.dumps(receipt))
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=4)
+
+
+if __name__ == "__main__":
+    main()

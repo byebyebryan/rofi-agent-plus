@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Source-checkout entry for the private direct-window foreground viewer."""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+sys.dont_write_bytecode = True
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from rofi_agent_plus.viewer import main  # noqa: E402
+
+raise SystemExit(main())

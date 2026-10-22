@@ -1,0 +1,1 @@
+{"expectedHostId":"snap","expectedUser":{"account":"bryan","uid":1000},"schemaVersion":1,"specRevision":"sha256:0000000000000000000000000000000000000000000000000000000000000000","targetKey":{"account":"bryan","home":"/home/bryan/.codex","hostId":"snap","provider":"codex","uid":1000}}
