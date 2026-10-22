@@ -638,7 +638,7 @@ class PickerCallbackTests(unittest.TestCase):
             self.assertIn('"selectedKey":"' + selected.key + '"', frame)
             self.assertIn("New window", frame)
             self.assertIn("a" * 32, frame)
-            self.assertIn(f"timeout {{ delay: {0.0 if complete else 0.2};", frame)
+            self.assertIn(f"timeout {{ delay: {0.0 if complete else 0.5};", frame)
             self.assertIn("Open · <span", frame)
             self.assertIn("[New window]</span>", frame)
             self.assertIn("Tab: Cycle actions", frame)
@@ -660,7 +660,7 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertIn(self.target.label, output.getvalue())
         self.assertNotIn("Refreshing host inventory", output.getvalue())
         self.assertIn("[Open]</span> · New window", output.getvalue())
-        self.assertIn("delay: 0.2", output.getvalue())
+        self.assertIn("delay: 0.5", output.getvalue())
         finish_refresh(refresh.env, "controlled failure")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -684,7 +684,7 @@ class PickerCallbackTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             run_rofi(env, context=context)
         self.assertIn("Refreshing host inventory", output.getvalue())
-        self.assertIn("delay: 0.2", output.getvalue())
+        self.assertIn("delay: 0.5", output.getvalue())
         context.cache.publish_host(host_result(self.inventory), mesh_revision=None)
         for retv in ("28", "10"):
             output = io.StringIO()
@@ -800,6 +800,73 @@ class PickerCallbackTests(unittest.TestCase):
             select=True,
         )
         self.assertIn("delay: 0.02", frame)
+
+    def test_changing_titles_cannot_restart_a_pending_selection_correction(self):
+        from rofi_agent_plus.rofi import _parse_state, _render
+
+        rows = build_rows(self.snapshot)
+        selected = rows[1]
+
+        def state_from(frame):
+            return _parse_state(
+                next(
+                    part.split("\x1f", 1)[1]
+                    for part in frame.replace("\x1e", "\n").splitlines()
+                    if part.startswith("\x00data\x1f")
+                )
+            )
+
+        state = state_from(
+            _render(
+                rows,
+                PickerState(selected_key=selected.key, request_id="a" * 32),
+                preserve=False,
+                select=True,
+            )
+        )
+        first_rows = (replace(rows[0], display="Live title 1", meta="Live title 1"), rows[1])
+        first = _render(first_rows, state, preserve=True, select=True)
+        self.assertTrue(state_from(first).restore_selection)
+        # The title changes on every callback, including the correction itself.
+        second_rows = (replace(rows[0], display="Live title 2", meta="Live title 2"), rows[1])
+        second = _render(second_rows, state_from(first), preserve=True, select=True)
+        self.assertFalse(state_from(second).restore_selection)
+        self.assertIn("new-selection\x1f1", second)
+        self.assertIn("delay: 0.0", second)
+        self.assertEqual(state_from(second).selected_key, selected.key)
+
+    def test_new_row_positions_during_correction_still_require_restoration(self):
+        from rofi_agent_plus.rofi import _parse_state, _render
+
+        rows = build_rows(self.snapshot)
+
+        def state_from(frame):
+            return _parse_state(
+                next(
+                    part.split("\x1f", 1)[1]
+                    for part in frame.replace("\x1e", "\n").splitlines()
+                    if part.startswith("\x00data\x1f")
+                )
+            )
+
+        state = state_from(
+            _render(
+                rows,
+                PickerState(selected_key=rows[1].key, request_id="a" * 32),
+                preserve=False,
+                select=True,
+            )
+        )
+        inserted = (rows[0], replace(rows[0], key="t:" + "e" * 64), rows[1])
+        first = _render(inserted, state, preserve=True, select=True)
+        more = (inserted[0], replace(rows[0], key="t:" + "f" * 64), *inserted[1:])
+        second = _render(more, state_from(first), preserve=True, select=True)
+        self.assertTrue(state_from(second).restore_selection)
+        self.assertNotIn("new-selection", second)
+        third = _render(more, state_from(second), preserve=True, select=True)
+        self.assertFalse(state_from(third).restore_selection)
+        self.assertIn("new-selection\x1f3", third)
+        self.assertIn("delay: 0.0", third)
 
     def test_action_bar_keeps_notices_below_the_hint_and_escapes_their_markup(self):
         from rofi_agent_plus.rofi import _render

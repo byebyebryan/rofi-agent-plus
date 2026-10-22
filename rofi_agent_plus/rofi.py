@@ -113,6 +113,7 @@ class PickerState:
     row_revision: str | None = None
     restore_selection: bool = False
     prefix_revision: str | None = None
+    position_revision: str | None = None
 
 
 @dataclass
@@ -485,6 +486,7 @@ def _state_json(state: PickerState) -> str:
         "rowRevision": state.row_revision,
         "restoreSelection": state.restore_selection,
         "prefixRevision": state.prefix_revision,
+        "positionRevision": state.position_revision,
     }
     encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_DATA_BYTES:
@@ -509,7 +511,9 @@ def _parse_state(raw: object) -> PickerState:
     if (
         not isinstance(value, dict)
         or not expected <= set(value)
-        or set(value) - expected - {"rowRevision", "restoreSelection", "prefixRevision"}
+        or set(value)
+        - expected
+        - {"rowRevision", "restoreSelection", "prefixRevision", "positionRevision"}
         or type(value.get("schemaVersion")) is not int
         or value["schemaVersion"] != 1
     ):
@@ -531,7 +535,10 @@ def _parse_state(raw: object) -> PickerState:
     prefix = value.get("prefixRevision")
     if not isinstance(prefix, str) or not _HEX_64.fullmatch(prefix):
         prefix = None
-    return PickerState(key, action, request_id, notice, revision, restore, prefix)
+    position = value.get("positionRevision")
+    if not isinstance(position, str) or not _HEX_64.fullmatch(position):
+        position = None
+    return PickerState(key, action, request_id, notice, revision, restore, prefix, position)
 
 
 def _local_view(context: PickerContext) -> tuple[tuple[Window, ...], str | None]:
@@ -591,19 +598,33 @@ def _render(
     prefix = hashlib.sha256(
         json.dumps(signatures[: index + 1] if index is not None else []).encode()
     ).hexdigest()
+    position = hashlib.sha256(
+        json.dumps(
+            [(row.key, row.selectable) for row in rows[: index + 1]] if index is not None else []
+        ).encode()
+    ).hexdigest()
     restore = (
         preserve
         and state.row_revision is not None
         and state.row_revision != revision
         and state.prefix_revision != prefix
         and index is not None
+        and (not state.restore_selection or state.position_revision != position)
     )
     # Rofi applies new-selection against the *previous* filtered line map.
     # After rows change, restore identity in one short follow-up once Rofi has
     # rebuilt that map. With native sorting disabled, unchanged rows through
     # the selection need no correction when later rows arrive or change.
+    # A correction must finish even when live titles keep changing. Only a
+    # further change to row positions/eligibility can restart that correction.
     # Explicit user actions still honor their current row.
-    state = replace(state, row_revision=revision, restore_selection=restore, prefix_revision=prefix)
+    state = replace(
+        state,
+        row_revision=revision,
+        restore_selection=restore,
+        prefix_revision=prefix,
+        position_revision=position,
+    )
     delay = 0.02 if restore else (POLL_SECONDS if polling else 0.0)
     headers = [
         _protocol("prompt", prompt),

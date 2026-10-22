@@ -15,7 +15,7 @@ from pathlib import Path
 from .registry import RegistryError, atomic_json, read_private_json
 
 STATUS_ENV = "ROFI_AGENT_PLUS_STARTUP_REFRESH"
-POLL_SECONDS = 0.2
+POLL_SECONDS = 0.5
 REFRESH_SECONDS = 30.0
 STOP_SECONDS = 2.0
 PENDING_MESSAGE = "Refreshing host inventory…"

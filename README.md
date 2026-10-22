@@ -182,6 +182,9 @@ silent whenever the list has a selectable target or window; progress appears
 only for an empty list, and failures remain visible. Native search retains the
 flat host/environment/window order. Selection correction runs only when rows
 through the selected row change, so later additions need no extra callback.
+Once a correction starts, changing titles cannot restart it; another change
+to row positions or eligibility can. Discovery checks run at most twice per
+second while pending, then stop.
 Fresh catalogs need no
 background work. Alt+R explicitly refreshes before redrawing, or joins an already
 pending startup refresh. The fleet deadline is 20 seconds, with
