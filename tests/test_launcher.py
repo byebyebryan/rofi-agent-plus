@@ -42,6 +42,13 @@ class FakeProcess:
 
 
 class LauncherTest(unittest.TestCase):
+    def setUp(self):
+        self.context = mock.Mock()
+        self.context.cache.load.return_value.is_stale.return_value = False
+        patcher = mock.patch.object(launcher, "build_context", return_value=self.context)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_default_bindings_select_flat_open_and_native_search(self):
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "rofi-agent-plus"
@@ -49,7 +56,7 @@ class LauncherTest(unittest.TestCase):
             rofi = FakeProcess()
             calls = []
 
-            def render(environment):
+            def render(environment, **_kwargs):
                 self.assertEqual("0", environment["ROFI_RETV"])
                 print("\x00new-selection\x1f1\nOne\x00info\x1f{}")
 
@@ -78,7 +85,7 @@ class LauncherTest(unittest.TestCase):
         frame = "\x00new-selection\x1f2\n\x00delim\x1f\\t\nOne\tTwo\t"
         rofi = FakeProcess((0,))
 
-        def render(environment):
+        def render(environment, **_kwargs):
             self.assertEqual("0", environment["ROFI_RETV"])
             self.assertNotIn("ROFI_DATA", environment)
             print(frame, end="")
@@ -119,7 +126,7 @@ class LauncherTest(unittest.TestCase):
         rofi = InterruptedProcess(values=())
         launched = []
 
-        def render(_environment):
+        def render(_environment, **_kwargs):
             print("frame")
 
         def launch(argv, **kwargs):
@@ -158,7 +165,7 @@ class LauncherTest(unittest.TestCase):
     def test_frame_or_rofi_failure_cleans_the_private_session_directory(self):
         frames: list[Path] = []
 
-        def render(environment):
+        def render(environment, **_kwargs):
             print("frame")
 
         def failure(_argv, *, env, **_kwargs):
@@ -175,6 +182,38 @@ class LauncherTest(unittest.TestCase):
         ):
             self.assertEqual(1, launcher.main(["-show", "agent-plus"]))
         self.assertFalse(frames[0].exists())
+
+    def test_stale_open_launches_rofi_before_refresh_and_cancels_owned_helper(self):
+        from rofi_agent_plus.startup_refresh import STATUS_ENV, read_status
+
+        self.context.cache.load.return_value.is_stale.return_value = True
+        rofi = FakeProcess()
+        worker = FakeProcess((None,))
+        calls = []
+
+        def render(environment, **kwargs):
+            self.assertIs(kwargs["context"], self.context)
+            self.assertTrue(read_status(environment).pending)
+            print("frame")
+
+        def launch(argv, *, env, **kwargs):
+            calls.append((argv, env, kwargs))
+            return rofi if argv[0] == "rofi" else worker
+
+        with (
+            mock.patch.object(
+                launcher, "_agent_executable", return_value=Path("/artifact/bin/agent")
+            ),
+            mock.patch.object(launcher, "run_rofi", side_effect=render),
+            mock.patch.object(launcher.subprocess, "Popen", side_effect=launch),
+        ):
+            self.assertEqual(0, launcher.main([]))
+        self.assertEqual(calls[0][0][0], "rofi")
+        self.assertEqual(calls[1][0], ["/artifact/bin/agent", "_direct-refresh"])
+        self.assertTrue(calls[1][2]["start_new_session"])
+        self.assertEqual(worker.signals, [signal.SIGTERM])
+        self.assertTrue(worker.waited)
+        self.assertFalse(Path(calls[0][1][STATUS_ENV]).exists())
 
     def test_app_reuses_the_prepared_first_frame_without_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:

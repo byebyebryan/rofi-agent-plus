@@ -571,7 +571,7 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertIn("Host inventory refreshed", output.getvalue())
         self.assertIn("new-selection\x1f0", output.getvalue())
 
-    def test_missing_catalog_is_refreshed_before_initial_frame(self):
+    def test_missing_catalog_renders_immediately_without_waiting_for_discovery(self):
         context, transport, _actions = self._context()
         context.cache = CacheStore(self.root / "cold-cache")
         transport.results = (host_result(self.inventory),)
@@ -581,9 +581,147 @@ class PickerCallbackTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, run_rofi({"ROFI_RETV": "0"}, context=context))
 
-        self.assertEqual(transport.calls, 1)
+        self.assertEqual(transport.calls, 0)
+        self.assertIn("No host catalog is available", output.getvalue())
+        self.assertIsNone(context.cache.load())
+
+    def test_expired_catalog_is_still_available_without_a_startup_probe(self):
+        context, transport, _actions = self._context()
+        stale = self.snapshot.to_json()
+        for host in stale["hosts"]:
+            for provider in host["providers"]:
+                provider["observedAt"] = 0
+                provider["lastCompleteAt"] = 0
+        context.cache.path.write_text(json.dumps(stale))
+        self.assertTrue(context.cache.load().is_stale())
+        output = io.StringIO()
+        import contextlib
+
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(0, run_rofi({"ROFI_RETV": "0"}, context=context))
+        self.assertEqual(transport.calls, 0)
         self.assertIn(self.target.label, output.getvalue())
-        self.assertIsNotNone(context.cache.load())
+        self.assertIn("Showing saved inventory", output.getvalue())
+
+    def test_startup_poll_preserves_selection_action_and_filter_then_disables_timeout(self):
+        import contextlib
+
+        from rofi_agent_plus.startup_refresh import STATUS_ENV, StartupRefresh, finish_refresh
+
+        context, transport, _actions = self._context()
+        directory = self.root / "launch"
+        directory.mkdir(mode=0o700)
+        refresh = StartupRefresh(directory, Path("/unused"), {})
+        rows = build_rows(self.snapshot)
+        selected = next(row for row in rows if row.target_id != self.target_id and row.selectable)
+        state = PickerState(
+            selected_key=f"t:{self.target_id}", action="additional", request_id="a" * 32
+        )
+        env = {
+            "ROFI_RETV": "28",
+            "ROFI_DATA": _state_json(state),
+            "ROFI_INFO": json.dumps(selected.info),
+            "ROFI_INPUT": "my filter",
+            STATUS_ENV: str(refresh.path),
+        }
+        for complete in (False, True):
+            if complete:
+                finish_refresh(env)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(0, run_rofi(env, context=context))
+            frame = output.getvalue()
+            self.assertIn("keep-filter\x1ftrue", frame)
+            self.assertIn("keep-selection\x1ftrue", frame)
+            self.assertIn("new-selection\x1f1", frame)
+            self.assertIn('"selectedKey":"' + selected.key + '"', frame)
+            self.assertIn("Open another window", frame)
+            self.assertIn("a" * 32, frame)
+            self.assertIn(f"timeout {{ delay: {0.0 if complete else 0.2};", frame)
+        self.assertEqual(transport.calls, 0)
+
+    def test_startup_poll_loads_newly_published_rows_and_alt_r_joins_pending_refresh(self):
+        import contextlib
+
+        from rofi_agent_plus.startup_refresh import STATUS_ENV, StartupRefresh, finish_refresh
+
+        context, transport, _actions = self._context()
+        context.cache = CacheStore(self.root / "empty")
+        directory = self.root / "launch"
+        directory.mkdir(mode=0o700)
+        refresh = StartupRefresh(directory, Path("/unused"), {})
+        env = {"ROFI_RETV": "0", STATUS_ENV: str(refresh.path)}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            run_rofi(env, context=context)
+        self.assertIn("Refreshing host inventory", output.getvalue())
+        self.assertIn("delay: 0.2", output.getvalue())
+        context.cache.publish_host(host_result(self.inventory), mesh_revision=None)
+        for retv in ("28", "10"):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                run_rofi(dict(env, ROFI_RETV=retv), context=context)
+            self.assertIn(self.target.label, output.getvalue())
+        self.assertEqual(transport.calls, 0)
+        finish_refresh(env, "offline test peer")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            run_rofi(dict(env, ROFI_RETV="28"), context=context)
+        self.assertIn("offline test peer", output.getvalue())
+        self.assertIn("delay: 0.0", output.getvalue())
+
+    def test_row_insertion_restores_identity_after_rofi_rebuilds_its_filtered_map(self):
+        from rofi_agent_plus.rofi import _parse_state, _render
+
+        rows = build_rows(self.snapshot)
+        selected = rows[1]
+        initial = _render(
+            rows,
+            PickerState(selected_key=selected.key, request_id="a" * 32),
+            preserve=False,
+            select=True,
+        )
+
+        def frame_state(frame):
+            return _parse_state(
+                next(
+                    part.split("\x1f", 1)[1]
+                    for part in frame.replace("\x1e", "\n").splitlines()
+                    if part.startswith("\x00data\x1f")
+                )
+            )
+
+        state = frame_state(initial)
+        inserted = (rows[0], replace(rows[0], key="t:" + "f" * 64), *rows[1:])
+        first = _render(inserted, state, preserve=True, select=True)
+        self.assertIn("delay: 0.02", first)
+        self.assertNotIn("new-selection", first)
+        self.assertTrue(frame_state(first).restore_selection)
+        context, transport, _actions = self._context()
+        # The interim native selection may point elsewhere. The automatic
+        # correction retains the original identity, never dispatching an action.
+        import contextlib
+        from unittest.mock import patch
+
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            patch("rofi_agent_plus.rofi.build_rows", return_value=inserted),
+        ):
+            run_rofi(
+                {
+                    "ROFI_RETV": "28",
+                    "ROFI_DATA": _state_json(frame_state(first)),
+                    "ROFI_INFO": json.dumps(rows[0].info),
+                },
+                context=context,
+            )
+        second = output.getvalue()
+        self.assertIn("new-selection\x1f2", second)
+        self.assertIn("delay: 0.0", second)
+        self.assertFalse(frame_state(second).restore_selection)
+        self.assertEqual(frame_state(second).selected_key, selected.key)
+        self.assertEqual(transport.calls, 0)
 
     def test_enter_replay_reuses_request_id_and_registry_dispatch(self):
         context, _transport, actions = self._context()

@@ -169,16 +169,22 @@ status. Open another window is the explicit action that creates another native
 client for that target. Normal terminal controls close it; the provider daemon
 and worker lifetime are independent.
 
-Opening the dialog uses a fresh cached catalog immediately. If the cache is
-missing or stale, the first frame waits for a bounded synchronous refresh;
-Alt+R does the same before redrawing. The fleet deadline is 20 seconds, with
+Opening the dialog immediately uses the saved catalog and current local windows.
+If the catalog is missing or stale, the launcher starts one background refresh
+after launching Rofi. The dialog reads published results while that refresh is
+pending, preserving the filter, selected row identity and chosen action. Redraw
+checks stop when the refresh finishes or its deadline expires. A new install
+shows discovery progress until its first targets arrive. Fresh catalogs need no
+background work. Alt+R explicitly refreshes before redrawing, or joins an already
+pending startup refresh. The fleet deadline is 20 seconds, with
 12 seconds per host and at most four concurrent host workers. Each host result
 publishes to the cache as it arrives, retaining valid siblings and last-known
 targets with their original observation times after partial failure; the
-picker redraws after that bounded refresh returns. A complete current inventory
+picker can show each result without waiting for slower peers. A complete current inventory
 may remove a missing target; registered windows remain listed from the private
-desktop registry. There is no periodic Rofi timeout or provider work on local
-redraws. Refresh subprocesses are cancelled when their dialog callback exits,
+desktop registry. Local redraws do not probe providers. The startup timeout only
+reads published state while one refresh is pending; there is no ongoing polling
+after completion. Unfinished startup probes are cancelled when the dialog exits,
 while accepted native windows outlive the picker.
 
 ## Identity and bounded resources
@@ -211,7 +217,7 @@ private and versioned; cache data is never launch authority.
 | Local catalog | 8 MiB, at most 256 host records |
 | Active registrations | 512 per target; terminal tombstones do not consume active capacity |
 | Picker callback state / first frame | 16 KiB / 16 MiB |
-| Startup/Alt+R catalog refresh / Niri request | 20 seconds / 1 second; refresh completes before redraw and there is no periodic timer |
+| Startup/Alt+R catalog refresh / Niri request | 20 seconds / 1 second; startup is asynchronous, Alt+R waits unless joining startup |
 
 ## Source, artifact and native checks
 

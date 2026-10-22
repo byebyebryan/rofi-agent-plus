@@ -16,6 +16,7 @@ from .desktop import DesktopError
 from .launcher import initial_frame
 from .process import passive_probe_signals
 from .rofi import PickerRow, _local_view, build_context, build_rows, clean_text, run_rofi
+from .startup_refresh import finish_refresh
 from .transport import TransportError
 
 DIAGNOSTIC_VERSION = 1
@@ -114,8 +115,10 @@ def diagnostic_main(argv: Sequence[str] | None = None) -> int:
         try:
             with passive_probe_signals():
                 context.cache.refresh(context.transport)
+            finish_refresh(os.environ)
             return 0
         except (CacheError, TransportError, OSError, ValueError) as error:
+            finish_refresh(os.environ, clean_text(error, limit=512))
             print(
                 f"rofi-agent-plus: direct refresh failed · {clean_text(error, limit=512)}",
                 file=sys.stderr,

@@ -13,8 +13,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .cache import CacheError
 from .process import passive_probe_signals
-from .rofi import run_rofi
+from .rofi import build_context, run_rofi
+from .startup_refresh import STATUS_ENV, StartupRefresh
 
 INITIAL_FRAME_ENV = "ROFI_AGENT_PLUS_INITIAL_FRAME"
 MAX_INITIAL_FRAME_BYTES = 16 * 1024 * 1024
@@ -129,8 +131,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         with TemporaryDirectory(prefix="rofi-agent-plus-launch-") as temporary:
             directory = Path(temporary)
             frame_path = directory / "initial-frame"
+            context = build_context(environment)
+            try:
+                snapshot = context.cache.load()
+            except CacheError:
+                snapshot = None
+            refresh = None
+            if snapshot is None or snapshot.is_stale(context.config.desktop.catalog_ttl_seconds):
+                refresh = StartupRefresh(directory, executable, environment)
+                environment[STATUS_ENV] = str(refresh.path)
             with passive_probe_signals(), redirect_stdout(output):
-                run_rofi(dict(environment, ROFI_RETV="0"))
+                run_rofi(dict(environment, ROFI_RETV="0"), context=context)
             frame = output.getvalue()
             if len(frame.encode("utf-8")) > MAX_INITIAL_FRAME_BYTES:
                 raise ValueError("initial picker frame is too large")
@@ -151,6 +162,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 env=environment,
             )
             try:
+                if refresh is not None:
+                    refresh.start()
                 return_code = rofi.wait()
                 return int(return_code) if return_code is not None else 1
             except KeyboardInterrupt:
@@ -158,6 +171,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 130
             finally:
                 _stop_rofi(rofi)
+                if refresh is not None:
+                    refresh.stop()
     except (OSError, ValueError) as error:
         print(f"rofi-agent-plus-rofi: {error}", file=sys.stderr)
         return 1

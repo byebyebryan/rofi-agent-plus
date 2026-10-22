@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -25,6 +26,7 @@ from .model import (
     parse_target,
 )
 from .registry import Instance, Registry, RegistryError, target_storage_key
+from .startup_refresh import POLL_SECONDS, read_status
 from .transport import Transport, TransportError
 from .view_preferences import ViewPreference, ViewPreferenceStore
 
@@ -108,6 +110,8 @@ class PickerState:
     action: str = ACTION_OPEN
     request_id: str = ""
     notice: str = ""
+    row_revision: str | None = None
+    restore_selection: bool = False
 
 
 @dataclass
@@ -477,6 +481,8 @@ def _state_json(state: PickerState) -> str:
         "action": state.action,
         "requestId": state.request_id,
         "notice": clean_text(state.notice, limit=MAX_MESSAGE_LENGTH),
+        "rowRevision": state.row_revision,
+        "restoreSelection": state.restore_selection,
     }
     encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_DATA_BYTES:
@@ -500,7 +506,8 @@ def _parse_state(raw: object) -> PickerState:
     }
     if (
         not isinstance(value, dict)
-        or set(value) != expected
+        or not expected <= set(value)
+        or set(value) - expected - {"rowRevision", "restoreSelection"}
         or type(value.get("schemaVersion")) is not int
         or value["schemaVersion"] != 1
     ):
@@ -515,7 +522,11 @@ def _parse_state(raw: object) -> PickerState:
     if not isinstance(request_id, str) or not _HEX_32.fullmatch(request_id):
         request_id = uuid.uuid4().hex
     notice = clean_text(value.get("notice", ""), limit=MAX_MESSAGE_LENGTH)
-    return PickerState(key, action, request_id, notice)
+    revision = value.get("rowRevision")
+    if not isinstance(revision, str) or not _HEX_64.fullmatch(revision):
+        revision = None
+    restore = value.get("restoreSelection") is True and revision is not None
+    return PickerState(key, action, request_id, notice, revision, restore)
 
 
 def _local_view(context: PickerContext) -> tuple[tuple[Window, ...], str | None]:
@@ -547,9 +558,28 @@ def _selected_index(rows: tuple[PickerRow, ...], key: str | None) -> int | None:
 
 
 def _render(
-    rows: tuple[PickerRow, ...], state: PickerState, *, preserve: bool, select: bool
+    rows: tuple[PickerRow, ...],
+    state: PickerState,
+    *,
+    preserve: bool,
+    select: bool,
+    polling: bool = False,
 ) -> str:
     prompt = "Open another window" if state.action == ACTION_ADDITIONAL else "Open"
+    revision = hashlib.sha256(
+        json.dumps([(row.key, row.selectable) for row in rows]).encode()
+    ).hexdigest()
+    restore = (
+        preserve
+        and state.row_revision is not None
+        and state.row_revision != revision
+        and _selected_index(rows, state.selected_key) is not None
+    )
+    # Rofi applies new-selection against the *previous* filtered line map.
+    # After rows change, restore identity in one short follow-up once Rofi has
+    # rebuilt that map. Explicit user actions still honor their current row.
+    state = replace(state, row_revision=revision, restore_selection=restore)
+    delay = 0.02 if restore else (POLL_SECONDS if polling else 0.0)
     headers = [
         _protocol("prompt", prompt),
         # Rofi suppresses hotkeys when a filter has no selected row if this is
@@ -557,7 +587,10 @@ def _render(
         _protocol("no-custom", "false"),
         _protocol("use-hot-keys", "true"),
         _protocol("markup-rows", "true"),
-        _protocol("theme", 'configuration { timeout { delay: 0.0; action: "kb-custom-19"; } }'),
+        _protocol(
+            "theme",
+            f'configuration {{ timeout {{ delay: {delay}; action: "kb-custom-19"; }} }}',
+        ),
         _protocol("data", _state_json(state)),
         # Rofi reads retention flags from the preceding frame, including the
         # first timeout or Tab callback after opening.
@@ -566,7 +599,7 @@ def _render(
     ]
     if state.notice:
         headers.append(_protocol("message", clean_text(state.notice, limit=MAX_MESSAGE_LENGTH)))
-    if select:
+    if select and not restore:
         index = _selected_index(rows, state.selected_key)
         if index is not None:
             headers.append(_protocol("new-selection", index))
@@ -688,16 +721,19 @@ def run_rofi(
         retv = int(env.get("ROFI_RETV", "0"))
     except (TypeError, ValueError):
         retv = 0
+    refresh = read_status(env)
+    polling = refresh is not None and refresh.pending
 
     if retv == 0:
         state = PickerState(request_id=uuid.uuid4().hex)
         saved = context.preferences.load()
         snapshot, cache_error = _load_snapshot(context)
-        if snapshot is None or snapshot.is_stale(context.config.desktop.catalog_ttl_seconds):
-            snapshot, refresh_error = _refresh(context)
-            state = replace(state, notice=refresh_error or "")
-        else:
-            state = replace(state, notice=cache_error or "")
+        notice = cache_error or ""
+        if refresh is not None:
+            notice = notice or refresh.message
+        elif snapshot is not None and snapshot.is_stale(context.config.desktop.catalog_ttl_seconds):
+            notice = notice or "Showing saved inventory; use Alt+R to refresh"
+        state = replace(state, notice=notice)
         windows, window_error = _local_view(context)
         rows = build_rows(
             snapshot,
@@ -713,7 +749,7 @@ def run_rofi(
         preferred = _preferred_key(saved, rows)
         default_key = next((row.key for row in rows if row.selectable), None)
         state = replace(state, selected_key=preferred or default_key)
-        print(_render(rows, state, preserve=False, select=True), end="")
+        print(_render(rows, state, preserve=False, select=True, polling=polling), end="")
         return 0
 
     state = _parse_state(env.get("ROFI_DATA"))
@@ -721,7 +757,8 @@ def run_rofi(
     notice = state.notice or cache_error or ""
     raw_info = _parse_info(env.get("ROFI_INFO"))
     selected_key: str | None = state.selected_key
-    if raw_info is not None:
+    restoring = retv == ROFI_RETV_CUSTOM_19 and state.restore_selection
+    if raw_info is not None and not restoring:
         selected_key = (
             f"t:{raw_info['targetId']}"
             if raw_info["kind"] == "target"
@@ -731,17 +768,19 @@ def run_rofi(
     did_action = False
 
     if retv == ROFI_RETV_CUSTOM_1:
-        snapshot, refresh_error = _refresh(context)
+        refresh_error = None
+        if not polling:
+            snapshot, refresh_error = _refresh(context)
         state = replace(
             state,
-            notice=refresh_error or "Host inventory refreshed",
+            notice=refresh.message if polling else (refresh_error or "Host inventory refreshed"),
         )
     elif retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
         action = ACTION_ADDITIONAL if state.action == ACTION_OPEN else ACTION_OPEN
         state = replace(state, action=action, request_id=uuid.uuid4().hex, notice="")
     elif retv == ROFI_RETV_CUSTOM_19:
-        # Migration-only callback: no timeout refresh or automatic host probe.
-        pass
+        # Only read published cache/status; polling never starts another probe.
+        state = replace(state, notice=refresh.message if refresh is not None else "")
     elif retv == ROFI_RETV_SELECTED:
         if raw_info is None:
             state = replace(
@@ -759,7 +798,9 @@ def run_rofi(
             )
             row = _row_for_info(rows, raw_info)
             if row is None:
-                snapshot, refresh_error = _refresh(context)
+                refresh_error = None
+                if not polling:
+                    snapshot, refresh_error = _refresh(context)
                 state = replace(
                     state,
                     notice=refresh_error
@@ -808,6 +849,7 @@ def run_rofi(
     select = (
         retv in {ROFI_RETV_CUSTOM_1, ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8, ROFI_RETV_SELECTED}
         or raw_info is not None
+        or restoring
     )
-    print(_render(rows, state, preserve=True, select=select), end="")
+    print(_render(rows, state, preserve=True, select=select, polling=polling), end="")
     return 0
