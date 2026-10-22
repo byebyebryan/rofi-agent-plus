@@ -72,6 +72,15 @@ def clean_text(value: object, *, limit: int = 4096) -> str:
     return " ".join(clean.split())[:limit]
 
 
+def clean_window_title(value: object) -> str:
+    """Drop leading native spinner/status icons from display and search text."""
+
+    title = clean_text(value, limit=1024)
+    while title and (unicodedata.category(title[0]) == "So" or title[0] in "\ufe0e\ufe0f"):
+        title = title[1:].lstrip()
+    return title
+
+
 def _protocol(name: str, value: object) -> str:
     return f"\x00{name}\x1f{value}"
 
@@ -369,7 +378,7 @@ def build_rows(
                         except DesktopError:
                             window = None
                         if window is not None:
-                            title = clean_text(window.title, limit=1024)
+                            title = clean_window_title(window.title)
                     if record.state == "live":
                         detail = f"Window {number}" + (f" · {title}" if title else "")
                         kind = "instance"

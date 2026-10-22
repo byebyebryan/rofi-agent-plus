@@ -182,7 +182,8 @@ usable rows appear, the refresh finishes, or its deadline expires. Refreshing is
 silent whenever the list has a selectable target or window; progress appears
 only for an empty list, and failures remain visible. Native search retains the
 flat host/environment/window order. Window titles are sampled once per open
-picker, including their search text; reopening samples them again. Animated
+picker, including their search text; reopening samples them again. Leading
+spinner/status icons are omitted from the displayed and searchable title. Animated
 native titles therefore cannot start repeated selection corrections during
 discovery. Window presence and action validation still use current identities.
 Selection correction runs only when rows
