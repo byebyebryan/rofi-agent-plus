@@ -1,9 +1,0 @@
-{
-  "status": "accepted",
-  "actualSshDisconnected": true,
-  "disconnectScope": "one_owned_read_only_ssh_process",
-  "freshSshReconnected": true,
-  "ownedNamespaceStillLive": true,
-  "providerWriteDispatched": false,
-  "nativeUncertainWriteCase": "controlled_evidence_only"
-}

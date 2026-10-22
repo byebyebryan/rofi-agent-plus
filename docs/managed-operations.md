@@ -47,9 +47,9 @@ scoped chezmoi apply. Preserve an immutable prefix while any direct TUI wrapper
 still uses it. Changing picker selection never closes terminals or stops native
 provider work.
 
-The older [managed-native-selection.json](../artifacts/managed-native-selection.json)
-and three-selector `managed-selection-rollback` tool describe the retired
-Observer/Tmux artifact only. They do not qualify or fully roll back this direct
-trial's additional helper/configuration/binding targets. The
-[candidate execution record](direct-tui-candidate-20261021.md) preserves its
-source, wheel and native evidence boundaries.
+The retired Observer/Tmux manifest, three-selector rollback tool and unused
+fixtures have been removed from the current source tree. Their Git checkpoint
+and recovery instructions are in [legacy retirement](legacy-retirement.md).
+Use the captured direct-trial targets above for current rollback. The
+[candidate execution record](direct-tui-candidate-20261021.md) preserves the
+direct artifact's source, wheel and native evidence boundaries.

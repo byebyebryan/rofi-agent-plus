@@ -274,11 +274,8 @@ class ContractBundleTest(unittest.TestCase):
                 expected = {
                     path.relative_to(directory / "fixtures").as_posix()
                     for path in (directory / "fixtures").rglob("*")
-                    # Host Mesh's README is bundle documentation rather than
-                    # a fixture; Tmux indexes its analogous file explicitly.
-                    if path.is_file()
-                    and path.name != "index.json"
-                    and (name == "tmux-session-v1" or path.name != "README.md")
+                    # The README documents the Host Mesh bundle; it is not a fixture.
+                    if path.is_file() and path.name not in {"index.json", "README.md"}
                 }
                 self.assertEqual(expected, set(references))
                 self.assertEqual(len(expected), len(references))

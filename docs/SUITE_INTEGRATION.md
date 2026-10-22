@@ -121,16 +121,20 @@ not row text or search input. Redraw keeps the filter, action and selected
 identity when possible. Each new dialog opens with empty search and Open
 selected, restoring the last successful instance/target if still present.
 
-The first frame uses the launcher's supported `-selected-row` option. A fresh
-cached catalog renders immediately; missing or expired data triggers a bounded
-synchronous refresh before the first frame. Alt+R performs the same refresh
-before redrawing. The fleet deadline is 20 seconds, each host is bounded to 12
-seconds, and at most four host workers run concurrently. Host results publish
-to cache as they complete, but the picker redraws after the fleet callback
-returns. There is no periodic Rofi timer; ordinary redraws read only local
-Niri, registry/process and cache state. Closing a dialog callback cancels its
-passive probes; detached TUI viewers live until their native client exits.
-Mosh, Ghostty, manual TUI adoption and a persistent watcher are not supported.
+The first frame uses the launcher's supported `-selected-row` option and renders
+the saved catalog and current local windows immediately. Missing or stale
+catalog data starts one dialog-owned background refresh. Rofi reads published
+results only while that refresh is pending, preserving search, selected
+identity and action. Refresh progress is quiet whenever a selectable row is
+available; failures remain visible. Checks stop at completion or timeout.
+Alt+R refreshes explicitly, or joins the pending startup refresh.
+
+The fleet deadline is 20 seconds, each host is bounded to 12 seconds, and at
+most four host workers run concurrently. Host results publish and redraw as
+they complete. Ordinary redraws read only local Niri, registry/process and
+cache state; no watcher remains after discovery. Closing the dialog cancels
+unfinished passive probes, while accepted native TUI windows outlive it.
+Mosh, Ghostty and manual TUI adoption remain unsupported.
 
 ## Configuration and private state
 
@@ -173,7 +177,7 @@ record.
 | Config file / declarations | 256 KiB / 128 entries; selector path 4096 characters; label 256 characters |
 | Active runtime records | 512 per target; request and tombstone lookup is exact and bounded |
 | Rofi callback state / initial frame | 16 KiB / 16 MiB |
-| Catalog refresh / compositor request | 20 seconds / 1 second; catalog refresh is synchronous and there is no periodic Rofi timer |
+| Catalog refresh / compositor request | 20 seconds / 1 second; startup refresh is asynchronous, Alt+R waits unless joining startup |
 
 These bounds limit work and parsing; an interactive native manager or SSH
 authentication prompt is intentionally not given an inventory timeout.
@@ -276,8 +280,8 @@ The candidate report records the actual artifact digest, host/helper paths,
 per-case receipts, cleanup, and remaining gates. Final human keyboard/visual
 judgment, managed desktop selection, publication and rollout remain separate.
 
-**Historical evidence only:** the [0.14.0a1 installed operational proof](native-operational-proof.md)
-and [Observer v2 consumer execution record](observer-v2-execution.md) document
-the former Observer/Tmux conversation-picker artifact. They do not test or
-qualify this direct-window implementation. The [immutable release ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md#agent-plus-121-viewer-timer-across-view-changes)
+Historical Observer/Tmux operational proofs and experiment records have been
+retired from the current tree. [Legacy retirement](legacy-retirement.md) records
+their Git checkpoint and how to retrieve them. They do not qualify this
+direct-window implementation. The [immutable release ledger](https://github.com/byebyebryan/dotfiles/blob/5ff8b412a45b69cac64b8eb356444e6cf0705012/docs/rofi-plus-status.md#agent-plus-121-viewer-timer-across-view-changes)
 is historical as well.

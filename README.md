@@ -281,5 +281,6 @@ an owned local fixture and a controlled local Mesh.
 
 Human visual/input judgment, managed desktop selection, publication and rollout
 are separate gates. Historical evidence for the retired Observer/Tmux picker is
-clearly scoped in [the historical operational proof](docs/native-operational-proof.md);
-it does not qualify this direct-window runtime.
+available from the Git checkpoint recorded in
+[legacy retirement](docs/legacy-retirement.md). It does not qualify this
+direct-window runtime.
