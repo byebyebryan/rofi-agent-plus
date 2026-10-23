@@ -19,7 +19,9 @@ ENTRY_COMMAND = ("agents",)
 _MISSING_ENDPOINT = re.compile(
     r"(?:socket|daemon endpoint|connect(?:ion)? to .*daemon).*"
     r"(?:no such file or directory)"
-    r"|no daemon(?: is)? running",
+    r"|no daemon(?: is)? running"
+    r"|failed to connect to [^\r\n]*/(?:app-server-control|app-server-daemon)/[^\r\n]*[.]sock\r?\n"
+    r"\s*Caused by:\s*No such file or directory(?: \(os error 2\))?(?:\s|$)",
     re.IGNORECASE,
 )
 

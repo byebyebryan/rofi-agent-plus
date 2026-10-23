@@ -145,6 +145,28 @@ class DirectHostTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_codex_multiline_missing_control_socket_is_stopped(self) -> None:
+        message = (
+            b"Error: failed to connect to /home/bryan/.codex/"
+            b"app-server-control/app-server-control.sock\n\nCaused by:\n    "
+        )
+        cases = [
+            (message + b"No such file or directory (os error 2)\n", "stopped"),
+            (message + b"Permission denied (os error 13)\n", "unknown"),
+            (message + b"Connection refused (os error 111)\n", "unknown"),
+            (
+                message.replace(b"app-server-control/", b"unrelated/")
+                + b"No such file or directory (os error 2)\n",
+                "unknown",
+            ),
+        ]
+        for diagnostic, expected in cases:
+            with self.subTest(diagnostic=diagnostic):
+                observation = codex.daemon_observation(
+                    ProcessResult(("codex",), 1, b"", diagnostic)
+                )
+                self.assertEqual(observation.status, expected)
+
     def test_native_status_requires_recognized_positive_evidence(self) -> None:
         current_codex = {"status": "running", "backend": "pid", "appServerVersion": "0.163.0"}
         self.assertEqual(
