@@ -22,3 +22,6 @@ the previous conversation/Observer/Tmux implementation.
 Current behavior comes from the guides above and the source. The
 [managed selection](../artifacts/managed-direct-selection.json) identifies an
 immutable deployed artifact; a documentation commit does not replace it.
+
+The [removed-host row correction](removed-host-rows.md) records the a15
+source, installed-artifact and managed-fleet acceptance.
