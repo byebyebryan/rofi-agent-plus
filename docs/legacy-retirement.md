@@ -32,12 +32,12 @@ all owned direct targets as described in [managed operations](managed-operations
 
 ## Managed installations
 
-Snap and Starship use the immutable direct wheel selected by
+Snap, Starship and Carbon use the immutable direct wheel selected by
 [managed-direct-selection.json](../artifacts/managed-direct-selection.json).
 Chezmoi no longer declares the old picker archive or manages its legacy
 `config.toml` on those hosts. Existing archived trees, versioned prefixes,
-deployment preimages and running native clients are retained. Carbon keeps its
-previous archive/configuration and has no Mod+A binding.
+deployment preimages and running native clients are retained. Carbon now selects
+the same direct helper, configuration and Mod+A binding.
 
 The October 2026 retirement changed source support files and management policy.
 It preserved installed direct package bytes and existing native clients.

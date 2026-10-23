@@ -3,7 +3,8 @@
   "selection": "local_direct_tui_trial",
   "hosts": [
     "snap",
-    "starship"
+    "starship",
+    "carbon"
   ],
   "version": "0.15.0a13",
   "wheel": "rofi_agent_plus-0.15.0a13-py3-none-any.whl",

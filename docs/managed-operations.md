@@ -4,7 +4,8 @@ This guide describes the repository owner's chezmoi-managed fleet. The
 selected immutable wheel, version, digest and hosts are recorded in
 [managed-direct-selection.json](../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
-Carbon retains its historical artifact and has no Agent Plus desktop binding.
+Snap, Starship and Carbon select this build. Carbon discovers its native default
+without extra profile declarations; retired artifacts remain available for rollback.
 
 The wheel is staged on each selected host under
 `~/.local/share/rofi-agent-plus/artifacts/<wheel-sha256>/`. The managed
@@ -36,8 +37,8 @@ scripts/check-installed-artifact --candidate-prefix "$PREFIX" \
 
 Check local and SSH inventory, canonical Default/Work homes, the four selected
 entrypoints and Mod+A independently. Passive checks open no native manager.
-Any disruptive GUI testing belongs on unattended Snap; Starship is reserved
-for the user's own trial. Human input/visual judgment remains separate from
+Any disruptive GUI testing belongs on unattended Snap; Starship and Carbon are
+reserved for the user's own trial. Human input/visual judgment remains separate from
 package and passive inventory checks.
 
 Before applying, capture the selected links, direct configuration, active binds
