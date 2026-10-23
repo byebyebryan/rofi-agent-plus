@@ -124,6 +124,8 @@ rofi-agent-plus-host inventory --json
 Both commands perform bounded passive discovery without opening a native TUI.
 The diagnostic separates installation, daemon observations, freshness and local
 window presence. An unreachable host retains last-known targets with errors.
+Removed peers contribute no cached environment or warning rows; existing
+registered windows remain available without granting a new host route.
 
 Read the [architecture](docs/architecture.md),
 [development and validation guide](docs/development.md), and

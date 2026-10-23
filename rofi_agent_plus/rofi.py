@@ -299,15 +299,18 @@ def build_rows(
     host_order: list[str] = []
     host_display: dict[str, str] = {}
     if snapshot is not None:
-        host_order = [host.host_id for host in snapshot.hosts]
+        host_order = [host.host_id for host in snapshot.hosts if host.status != "removed"]
         host_display = {host.host_id: host.display for host in snapshot.hosts}
         for host in snapshot.hosts:
+            # Removed peers contribute no cached targets or provider warnings.
+            # Registered windows are added independently below.
+            if host.status == "removed":
+                continue
             targets.update(_provider_targets(host))
-            if host.status in {"partial", "error", "removed"}:
+            if host.status in {"partial", "error"}:
                 suffix = {
                     "partial": "inventory partial",
                     "error": "inventory unavailable; showing last-known targets",
-                    "removed": "not in current Host Mesh; showing registered windows",
                 }[host.status]
                 rows.append(_status_row(f"{host.display} · {suffix}", host.host_id))
             for provider in host.providers:
@@ -328,6 +331,15 @@ def build_rows(
             if target.key.host_id not in host_order:
                 host_order.append(target.key.host_id)
                 host_display.setdefault(target.key.host_id, target.key.host_id)
+    if snapshot is not None:
+        for host in snapshot.hosts:
+            if host.status == "removed" and host.host_id in host_order:
+                rows.append(
+                    _status_row(
+                        f"{host.display} · not in current Host Mesh; showing registered windows",
+                        host.host_id,
+                    )
+                )
     if desktop_error:
         rows.insert(0, _status_row(f"Local window state unknown · {desktop_error}"))
     if snapshot is None:

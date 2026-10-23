@@ -473,6 +473,29 @@ class PickerRowsTests(unittest.TestCase):
         self.assertTrue(
             any("not in current Host Mesh" in row.display for row in rows if row.kind == "status")
         )
+        self.assertEqual(
+            [row.instance_id for row in rows if row.kind == "instance"], [record.instance_id]
+        )
+        self.assertFalse(any(row.kind == "target" for row in rows))
+        self.assertEqual(len([row for row in rows if row.kind == "status"]), 1)
+
+    def test_removed_peer_without_windows_contributes_no_cached_rows(self):
+        removed = self.snapshot_store.finish_fleet(FleetSnapshot("sha256:" + "c" * 64, 3000, ()))
+        self.assertEqual(
+            [row.display for row in build_rows(removed)],
+            ["No supported host targets or registered windows"],
+        )
+
+    def test_removed_peer_provider_warnings_do_not_create_empty_host_rows(self):
+        unknown = fixture_inventory(
+            codex_status="unknown", claude_status="unknown", empty=("codex", "claude")
+        )
+        self.snapshot_store.publish_host(host_result(unknown), mesh_revision="sha256:" + "b" * 64)
+        removed = self.snapshot_store.finish_fleet(FleetSnapshot("sha256:" + "c" * 64, 3000, ()))
+        self.assertEqual(
+            [row.display for row in build_rows(removed)],
+            ["No supported host targets or registered windows"],
+        )
 
     def test_starting_opening_and_uncertain_instances_remain_typed_selectable_rows(self):
         records = []

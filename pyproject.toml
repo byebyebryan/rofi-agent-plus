@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rofi-agent-plus"
-version = "0.15.0a14"
+version = "0.15.0a15"
 description = "Rofi launcher for local and remote Codex and Claude TUIs"
 readme = "README.md"
 requires-python = ">=3.11"
