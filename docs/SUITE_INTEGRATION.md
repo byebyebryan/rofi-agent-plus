@@ -6,12 +6,22 @@ managers through its own headless host helper.
 
 | Responsibility | Owner |
 | --- | --- |
-| Logical host IDs, aliases, routes and SSH connection policy | [SSH Plus / Host Mesh](https://github.com/byebyebryan/rofi-ssh-plus) |
+| Logical host IDs, aliases, routes and SSH connection policy | Mesh Plus authority through [SSH Plus / Host Mesh](https://github.com/byebyebryan/rofi-ssh-plus) |
 | Installed environments, labels, capabilities and passive daemon observations | Agent Plus host helper and provider adapters |
 | Local picker, catalog cache, launch requests, registration and exact focus | Agent Plus desktop runtime |
 | Conversations, agent work, settings, authentication and daemon startup | Codex and Claude |
 | Window surfaces and foreground terminal clients | Niri and dedicated Kitty |
 | Immutable installation, command links, configuration and key bindings | The deployment owner; chezmoi in the managed fleet |
+
+Agent Observer separately owns Codex read-only conversation/runtime observation
+for dashboards and other utilities. The Tmux pair separately owns generic tmux
+observation and management. Neither is a runtime dependency of this entry tool.
+Claude native entry remains supported here; it does not imply an Observer
+adapter or discovery/monitoring of Claude background conversations.
+
+SSH Plus owns the canonical Host Mesh v1 process contract and picker history;
+Mesh implements the selected shared authority. These roles do not require a
+configuration-directory rename or a new host registry in Agent Plus.
 
 ## Integration contracts
 

@@ -14,6 +14,10 @@ controls its appearance; the sample contains no live sessions.*
 Codex Agent Command Center and Claude Agent View handle conversations and agent
 work inside those windows. Agent Plus handles discovery, launch and focus.
 
+This is a convenience entrypoint around native shared runtimes. Agent Observer
+separately supplies Codex read-only state to dashboards and other utilities;
+its retired Claude monitoring does not affect Claude native entry here.
+
 ## What it does
 
 - Finds installed Codex and Claude defaults, plus declared additional homes such
