@@ -5,7 +5,7 @@ TUIs. Agent Plus owns discovery and its launched windows; native managers own
 conversations and agent work.
 
 [Project showcase](https://dev.byebyebryan.com/fleet-plus/projects/agent-plus/) ·
-[Documentation](docs/README.md) · [Usage](docs/usage.md)
+[Get started](docs/getting-started.md) · [Documentation](docs/README.md) · [Usage](docs/guides/usage.md)
 
 [![CI](https://github.com/byebyebryan/rofi-agent-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/byebyebryan/rofi-agent-plus/actions/workflows/ci.yml)
 
@@ -51,8 +51,8 @@ does not start one; explicit native entry may do so under provider configuration
 Installed provider defaults appear automatically; optional configuration labels
 them or adds prepared native homes such as Codex Work. **New window** opens an
 independent client, without creating a conversation. Arbitrary manually launched
-TUIs are outside the registry. See [usage](docs/usage.md) and
-[environment/remote configuration](docs/configuration.md).
+TUIs are outside the registry. See [usage](docs/guides/usage.md) and
+[environment/remote configuration](docs/guides/configuration.md).
 
 Agent Plus uses Host Mesh for routing and has no Observer/Tmux runtime dependency.
 Claude native entry here is independent of Observer's retired Claude monitoring.
@@ -60,12 +60,9 @@ Other desktops/terminals, Mosh and picker-driven Close remain deferred.
 
 ## Develop and operate
 
-Use [development](docs/development.md) for the source gate, isolated native proofs
-and preview renderer. [Architecture](docs/architecture.md) defines discovery,
-identity and window ownership; [managed operations](docs/managed-operations.md)
+Use [development](docs/maintenance/development.md) for the source gate, isolated native proofs
+and preview renderer. [Architecture](docs/reference/architecture.md) defines discovery,
+identity and window ownership; [managed operations](docs/maintenance/operations.md)
 records separately pinned deployment/rollback.
 
-The [history index](docs/history/README.md) preserves the redesign and first
-candidate records; [legacy retirement](docs/legacy-retirement.md) identifies the
-old conversation controller. Shared presentation lives at
-[Fleet Plus](https://dev.byebyebryan.com/fleet-plus/). [MIT license](LICENSE).
+Current guides are organized in the [documentation index](docs/README.md).

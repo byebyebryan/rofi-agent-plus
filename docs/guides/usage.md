@@ -33,4 +33,4 @@ rofi-agent-plus-host inventory --json
 Both commands perform bounded passive discovery without opening a native TUI.
 Unreachable hosts retain last-known targets with errors. Removed peers supply
 no cached target/warning rows; registered windows can remain without granting
-a new host route. See [architecture](architecture.md).
+a new host route. See [architecture](../reference/architecture.md).

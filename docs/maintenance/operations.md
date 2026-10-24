@@ -2,7 +2,7 @@
 
 This guide describes the repository owner's chezmoi-managed fleet. The
 selected immutable wheel, version, digest and hosts are recorded in
-[managed-direct-selection.json](../artifacts/managed-direct-selection.json).
+[managed-direct-selection.json](../../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
 Snap, Starship and Carbon select this build. Carbon discovers its native default
 without extra profile declarations; retired artifacts remain available for rollback.
@@ -15,8 +15,8 @@ installed package against wheel bytes before selectors are applied. An existing
 different/corrupt prefix is refused rather than overwritten. The host must have
 `uv` and a locally available Python 3.11 interpreter.
 
-The trial artifact is distributed locally; no GitHub push or publication is a
-deployment prerequisite. Keep the wheel and its checksum together. The package
+The immutable wheel is distributed by the deployment owner; publishing a
+documentation commit is not a deployment step. Keep the wheel and its checksum together. The package
 has no Observer or Tmux dependency. Its remote headless helper must be reachable
 as `rofi-agent-plus-host` in the owning user's noninteractive PATH.
 
@@ -47,15 +47,6 @@ restores those exact inputs/targets and the previous selected prefix through a
 scoped chezmoi apply. Preserve an immutable prefix while any direct TUI wrapper
 still uses it. Changing picker selection never closes terminals or stops native
 provider work.
-
-The retired Observer/Tmux manifest, three-selector rollback tool and unused
-fixtures have been removed from the current source tree. Their Git checkpoint
-and recovery instructions are in [legacy retirement](legacy-retirement.md).
-Use the captured direct-trial targets above for current rollback. The
-[first candidate record](history/direct-tui-candidate-20261021.md) preserves
-the original qualification scope. Later deployment receipts belong to their
-exact source revision and wheel digest; the historical candidate is not a
-fresh acceptance pass for them.
 
 The [development guide](development.md#native-proofs) documents the private
 Xvfb input regression and the other native proof drivers. A documentation or

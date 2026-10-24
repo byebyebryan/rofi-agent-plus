@@ -73,7 +73,7 @@ treated as an empty or stopped host.
 ## Host transport and native entry
 
 SSH Plus owns host identity, route order and SSH policy through
-[Host Mesh v1](../contracts/host-mesh-v1/contract.md). When its CLI is absent,
+[Host Mesh v1](../../contracts/host-mesh-v1/contract.md). When its CLI is absent,
 the helper can operate with a local-only identity. A configured Mesh failure is
 an error, rather than permission to invent a replacement host identity.
 
@@ -167,5 +167,17 @@ authority. Tombstones preserve replay identity after an instance exits.
 | Rofi callback state / first frame | 16 KiB / 16 MiB |
 
 Inventory deadlines do not terminate interactive provider TUIs or SSH login
-prompts. [Validation](development.md) and [managed selection](managed-operations.md)
+prompts. [Validation](../maintenance/development.md) and [managed selection](../maintenance/operations.md)
 have separate acceptance scopes.
+
+## Ownership and retired responsibilities
+
+Agent Plus consumes the public Host Mesh process contract and fixed owning-host
+helpers; it imports no sibling implementations. Mesh/SSH own routing, native
+Codex/Claude managers own conversations/authentication, and Niri/Kitty own the
+window surfaces. The deployment owner separately pins installation and bindings.
+
+The former conversation picker, Observer writer and Tmux viewer runtime are
+removed. No compatibility controller, conversation database discovery or agent
+work supervisor is part of this entry/window tool. Claude native TUI entry is
+independent of retired Claude observation in Agent Observer.

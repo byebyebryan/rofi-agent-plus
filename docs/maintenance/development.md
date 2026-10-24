@@ -111,10 +111,7 @@ An installed host/provider case uses host-local configuration and helper paths:
 
 Omit `--helper` for a local case. `--fixture-script` observes the owned daemon
 on its host; `--disconnect-first` exercises an owned SSH interruption without
-entry replay. Run `--help` for the full selectors. The
-[initial candidate record](history/direct-tui-candidate-20261021.md) preserves
-the original Starship/Snap, Default/Work and Claude matrix and its receipts.
-It is historical evidence, not a fresh pass for a later artifact.
+entry replay. Run `--help` for the full selectors.
 
 ## Repository preview
 
@@ -127,7 +124,7 @@ display and captures it with ImageMagick. It requires Rofi, Xvfb, ImageMagick
 and DejaVu Sans Mono. It performs no host/provider discovery, opens no native
 TUI and sends no physical desktop input. The theme is for documentation only;
 Agent Plus uses the user's own Rofi theme in normal operation. See
-[asset provenance](../ASSETS.md).
+[asset provenance](../../ASSETS.md).
 
 ## Review and delivery
 
@@ -136,16 +133,25 @@ selection distinct. Repeat the gates affected by a change; a docs update does
 not require another provider-entry matrix or a managed reinstall. A runtime
 change needs a newly verified immutable artifact before deployment.
 
-Keep the runtime limited to its [architecture](architecture.md): provider
+Keep the runtime limited to its [architecture](../reference/architecture.md): provider
 adapters and native clients, exact owned-window identity, public Host Mesh and
 finite discovery. Preserve unrelated work, native settings and existing clients.
-[Managed operations](managed-operations.md) covers scoped delivery and rollback.
+[Managed operations](operations.md) covers scoped delivery and rollback.
 
 ## Documentation maintenance
 
-Keep current setup in the README and details in [usage](usage.md),
-[configuration](configuration.md) and [architecture](architecture.md), linked
-from [the index](README.md). Completed plans/corrections belong in
-[history](history/README.md); preserve dated evidence and artifact selection
-bytes. Do not append rollout ledgers to the README. Fleet Plus carries the
-shared showcase without changing this repository's native-entry boundary.
+Keep only `README.md` and `getting-started.md` at the docs root. Use lowercase
+kebab-case filenames in one shallow topic folder: `guides/` for workflows,
+`reference/` for current interfaces, and `maintenance/` for development/operations.
+Media belongs in `assets/`. Mesh's hash-locked `contract-freeze.md` is the sole
+root exception; its original bytes remain normative input.
+
+Update or consolidate the existing guide instead of adding a dated plan,
+handoff or status page. Delete superseded notes; Git retains earlier revisions.
+Do not add forwarding pages or copy old reports into the current docs tree.
+Keep executable test data beside tests, not under docs. Record necessary release
+provenance with an immutable Git/release link in the operations guide.
+
+Run `scripts/check-docs` and the canonical source gate before committing. The
+docs check enforces this layout and checks local links/heading fragments.
+Package, native, managed, consumer and physical acceptance remain separate.
