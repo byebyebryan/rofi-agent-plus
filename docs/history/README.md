@@ -1,17 +1,16 @@
-# Direct-TUI transition records
+# Documentation history
 
-These records preserve the October 2026 redesign and first qualification run.
-They are historical evidence, rather than current setup instructions or an
-unfinished roadmap. The [current documentation](../README.md) describes the
-implemented picker, including subsequent responsiveness and recovery fixes.
+These are dated design, delivery and research records, not current setup instructions or a backlog. Start with the [current documentation](../README.md). Version, provider, host and acceptance claims apply only to the checkpoint recorded in each document.
 
-| Record | Scope |
-| --- | --- |
-| [Design](agent-plus-daemon-tui-design.md) | Product decisions, identity model and original proof requirements |
-| [Design review](agent-plus-daemon-tui-design-review.md) | Discovery findings and native questions at design time |
-| [Implementation plan](agent-plus-daemon-tui-implementation-plan.md) | The original unattended execution contract |
-| [First candidate](direct-tui-candidate-20261021.md) | The initial wheel, native case matrix, receipts and remaining acceptance at that point |
+Evidence under [`docs/evidence/`](../evidence/) retains its original paths and bytes. Old documentation paths needed by receipts or consumers remain short forwarding pages. No historical record is promoted to current support by appearing here.
 
-Later source changes live in Git history. The current selected wheel and host
-scope are recorded in [managed-direct-selection.json](../../artifacts/managed-direct-selection.json).
-The previous conversation picker is covered by [legacy retirement](../legacy-retirement.md).
+## Delivery
+
+- [Removed-host rows correction](delivery/removed-host-rows.md)
+
+## Earlier records
+
+- [Agent Plus daemon and TUI design review](agent-plus-daemon-tui-design-review.md)
+- [Agent Plus daemon and TUI design](agent-plus-daemon-tui-design.md)
+- [Agent Plus direct TUI implementation plan](agent-plus-daemon-tui-implementation-plan.md)
+- [Direct TUI candidate execution record](direct-tui-candidate-20261021.md)

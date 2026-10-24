@@ -140,3 +140,12 @@ Keep the runtime limited to its [architecture](architecture.md): provider
 adapters and native clients, exact owned-window identity, public Host Mesh and
 finite discovery. Preserve unrelated work, native settings and existing clients.
 [Managed operations](managed-operations.md) covers scoped delivery and rollback.
+
+## Documentation maintenance
+
+Keep current setup in the README and details in [usage](usage.md),
+[configuration](configuration.md) and [architecture](architecture.md), linked
+from [the index](README.md). Completed plans/corrections belong in
+[history](history/README.md); preserve dated evidence and artifact selection
+bytes. Do not append rollout ledgers to the README. Fleet Plus carries the
+shared showcase without changing this repository's native-entry boundary.

@@ -1,31 +1,31 @@
 # Agent Plus documentation
 
-Agent Plus is a direct native-TUI launcher and window picker for Codex and
-Claude. Start with the [repository README](../README.md) for setup and keys.
+Start with the [repository README](../README.md) for installation, or visit
+[Fleet Plus](https://dev.byebyebryan.com/fleet-plus/projects/agent-plus/) for the
+product walkthrough and ecosystem relationships.
 
-| Guide | Use it for |
+| Guide | Purpose |
 | --- | --- |
-| [Architecture](architecture.md) | Environment identity, discovery, native entry, window ownership and refresh behavior |
-| [Development and validation](development.md) | Source checks, installed-wheel checks, native proofs and the preview renderer |
-| [Suite ownership](SUITE_INTEGRATION.md) | The boundary between Agent Plus, SSH Plus, native providers and the desktop |
-| [Managed operations](managed-operations.md) | The pinned chezmoi installation, verification and rollback |
-| [Configuration example](../examples/direct.toml) | Optional desktop settings and additional native homes |
+| [Usage](usage.md) | Rows, keys, exact window focus and inventory diagnosis |
+| [Configuration](configuration.md) | Native homes, defaults and remote prerequisites |
+| [Architecture](architecture.md) | Environment identity, discovery, entry and window ownership |
+| [Development](development.md) | Source checks, isolated native proofs and preview assets |
+| [Suite ownership](SUITE_INTEGRATION.md) | Host Mesh, native provider and desktop boundaries |
+| [Managed operations](managed-operations.md) | Separately pinned chezmoi installation and rollback |
+| [Config example](../examples/direct.toml) | Optional settings and additional native homes |
 
-[Fleet Plus](https://dev.byebyebryan.com/fleet-plus/) provides shared ecosystem
-orientation; [Agent Plus's product page](https://dev.byebyebryan.com/fleet-plus/projects/agent-plus/)
-provides its direct public introduction.
+Agent Plus is native-TUI entry/window convenience. It has no Observer/Tmux
+runtime dependency and supplies no external conversation lifecycle controller.
 
-## Historical records
+## History and evidence
 
-The [history index](history/README.md) preserves the October 2026 design,
-implementation plan and first candidate receipts. They describe their own
-stage, including labels and refresh strategies superseded by later fixes.
-[Legacy retirement](legacy-retirement.md) identifies the Git checkpoint for
-the previous conversation/Observer/Tmux implementation.
+The [history index](history/README.md) retains the original redesign, first
+qualification and dated corrections. Earlier labels and strategies describe
+their own source/artifact checkpoint. [Legacy retirement](legacy-retirement.md)
+identifies the earlier conversation/Observer/Tmux implementation in Git.
 
-Current behavior comes from the guides above and the source. The
-[managed selection](../artifacts/managed-direct-selection.json) identifies an
-immutable deployed artifact; a documentation commit does not replace it.
-
-The [removed-host row correction](removed-host-rows.md) records the a15
-source, installed-artifact and managed-fleet acceptance.
+[`evidence/`](evidence/) and the
+[managed artifact selection](../artifacts/managed-direct-selection.json) retain
+their immutable installed scope. A current documentation commit does not replace
+that artifact. Keep new current guidance in the table above and completed plans
+in history; preserve old evidence rather than appending rollout ledgers to README.
