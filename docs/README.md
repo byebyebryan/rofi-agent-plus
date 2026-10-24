@@ -11,6 +11,10 @@ Claude. Start with the [repository README](../README.md) for setup and keys.
 | [Managed operations](managed-operations.md) | The pinned chezmoi installation, verification and rollback |
 | [Configuration example](../examples/direct.toml) | Optional desktop settings and additional native homes |
 
+[Fleet Plus](https://dev.byebyebryan.com/fleet-plus/) provides shared ecosystem
+orientation; [Agent Plus's product page](https://dev.byebyebryan.com/fleet-plus/projects/agent-plus/)
+provides its direct public introduction.
+
 ## Historical records
 
 The [history index](history/README.md) preserves the October 2026 design,

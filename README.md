@@ -1,5 +1,7 @@
 # Rofi Agent Plus
 
+[Project walkthrough](https://dev.byebyebryan.com/fleet-plus/projects/agent-plus/) · [Fleet Plus overview](https://dev.byebyebryan.com/fleet-plus/)
+
 [![CI](https://github.com/byebyebryan/rofi-agent-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/byebyebryan/rofi-agent-plus/actions/workflows/ci.yml)
 
 Find your **Codex and Claude environments**, then open or focus their native
