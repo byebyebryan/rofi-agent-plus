@@ -7,11 +7,13 @@ Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
 Snap, Starship and Carbon select this build. Carbon discovers its native default
 without extra profile declarations; retired artifacts remain available for rollback.
 
-The [0.15.0a16 release](https://github.com/byebyebryan/rofi-agent-plus/releases/tag/v0.15.0a16)
+The [0.15.0a17 release](https://github.com/byebyebryan/rofi-agent-plus/releases/tag/v0.15.0a17)
 fixes Claude's native default-home configuration selection. Qualification covers
-159 source tests, isolated installed-wheel byte/entrypoint checks and 22 host
+160 source tests, isolated installed-wheel byte/entrypoint checks and 23 host
 tests against the installed package, including default/custom-home entry and
-probe environments. Native desktop appearance/input acceptance remains separate.
+probe environments. Its installed CLI gate includes both Codex and Claude.
+It supersedes a16's regression when inventory used the implicit process environment.
+Native desktop appearance/input acceptance remains separate.
 
 The wheel is staged on each selected host under
 `~/.local/share/rofi-agent-plus/artifacts/<wheel-sha256>/`. The managed

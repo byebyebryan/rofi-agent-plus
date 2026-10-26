@@ -77,13 +77,17 @@ def inspect(prefix, wheel, output):
             + """import json,os,sys
 from pathlib import Path
 with Path(os.environ['PROOF_LOG']).open('a') as stream: stream.write(json.dumps(sys.argv[1:])+'\\n')
+if Path(sys.argv[0]).name == 'claude': assert 'CLAUDE_CONFIG_DIR' not in os.environ
 if sys.argv[1:]==['agents','--help']: print('native agents manager')
 elif sys.argv[1:]==['app-server','daemon','version']: print('daemon socket: No such file or directory (os error 2)',file=sys.stderr);sys.exit(1)
+elif sys.argv[1:]==['daemon','status']: print('pid: 42\\ncontrol.sock: reachable')
 else: raise RuntimeError('unexpected provider call')
 """
         )
         (bin_dir / "codex").write_text(fake)
         (bin_dir / "codex").chmod(0o700)
+        (bin_dir / "claude").write_text(fake)
+        (bin_dir / "claude").chmod(0o700)
         for command in ("rofi-tmux-plus", "agent-observer", "tmux", "niri", "kitty"):
             script = bin_dir / command
             script.write_text(
@@ -102,6 +106,7 @@ else: raise RuntimeError('unexpected provider call')
             "XDG_CACHE_HOME": str(root / "cache"),
             "XDG_STATE_HOME": str(root / "state"),
             "PROOF_LOG": str(log),
+            "CLAUDE_CONFIG_DIR": "/foreign/inherited/claude",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
 
@@ -166,7 +171,7 @@ print(json.dumps({'version':d.version,'requires':d.requires or [],'entries':{e.n
             ]
         )
         require(
-            payload["schemaVersion"] == 1 and len(payload["targets"]) == 1,
+            payload["schemaVersion"] == 1 and len(payload["targets"]) == 2,
             "headless inventory shape",
         )
         require(
@@ -175,7 +180,18 @@ print(json.dumps({'version':d.version,'requires':d.requires or [],'entries':{e.n
         )
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         require(
-            calls == [["agents", "--help"], ["app-server", "daemon", "version"]],
+            payload["targets"][1]["key"]["provider"] == "claude"
+            and payload["targets"][1]["daemon"]["status"] == "running",
+            "native default Claude inventory failed",
+        )
+        require(
+            calls
+            == [
+                ["agents", "--help"],
+                ["app-server", "daemon", "version"],
+                ["agents", "--help"],
+                ["daemon", "status"],
+            ],
             "inventory called entry or unexpected command",
         )
         # Exercise the installed console script itself, rather than only -m.

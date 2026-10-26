@@ -436,7 +436,7 @@ def build_inventory(
             target_capability = _capability(capability, home_problem, candidate.conflicting)
             key = TargetKey(mesh.local.host_id, scope.uid, scope.account, provider, candidate.home)
             spec_revision = canonical_revision(
-                adapter.launch_spec(executable, candidate.home, env=env)
+                adapter.launch_spec(executable, candidate.home, env=process_env)
             )
             daemon_status = "unknown"
             daemon_reason: str | None

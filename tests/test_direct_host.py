@@ -208,6 +208,21 @@ class DirectHostTests(unittest.TestCase):
             "running",
         )
 
+    def test_inventory_without_explicit_environment_uses_resolved_process_environment(self) -> None:
+        base = dict(self.harness.env, HOME=str(self.harness.home), CLAUDE_CONFIG_DIR="/foreign")
+        with patch.dict("os.environ", base, clear=True):
+            inventory = self.harness.inventory(env=None)
+        target = next(item for item in inventory.targets if item.key.provider == "claude")
+        self.assertEqual(
+            target.spec_revision,
+            canonical_revision(
+                claude.launch_spec(
+                    str(self.harness.claude), str(self.harness.claude_home), env=base
+                )
+            ),
+        )
+        self.assertEqual(target.daemon.status, "running")
+
     def test_claude_native_home_environment_and_specification(self) -> None:
         native = str(self.harness.claude_home.resolve())
         for child_home in (str(self.harness.home), "/not-the-owning-home", "relative", None):
