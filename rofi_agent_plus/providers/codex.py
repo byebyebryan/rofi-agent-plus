@@ -43,7 +43,8 @@ def entry_argv(executable: str) -> tuple[str, ...]:
     return (executable, *ENTRY_COMMAND)
 
 
-def launch_spec(executable: str | None, home: str) -> dict[str, object]:
+def launch_spec(executable: str | None, home: str, *, env: Mapping[str, str]) -> dict[str, object]:
+    del env
     return {
         "provider": PROVIDER,
         "adapterRevision": ADAPTER_REVISION,

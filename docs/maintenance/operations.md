@@ -41,6 +41,14 @@ Any disruptive GUI testing belongs on unattended Snap; Starship and Carbon are
 reserved for the user's own trial. Human input/visual judgment remains separate from
 package and passive inventory checks.
 
+The Claude default-home environment fix changes the adapter revision. Refresh
+and reselect an old Claude entry if it is rejected as stale. Existing native
+clients and daemons retain their launch environment after a package update;
+they are not restarted by deployment. A daemon started with the previous
+`CLAUDE_CONFIG_DIR` may need a separately scheduled native restart, which ends
+its background sessions. Preserve both Claude config files during rollout;
+the launcher fix neither migrates nor deletes native settings.
+
 Before applying, capture the selected links, direct configuration, active binds
 and their source inputs in a private host-local rollback directory. Rollback
 restores those exact inputs/targets and the previous selected prefix through a

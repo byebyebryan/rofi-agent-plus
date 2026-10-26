@@ -30,6 +30,14 @@ configuration directories must already be usable. These rows identify native
 homes, rather than Codex `--profile` overlays sharing the same home. Declare
 remote homes on their owning host. See the [full example](../../examples/direct.toml).
 
+For Claude's native default home, Agent Plus clears `CLAUDE_CONFIG_DIR` so
+Claude uses `$HOME/.claude.json` for workspace trust and user MCP settings.
+Setting the variable even to `$HOME/.claude` selects a different global config,
+`$HOME/.claude/.claude.json`. Custom Claude homes retain an explicit
+`CLAUDE_CONFIG_DIR`. Probes and native entry use the same environment policy;
+it follows the child's absolute `HOME`, with explicit selection when that
+default cannot be established.
+
 ## Remote prerequisites
 
 Install/configure SSH Plus and expose its public Host Mesh command on the

@@ -23,6 +23,7 @@ from rofi_agent_plus.model import (
     EntryReference,
     RecordError,
     UserScope,
+    canonical_revision,
     decode_document_json,
     decode_reference_json,
     parse_entry_reference,
@@ -206,6 +207,131 @@ class DirectHostTests(unittest.TestCase):
             ).status,
             "running",
         )
+
+    def test_claude_native_home_environment_and_specification(self) -> None:
+        native = str(self.harness.claude_home.resolve())
+        for child_home in (str(self.harness.home), "/not-the-owning-home", "relative", None):
+            with self.subTest(child_home=child_home):
+                base = {"CLAUDE_CONFIG_DIR": "/inherited/claude", "KEEP": "value"}
+                if child_home is not None:
+                    base["HOME"] = child_home
+                original = dict(base)
+                selected = claude.entry_environment(base, native)
+                spec = claude.launch_spec(str(self.harness.claude), native, env=base)
+                if child_home == str(self.harness.home):
+                    self.assertNotIn("CLAUDE_CONFIG_DIR", selected)
+                    self.assertEqual(spec["environment"], {})
+                    self.assertEqual(spec["clearedEnvironment"], ["CLAUDE_CONFIG_DIR"])
+                else:
+                    self.assertEqual(selected["CLAUDE_CONFIG_DIR"], native)
+                    self.assertEqual(spec["environment"], {"CLAUDE_CONFIG_DIR": native})
+                    self.assertEqual(spec["clearedEnvironment"], [])
+                self.assertEqual(selected["KEEP"], "value")
+                self.assertEqual(base, original)
+        alias = self.root / "home-alias"
+        alias.symlink_to(self.harness.home, target_is_directory=True)
+        self.assertNotIn(
+            "CLAUDE_CONFIG_DIR", claude.entry_environment({"HOME": str(alias)}, native)
+        )
+
+    def test_claude_default_and_custom_probes_and_entry_select_same_config(self) -> None:
+        work = self.harness.home / ".claude-work"
+        work.mkdir()
+        config = self.harness.write_config([{"provider": "claude", "home": str(work)}])
+        base = dict(self.harness.env, HOME=str(self.harness.home), CLAUDE_CONFIG_DIR="/foreign")
+        inventory = self.harness.inventory(config, env=base)
+        calls = [call for call in self.harness.calls if call[0][0] == str(self.harness.claude)]
+        help_calls = [call for call in calls if call[0][1:] == ("agents", "--help")]
+        self.assertEqual(len(help_calls), 1)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", help_calls[0][1]["env"])
+        status_calls = [call for call in calls if call[0][1:] == ("daemon", "status")]
+        self.assertEqual(len(status_calls), 2)
+        self.assertEqual(
+            {call[1]["env"].get("CLAUDE_CONFIG_DIR") for call in status_calls}, {None, str(work)}
+        )
+        for target in (item for item in inventory.targets if item.key.provider == "claude"):
+            events = []
+            reference = EntryReference(
+                inventory.host_id, inventory.user, target.key, target.spec_revision
+            )
+            enter_reference(
+                json.dumps(reference.to_json()),
+                config,
+                env=base,
+                runner=self.harness.runner,
+                user_scope=self.harness.user,
+                user_home=self.harness.home,
+                mesh_executable=str(self.harness.mesh),
+                is_tty=True,
+                chdir=lambda cwd: None,
+                execve=lambda path, argv, environment, sink=events: sink.append(
+                    (path, argv, environment)
+                ),
+            )
+            self.assertEqual(len(events), 1)
+            executable, argv, child = events[0]
+            self.assertEqual(executable, str(self.harness.claude))
+            self.assertEqual(tuple(argv), (str(self.harness.claude), "agents"))
+            if target.key.home == str(work):
+                self.assertEqual(child["CLAUDE_CONFIG_DIR"], str(work))
+            else:
+                self.assertNotIn("CLAUDE_CONFIG_DIR", child)
+            self.assertEqual(child["HOME"], str(self.harness.home))
+        self.assertEqual(base["CLAUDE_CONFIG_DIR"], "/foreign")
+
+    def test_claude_legacy_specification_is_rejected_for_default_and_custom_home(self) -> None:
+        work = self.harness.home / ".claude-work"
+        work.mkdir()
+        config = self.harness.write_config([{"provider": "claude", "home": str(work)}])
+        base = dict(self.harness.env, HOME=str(self.harness.home))
+        inventory = self.harness.inventory(config, env=base, include_status=False)
+        for target in (item for item in inventory.targets if item.key.provider == "claude"):
+            legacy = {
+                "provider": "claude",
+                "adapterRevision": "claude-agents-v1",
+                "executablePath": str(self.harness.claude),
+                "entryArgv": ["agents"],
+                "environment": {"CLAUDE_CONFIG_DIR": target.key.home},
+                "clearedEnvironment": [],
+            }
+            reference = EntryReference(
+                inventory.host_id, inventory.user, target.key, canonical_revision(legacy)
+            )
+            with self.subTest(home=target.key.home), self.assertRaises(HostError) as raised:
+                validate_entry_reference(
+                    reference.to_json(),
+                    config,
+                    env=base,
+                    runner=self.harness.runner,
+                    user_scope=self.harness.user,
+                    user_home=self.harness.home,
+                    mesh_executable=str(self.harness.mesh),
+                )
+            self.assertEqual(raised.exception.code, "stale_specification")
+
+    def test_child_home_change_invalidates_claude_reference_but_preserves_codex_spec(self) -> None:
+        base = dict(self.harness.env, HOME=str(self.harness.home))
+        inventory = self.harness.inventory(env=base, include_status=False)
+        changed = dict(base, HOME=str(self.root / "different-child-home"))
+        after = self.harness.inventory(env=changed, include_status=False)
+        before_specs = {item.key.provider: item.spec_revision for item in inventory.targets}
+        after_specs = {item.key.provider: item.spec_revision for item in after.targets}
+        self.assertEqual(before_specs["codex"], after_specs["codex"])
+        self.assertNotEqual(before_specs["claude"], after_specs["claude"])
+        target = next(item for item in inventory.targets if item.key.provider == "claude")
+        reference = EntryReference(
+            inventory.host_id, inventory.user, target.key, target.spec_revision
+        )
+        with self.assertRaises(HostError) as raised:
+            validate_entry_reference(
+                reference.to_json(),
+                env=changed,
+                runner=self.harness.runner,
+                user_scope=self.harness.user,
+                user_home=self.harness.home,
+                mesh_executable=str(self.harness.mesh),
+            )
+        self.assertEqual(raised.exception.code, "stale_specification")
 
     def test_strict_versioned_fixtures_parse(self) -> None:
         inventory = parse_inventory(

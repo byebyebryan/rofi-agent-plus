@@ -12,7 +12,7 @@ from ..process import ProcessResult
 from .common import ProbeObservation
 
 PROVIDER = "claude"
-ADAPTER_REVISION = "claude-agents-v1"
+ADAPTER_REVISION = "claude-agents-v2"
 EXECUTABLE = "claude"
 ENTRY_COMMAND = ("agents",)
 _STOPPED = re.compile(
@@ -40,21 +40,34 @@ def entry_argv(executable: str) -> tuple[str, ...]:
     return (executable, *ENTRY_COMMAND)
 
 
-def launch_spec(executable: str | None, home: str) -> dict[str, object]:
+def launch_spec(executable: str | None, home: str, *, env: Mapping[str, str]) -> dict[str, object]:
+    native = home == _native_home(env)
     return {
         "provider": PROVIDER,
         "adapterRevision": ADAPTER_REVISION,
         "executablePath": executable,
         "entryArgv": list(ENTRY_COMMAND),
-        "environment": {"CLAUDE_CONFIG_DIR": home},
-        "clearedEnvironment": [],
+        "environment": {} if native else {"CLAUDE_CONFIG_DIR": home},
+        "clearedEnvironment": ["CLAUDE_CONFIG_DIR"] if native else [],
     }
 
 
 def entry_environment(base: Mapping[str, str], home: str) -> dict[str, str]:
     selected = dict(base)
-    selected["CLAUDE_CONFIG_DIR"] = home
+    # Setting even the default directory moves Claude's global config from
+    # $HOME/.claude.json to $CLAUDE_CONFIG_DIR/.claude.json.
+    if home == _native_home(base):
+        selected.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        selected["CLAUDE_CONFIG_DIR"] = home
     return selected
+
+
+def _native_home(env: Mapping[str, str]) -> str | None:
+    user_home = env.get("HOME")
+    if not user_home or not Path(user_home).is_absolute():
+        return None
+    return str((Path(user_home) / ".claude").resolve(strict=False))
 
 
 def home_problem(home: str, *, is_default: bool) -> str | None:
