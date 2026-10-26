@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import subprocess
 import tempfile
 import zipfile
@@ -101,7 +102,9 @@ else: raise RuntimeError('unexpected provider call')
         env = {
             "PATH": str(bin_dir),
             "PYTHONPATH": str(root),
-            "HOME": str(root),
+            # Match the owning account for native-default selection; only our
+            # inert providers run, with private config/cache/state below root.
+            "HOME": pwd.getpwuid(os.getuid()).pw_dir,
             "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_CACHE_HOME": str(root / "cache"),
             "XDG_STATE_HOME": str(root / "state"),

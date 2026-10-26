@@ -6,10 +6,10 @@
     "starship",
     "carbon"
   ],
-  "version": "0.15.0a16",
-  "wheel": "rofi_agent_plus-0.15.0a16-py3-none-any.whl",
-  "wheelSha256": "24295d75342c1351b28b1160f435e645ed9ae50d3d85eacd3bb3ec5faa8bd987",
-  "prefix": ".local/share/rofi-agent-plus/0.15.0a16-24295d75342c1351",
+  "version": "0.15.0a17",
+  "wheel": "rofi_agent_plus-0.15.0a17-py3-none-any.whl",
+  "wheelSha256": "55873f83c52c6bc26d38029b6c6da76eb9b2396ba592a46b72927d31e0972f41",
+  "prefix": ".local/share/rofi-agent-plus/0.15.0a17-55873f83c52c6bc2",
   "python": "3.11",
   "entryPoints": [
     "rofi-agent-plus",
