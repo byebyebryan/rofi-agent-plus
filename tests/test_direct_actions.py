@@ -78,7 +78,7 @@ class DirectActionTests(unittest.TestCase):
         self.transport = FakeTransport()
         self.popen_calls: list[tuple[list[str], dict[str, object]]] = []
 
-    def action(self, *, popen=None) -> Actions:
+    def action(self, *, popen=None, motion="inherit") -> Actions:
         def launch(argv, **kwargs):
             self.popen_calls.append((list(argv), dict(kwargs)))
             return SimpleNamespace(pid=os.getpid())
@@ -88,6 +88,7 @@ class DirectActionTests(unittest.TestCase):
             self.registry,
             self.transport,
             terminal=("kitty",),
+            motion=motion,
             env={"PATH": "/usr/bin:/bin", "PYTHONPATH": "/foreign"},
             popen=launch if popen is None else popen,
         )
@@ -128,6 +129,29 @@ class DirectActionTests(unittest.TestCase):
         self.assertNotEqual(first.instance_id, second.instance_id)
         self.assertEqual([first.value["ordinal"], second.value["ordinal"]], [1, 2])
         self.assertEqual(len(self.popen_calls), 2)
+
+    def test_motion_is_captured_on_new_reservation_and_kept_on_focus_or_replay(self):
+        reduced_action = self.action(motion="reduced")
+        normal_action = self.action(motion="normal")
+        with patch("rofi_agent_plus.desktop.shutil.which", return_value="/usr/bin/kitty"):
+            first = reduced_action.open_target(self.target, self.reference, request_id="a" * 32)
+            replay = normal_action.open_target(self.target, self.reference, request_id="a" * 32)
+            focused = normal_action.open_target(self.target, self.reference)
+            second = normal_action.open_target(
+                self.target,
+                self.reference,
+                additional=True,
+                request_id="b" * 32,
+            )
+
+        self.assertEqual(first.instance_id, replay.instance_id)
+        self.assertEqual(first.instance_id, focused.instance_id)
+        self.assertEqual(first.value["transport"]["motion"], "reduced")
+        self.assertEqual(replay.value["transport"]["motion"], "reduced")
+        self.assertEqual(focused.value["transport"]["motion"], "reduced")
+        self.assertEqual(second.value["transport"]["motion"], "normal")
+        self.assertNotEqual(first.instance_id, second.instance_id)
+        self.assertEqual(self.transport.calls, 2)
 
     def test_failed_spawn_is_retired_and_request_replay_never_spawns_again(self):
         def fail(*_argv, **_kwargs):

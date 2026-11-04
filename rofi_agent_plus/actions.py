@@ -9,8 +9,10 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
+from .config import MOTION_MODES
 from .desktop import (
     Desktop,
     DesktopError,
@@ -49,6 +51,7 @@ class Actions:
         transport: Transport,
         *,
         terminal: Sequence[str] = ("kitty",),
+        motion: str = "inherit",
         env: Mapping[str, str] | None = None,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         observe: Callable[[int], ProcessIdentity | None] = observe_process,
@@ -57,6 +60,9 @@ class Actions:
         self.registry = registry
         self.transport = transport
         self.terminal = tuple(terminal)
+        if not isinstance(motion, str) or motion not in MOTION_MODES:
+            raise ActionError("invalid_motion", "desktop motion mode is invalid")
+        self.motion = motion
         self.env = dict(desktop.env if env is None else env)
         self.popen = popen
         self.observe = observe
@@ -276,6 +282,8 @@ class Actions:
         # provider work. The entry helper repeats target validation at dispatch.
         try:
             pinned = self.transport.pin_entry(target.key.host_id)
+            if self.motion != "inherit":
+                pinned = replace(pinned, motion=self.motion)
         except TransportError as error:
             raise ActionError(error.code, _bounded(error)) from error
         try:

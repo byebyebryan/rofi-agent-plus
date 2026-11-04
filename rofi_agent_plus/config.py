@@ -21,6 +21,7 @@ MAX_DECLARATION_ID_LENGTH = 128
 SUPPORTED_PROVIDERS = ("codex", "claude")
 DEFAULT_TERMINAL = ("kitty",)
 DEFAULT_CATALOG_TTL_SECONDS = 30
+MOTION_MODES = ("inherit", "normal", "reduced")
 
 
 class ConfigError(ValueError):
@@ -31,6 +32,7 @@ class ConfigError(ValueError):
 class DesktopConfig:
     terminal: tuple[str, ...] = DEFAULT_TERMINAL
     catalog_ttl_seconds: int = DEFAULT_CATALOG_TTL_SECONDS
+    motion: str = "inherit"
 
 
 @dataclass(frozen=True)
@@ -139,7 +141,7 @@ def _default_label(provider: str, home: str) -> str:
 def _parse_desktop(value: object) -> DesktopConfig:
     if not isinstance(value, Mapping):
         raise ConfigError("desktop must be a table")
-    unknown = set(value) - {"terminal", "catalog_ttl_seconds"}
+    unknown = set(value) - {"terminal", "catalog_ttl_seconds", "motion"}
     if unknown:
         raise ConfigError("desktop contains an unsupported setting")
     terminal = value.get("terminal", list(DEFAULT_TERMINAL))
@@ -160,7 +162,10 @@ def _parse_desktop(value: object) -> DesktopConfig:
     ttl = _integer(
         value.get("catalog_ttl_seconds", DEFAULT_CATALOG_TTL_SECONDS), "catalog_ttl_seconds", 1, 300
     )
-    return DesktopConfig(tuple(terminal), ttl)
+    motion = value.get("motion", "inherit")
+    if not isinstance(motion, str) or motion not in MOTION_MODES:
+        raise ConfigError("desktop motion must be inherit, normal, or reduced")
+    return DesktopConfig(tuple(terminal), ttl, motion)
 
 
 def _parse_declaration(value: object, index: int) -> EnvironmentDeclaration:

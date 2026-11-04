@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import MOTION_MODES
 from .host_mesh import MESH_COMMAND, HostMeshError, Mesh, MeshHost, Route, resolve_self_mesh
 from .model import (
     MAX_REFERENCE_BYTES,
@@ -90,6 +91,7 @@ class PinnedTransport:
     ssh_executable: str | None = None
     connect_timeout: int | None = None
     attempts: int | None = None
+    motion: str = "inherit"
 
     def to_json(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -117,6 +119,8 @@ class PinnedTransport:
             )
             if self.config is not None:
                 value["config"] = self.config
+        if self.motion != "inherit":
+            value["motion"] = self.motion
         return value
 
     @classmethod
@@ -128,7 +132,7 @@ class PinnedTransport:
             raise TransportError("unsupported_transport", "saved transport version is unsupported")
         kind = value.get("kind")
         if kind == "local":
-            required, optional = base, {"helper", "python", "config"}
+            required, optional = base, {"helper", "python", "config", "motion"}
         elif kind == "ssh":
             required = base | {
                 "route",
@@ -137,7 +141,7 @@ class PinnedTransport:
                 "connectionAttempts",
                 "helper",
             }
-            optional = {"config"}
+            optional = {"config", "motion"}
         else:
             raise TransportError("invalid_transport", "saved transport kind is invalid")
         if not required <= set(value) or set(value) - required - optional:
@@ -161,6 +165,9 @@ class PinnedTransport:
         ):
             raise TransportError("invalid_transport", "saved mesh revision is invalid")
         fields = {key: value.get(key) for key in ("helper", "python", "config")}
+        motion = value.get("motion", "inherit")
+        if not isinstance(motion, str) or motion not in MOTION_MODES:
+            raise TransportError("invalid_transport", "saved motion policy is invalid")
         if any(item is not None and not _bounded_text(item, 4096) for item in fields.values()):
             raise TransportError("invalid_transport", "saved transport path is invalid")
         for key in ("helper", "python", "config"):
@@ -179,6 +186,7 @@ class PinnedTransport:
                 fields["helper"],
                 fields["python"],
                 fields["config"],
+                motion=motion,
             )
         route = value.get("route")
         ssh = value.get("sshExecutable")
@@ -216,6 +224,7 @@ class PinnedTransport:
             ssh_executable=ssh,
             connect_timeout=timeout,
             attempts=attempts,
+            motion=motion,
         )
 
 
@@ -570,6 +579,8 @@ class Transport:
         if len(reference_json.encode("utf-8", "strict")) > MAX_REFERENCE_BYTES:
             raise TransportError("reference_too_large", "entry reference exceeds its byte limit")
         arguments = ["enter", "--reference-json", reference_json]
+        if pin.motion != "inherit":
+            arguments.extend(("--motion", pin.motion))
         if pin.config:
             arguments.extend(("--config", pin.config))
         if pin.kind == "local":

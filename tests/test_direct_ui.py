@@ -24,6 +24,7 @@ from rofi_agent_plus.rofi import (
     PickerContext,
     PickerState,
     _state_json,
+    build_context,
     build_rows,
     run_rofi,
 )
@@ -92,6 +93,24 @@ class FakeDesktop:
     def match(windows, marker, terminal):
         matching = [window for window in windows if window.app_id == marker]
         return matching[0] if len(matching) == 1 else None
+
+
+class BuildContextTests(unittest.TestCase):
+    def test_desktop_motion_is_passed_to_new_actions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            context = build_context(
+                environ={"PATH": "/usr/bin:/bin"},
+                transport=FakeTransport(),
+                desktop=FakeDesktop("a" * 64),
+                registry=Registry("a" * 64, root / "registry"),
+                cache_root=root / "cache",
+                state_root=root / "state",
+                config=DirectConfig(DesktopConfig(motion="reduced"), ()),
+            )
+
+        self.assertIsNotNone(context.actions)
+        self.assertEqual(context.actions.motion, "reduced")
 
 
 class CacheStoreTests(unittest.TestCase):

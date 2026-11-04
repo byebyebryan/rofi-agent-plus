@@ -36,8 +36,13 @@ def status_argv(executable: str) -> tuple[str, ...]:
     return (executable, "daemon", "status")
 
 
-def entry_argv(executable: str) -> tuple[str, ...]:
-    return (executable, *ENTRY_COMMAND)
+def entry_argv(executable: str, motion: str = "inherit") -> tuple[str, ...]:
+    if motion == "inherit":
+        return (executable, *ENTRY_COMMAND)
+    if motion not in {"normal", "reduced"}:
+        raise ValueError("unsupported motion policy")
+    settings = json.dumps({"prefersReducedMotion": motion == "reduced"}, separators=(",", ":"))
+    return (executable, "--settings", settings, *ENTRY_COMMAND)
 
 
 def launch_spec(executable: str | None, home: str, *, env: Mapping[str, str]) -> dict[str, object]:

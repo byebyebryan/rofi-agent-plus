@@ -3,6 +3,7 @@ schema_version = 1
 [desktop]
 terminal = ["kitty"]
 catalog_ttl_seconds = 30
+motion = "inherit"
 
 [[environments]]
 provider = "codex"

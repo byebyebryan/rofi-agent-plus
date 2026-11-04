@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from rofi_agent_plus.config import load_direct_config
+from rofi_agent_plus.config import ConfigError, load_direct_config
 from rofi_agent_plus.host import (
     HostError,
     build_inventory,
@@ -114,9 +114,16 @@ class HostHarness:
             return ProcessResult(tuple(argv), 0, b"pid:     42\n  control.sock: reachable\n", b"")
         raise AssertionError(f"unexpected provider command: {argv!r}")
 
-    def write_config(self, declarations: list[dict[str, str]]) -> Path:
+    def write_config(self, declarations: list[dict[str, str]], *, motion: str = "inherit") -> Path:
         config = self.root / "direct.toml"
-        lines = ["schema_version = 1", "", "[desktop]", 'terminal = ["kitty"]', ""]
+        lines = [
+            "schema_version = 1",
+            "",
+            "[desktop]",
+            'terminal = ["kitty"]',
+            f"motion = {json.dumps(motion)}",
+            "",
+        ]
         for declaration in declarations:
             lines.append("[[environments]]")
             for key, value in declaration.items():
@@ -387,6 +394,18 @@ class DirectHostTests(unittest.TestCase):
                 0,
             )
         self.assertEqual(enter.call_args.args, (reference, config_path))
+        self.assertEqual(enter.call_args.kwargs, {"motion": "inherit"})
+
+    def test_host_entry_cli_accepts_motion_and_rejects_unknown_values(self) -> None:
+        reference = (FIXTURE_ROOT / "entry-reference.json").read_text(encoding="utf-8").strip()
+        with patch("rofi_agent_plus.host.enter_reference", return_value=None) as enter:
+            self.assertEqual(
+                host_main(["enter", "--reference-json", reference, "--motion", "normal"]),
+                0,
+            )
+        self.assertEqual(enter.call_args.kwargs, {"motion": "normal"})
+        with self.assertRaises(SystemExit):
+            host_main(["enter", "--reference-json", reference, "--motion", "automatic"])
 
     def test_wire_rejects_duplicate_keys_unknown_versions_and_unsafe_reference(self) -> None:
         with self.assertRaises(RecordError):
@@ -427,6 +446,7 @@ class DirectHostTests(unittest.TestCase):
         self.assertEqual(len(loaded.issues), 1)
         self.assertEqual([item.provider for item in loaded.environments], ["claude"])
         self.assertEqual(loaded.desktop.terminal, ("kitty",))
+        self.assertEqual(loaded.desktop.motion, "inherit")
         xdg_config = self.root / "xdg-config"
         legacy_dir = xdg_config / "rofi-agent-plus"
         legacy_dir.mkdir(parents=True)
@@ -437,6 +457,36 @@ class DirectHostTests(unittest.TestCase):
             env={"XDG_CONFIG_HOME": str(xdg_config)}, user_home=self.harness.home
         )
         self.assertEqual(fresh.environments, ())
+
+    def test_motion_policy_is_bounded_and_does_not_change_target_identity(self) -> None:
+        inherited = self.harness.write_config([], motion="inherit")
+        reduced = self.root / "reduced.toml"
+        reduced.write_text(
+            inherited.read_text(encoding="utf-8").replace(
+                'motion = "inherit"', 'motion = "reduced"'
+            ),
+            encoding="utf-8",
+        )
+        inherited_config = load_direct_config(inherited, user_home=self.harness.home)
+        reduced_config = load_direct_config(reduced, user_home=self.harness.home)
+        self.assertEqual(inherited_config.desktop.motion, "inherit")
+        self.assertEqual(reduced_config.desktop.motion, "reduced")
+
+        first = self.harness.inventory(inherited, include_status=False)
+        second = self.harness.inventory(reduced, include_status=False)
+        first_targets = {target.key: target.spec_revision for target in first.targets}
+        second_targets = {target.key: target.spec_revision for target in second.targets}
+        self.assertEqual(first_targets, second_targets)
+
+        invalid = self.root / "invalid-motion.toml"
+        invalid.write_text(
+            inherited.read_text(encoding="utf-8").replace(
+                'motion = "inherit"', 'motion = "automatic"'
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ConfigError):
+            load_direct_config(invalid, user_home=self.harness.home)
 
     def test_inventory_deduplicates_canonical_aliases_and_preserves_partial_targets(self) -> None:
         alias = self.harness.home / ".codex-alias"
@@ -693,6 +743,7 @@ class DirectHostTests(unittest.TestCase):
             user_scope=self.harness.user,
             user_home=self.harness.home,
             mesh_executable=str(self.harness.mesh),
+            motion="reduced",
             is_tty=True,
             chdir=lambda cwd: events.append(("chdir", cwd)),
             execve=lambda path, argv, environment: events.append(
@@ -703,7 +754,10 @@ class DirectHostTests(unittest.TestCase):
         self.assertEqual(events[0], ("chdir", str(self.harness.home)))
         _kind, executable, argv, entry_env = events[1]
         self.assertEqual(executable, str(self.harness.codex.resolve()))
-        self.assertEqual(argv, (str(self.harness.codex.resolve()), "agents"))
+        self.assertEqual(
+            argv,
+            (str(self.harness.codex.resolve()), "-c", "tui.animations=false", "agents"),
+        )
         self.assertEqual(entry_env["CODEX_HOME"], str(self.harness.work_home))
         self.assertNotIn("CODEX_PLUS_SOCKET", entry_env)
         self.assertEqual(entry_env["CLAUDE_CONFIG_DIR"], "/preserve/native/claude")
@@ -735,6 +789,128 @@ class DirectHostTests(unittest.TestCase):
         self.assertEqual(target.capability.status, "unavailable")
         self.assertEqual(target.capability.reason, "home_missing")
         self.assertFalse(Path(target.key.home).exists())
+
+    def test_claude_motion_overrides_keep_native_and_custom_home_selection(self) -> None:
+        native_env = dict(
+            self.harness.env,
+            HOME=str(self.harness.home),
+            CLAUDE_CONFIG_DIR="/wrong/parent/home",
+        )
+        native_config = self.harness.write_config([])
+        native_inventory = self.harness.inventory(
+            native_config, env=native_env, include_status=False
+        )
+        native = next(
+            target for target in native_inventory.targets if target.key.provider == "claude"
+        )
+        native_plan = validate_entry_reference(
+            EntryReference(
+                native_inventory.host_id,
+                native_inventory.user,
+                native.key,
+                native.spec_revision,
+            ).to_json(),
+            native_config,
+            env=native_env,
+            runner=self.harness.runner,
+            user_scope=self.harness.user,
+            user_home=self.harness.home,
+            mesh_executable=str(self.harness.mesh),
+            motion="normal",
+        )
+        self.assertEqual(
+            native_plan.argv,
+            (
+                str(self.harness.claude.resolve()),
+                "--settings",
+                '{"prefersReducedMotion":false}',
+                "agents",
+            ),
+        )
+        self.assertNotIn("CLAUDE_CONFIG_DIR", native_plan.environment)
+
+        custom_home = self.root / ".claude-extra"
+        custom_home.mkdir()
+        custom_config = self.harness.write_config(
+            [{"provider": "claude", "home": str(custom_home), "label": "Extra"}]
+        )
+        custom_inventory = self.harness.inventory(
+            custom_config, env=native_env, include_status=False
+        )
+        custom = next(
+            target
+            for target in custom_inventory.targets
+            if target.key.provider == "claude" and target.key.home == str(custom_home)
+        )
+        custom_plan = validate_entry_reference(
+            EntryReference(
+                custom_inventory.host_id,
+                custom_inventory.user,
+                custom.key,
+                custom.spec_revision,
+            ).to_json(),
+            custom_config,
+            env=native_env,
+            runner=self.harness.runner,
+            user_scope=self.harness.user,
+            user_home=self.harness.home,
+            mesh_executable=str(self.harness.mesh),
+            motion="reduced",
+        )
+        self.assertEqual(
+            custom_plan.argv,
+            (
+                str(self.harness.claude.resolve()),
+                "--settings",
+                '{"prefersReducedMotion":true}',
+                "agents",
+            ),
+        )
+        self.assertEqual(custom_plan.environment["CLAUDE_CONFIG_DIR"], str(custom_home))
+
+    def test_motion_rejects_invalid_policy_before_inventory(self) -> None:
+        reference = (FIXTURE_ROOT / "entry-reference.json").read_text(encoding="utf-8").strip()
+        with self.assertRaises(HostError) as raised:
+            validate_entry_reference(
+                reference,
+                env=self.harness.env,
+                runner=self.harness.runner,
+                user_scope=self.harness.user,
+                user_home=self.harness.home,
+                mesh_executable=str(self.harness.mesh),
+                motion="automatic",
+            )
+        self.assertEqual(raised.exception.code, "invalid_motion")
+
+    def test_provider_entry_argv_preserves_inherit_and_places_flags_before_agents(self) -> None:
+        self.assertEqual(codex.entry_argv("/usr/bin/codex"), ("/usr/bin/codex", "agents"))
+        self.assertEqual(
+            codex.entry_argv("/usr/bin/codex", "normal"),
+            ("/usr/bin/codex", "-c", "tui.animations=true", "agents"),
+        )
+        self.assertEqual(
+            codex.entry_argv("/usr/bin/codex", "reduced"),
+            ("/usr/bin/codex", "-c", "tui.animations=false", "agents"),
+        )
+        self.assertEqual(claude.entry_argv("/usr/bin/claude"), ("/usr/bin/claude", "agents"))
+        self.assertEqual(
+            claude.entry_argv("/usr/bin/claude", "normal"),
+            (
+                "/usr/bin/claude",
+                "--settings",
+                '{"prefersReducedMotion":false}',
+                "agents",
+            ),
+        )
+        self.assertEqual(
+            claude.entry_argv("/usr/bin/claude", "reduced"),
+            (
+                "/usr/bin/claude",
+                "--settings",
+                '{"prefersReducedMotion":true}',
+                "agents",
+            ),
+        )
 
 
 class HostMeshTests(unittest.TestCase):

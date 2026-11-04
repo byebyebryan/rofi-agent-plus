@@ -22,6 +22,7 @@ from rofi_agent_plus.registry import (
     Registry,
     RegistryError,
     atomic_json,
+    parse_instance,
     target_storage_key,
 )
 
@@ -64,6 +65,17 @@ class RegistryTests(unittest.TestCase):
         replay, created_again = self.reserve(additional=True)
         self.assertEqual(replay.state, "exited")
         self.assertFalse(created_again)
+
+    def test_schema_one_registry_reader_accepts_nested_motion_descriptor(self):
+        record, _ = self.reserve()
+        value = dict(record.value)
+        value["transport"] = {**value["transport"], "motion": "reduced"}
+
+        parsed = parse_instance(value, self.registry.generation, self.target_id)
+        self.assertEqual(parsed.value["transport"]["motion"], "reduced")
+
+        with self.assertRaises(RegistryError):
+            parse_instance({**value, "motion": "reduced"}, self.registry.generation, self.target_id)
 
     def test_multiple_new_instances_require_row_refresh(self):
         self.reserve(additional=True)

@@ -261,6 +261,21 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(values[3:], ["--config", str(config)])
         self.assertFalse((self.root / "shell-injection-proof").exists())
 
+        reduced_pin = PinnedTransport.parse({**pin.to_json(), "motion": "reduced"})
+        reduced_argv = transport.entry_argv(reference_json, reduced_pin)
+        completed = subprocess.run(
+            ["/bin/sh", "-c", reduced_argv[-1]],
+            cwd=self.root,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        values = json.loads(self.helper_log.read_text())
+        self.assertEqual(values[0:2], ["enter", "--reference-json"])
+        self.assertEqual(values[2], reference_json)
+        self.assertEqual(values[3:5], ["--motion", "reduced"])
+        self.assertEqual(values[5:], ["--config", str(config)])
+
     def test_malformed_saved_transport_and_wrong_host_reference_are_rejected(self):
         invalid = {
             "schemaVersion": 1,
@@ -275,6 +290,18 @@ class TransportTests(unittest.TestCase):
         }
         with self.assertRaises(TransportError):
             PinnedTransport.parse(invalid)
+        legacy_local = {
+            "schemaVersion": 1,
+            "kind": "local",
+            "hostId": "snap",
+            "meshRevision": None,
+            "helper": "/usr/bin/rofi-agent-plus-host",
+        }
+        parsed_legacy = PinnedTransport.parse(legacy_local)
+        self.assertEqual(parsed_legacy.motion, "inherit")
+        self.assertEqual(parsed_legacy.to_json(), legacy_local)
+        with self.assertRaises(TransportError):
+            PinnedTransport.parse({**legacy_local, "motion": "automatic"})
         transport = self.transport()
         pin = transport.pin_entry("remote")
         reference = (FIXTURES / "entry-reference.json").read_text().strip()
@@ -326,10 +353,15 @@ class TransportTests(unittest.TestCase):
             pin = transport.pin_entry("snap")
             reference = (FIXTURES / "entry-reference.json").read_text().strip()
             argv = transport.entry_argv(reference, pin)
+            normal = PinnedTransport.parse({**pin.to_json(), "motion": "normal"})
+            normal_argv = transport.entry_argv(reference, normal)
         self.assertEqual(
             argv[:4],
             (sys.executable, "-I", "-m", "rofi_agent_plus.host"),
         )
+        self.assertNotIn("motion", pin.to_json())
+        self.assertEqual(PinnedTransport.parse(pin.to_json()).motion, "inherit")
+        self.assertEqual(normal_argv[-2:], ("--motion", "normal"))
 
     def test_venv_python_symlink_is_not_resolved_outside_candidate(self):
         candidate = self.root / "candidate" / "bin"

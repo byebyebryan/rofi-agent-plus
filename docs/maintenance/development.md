@@ -39,8 +39,11 @@ remains a diagnostic with last-known targets. The host command emits the strict
 schema-1 inventory directly. Neither command opens a native manager.
 
 The public commands are `list --json`, host `inventory --json`, and host
-`enter --reference-json`. Entry requires an exact validated reference and a
-real foreground TTY. The launcher and viewer entry points serve their dedicated
+`enter --reference-json` with an optional `--motion inherit|normal|reduced`.
+Entry requires an exact validated reference and a real foreground TTY. Motion
+does not change inventory or reference identity; the host applies the setting
+after it has freshly validated the reference. Omitted motion preserves the
+legacy provider argv. The launcher and viewer entry points serve their dedicated
 roles. Retired conversation `active`/`refresh`, session-limit and batch commands
 have no compatibility runtime.
 

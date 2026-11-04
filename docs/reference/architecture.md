@@ -41,6 +41,11 @@ window title does not change the target or its launch specification. Separate
 Codex homes selected by `CODEX_HOME` are separate targets; `--profile` overlays
 within one home do not add targets.
 
+The local display's `desktop.motion` preference is captured in the existing
+opaque transport descriptor only when a new window is reserved. It does not
+enter target identity or specification revision. Focus and request replay keep
+the saved value; a deliberate New window captures the current preference.
+
 Each dedicated window has an `org.agentplus.<instance-id>` application ID.
 Titles and reusable Window 1/2/3 ordinals are presentation, never action
 authority. Manually launched TUIs lack the owned registration and are not
@@ -86,8 +91,17 @@ authentication. An uncertain entry is never replayed through another route.
 Entry carries a bounded reference to the expected host, user, target and
 specification revision. The owning helper resolves them again before exec. It
 changes to the owning account's home and runs the installed `codex agents` or
-`claude agents`. Codex sets `CODEX_HOME` and clears `CODEX_PLUS_SOCKET`; Claude
-sets `CLAUDE_CONFIG_DIR`. Inventory cannot supply executable commands.
+`claude agents`. The optional `--motion normal|reduced` argument travels with
+that entry and is translated to a native one-session setting only after fresh
+target validation. Omitted motion preserves the exact legacy command.
+Codex sets `CODEX_HOME` and clears `CODEX_PLUS_SOCKET`; Claude preserves its
+native-default versus custom `CLAUDE_CONFIG_DIR` policy. Inventory cannot
+supply executable commands.
+
+Claude Agent View and sessions newly dispatched from it receive this local
+preference. Attaching to an existing Claude background session retains the
+motion setting from that session's launch; the manager's setting does not
+override it.
 
 Native entry or SSH errors remain readable in the owned terminal until
 dismissal. The wrapper records its foreground client's lifetime; it does not

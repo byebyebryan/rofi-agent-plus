@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import (
+    MOTION_MODES,
     ConfigError,
     DeclarationIssue,
     DesktopConfig,
@@ -526,9 +527,12 @@ def validate_entry_reference(
     user_home: Path | str | None = None,
     mesh_executable: str | None = None,
     observed_at: int | None = None,
+    motion: str = "inherit",
 ) -> EntryPlan:
     """Resolve a stale-resistant entry reference against fresh local facts."""
 
+    if not isinstance(motion, str) or motion not in MOTION_MODES:
+        raise HostError("invalid_motion", "entry", "motion policy is invalid")
     if isinstance(reference, str):
         try:
             parsed = decode_reference_json(reference)
@@ -582,7 +586,7 @@ def validate_entry_reference(
     adapter = ADAPTERS[target.key.provider]
     return EntryPlan(
         executable,
-        adapter.entry_argv(executable),
+        adapter.entry_argv(executable, motion),
         adapter.entry_environment(dict(os.environ if env is None else env), target.key.home),
         str(_user_identity(inventory.user, user_home)[1]),
         target,
@@ -598,6 +602,7 @@ def enter_reference(
     user_scope: UserScope | None = None,
     user_home: Path | str | None = None,
     mesh_executable: str | None = None,
+    motion: str = "inherit",
     is_tty: bool | None = None,
     chdir: Callable[[str], object] = os.chdir,
     execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve,
@@ -619,6 +624,7 @@ def enter_reference(
         user_scope=user_scope,
         user_home=user_home,
         mesh_executable=mesh_executable,
+        motion=motion,
     )
     try:
         chdir(plan.cwd)
@@ -674,6 +680,7 @@ def build_parser() -> argparse.ArgumentParser:
     enter = commands.add_parser("enter", help="enter one freshly validated native manager")
     enter.add_argument("--reference-json", required=True, help="bounded v1 entry reference JSON")
     enter.add_argument("--config", type=Path, help="read a private direct.toml fixture")
+    enter.add_argument("--motion", choices=MOTION_MODES, default="inherit")
     return parser
 
 
@@ -685,7 +692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 inventory = build_inventory(arguments.config)
                 _write_document(sys.stdout, inventory)
             return 0
-        enter_reference(arguments.reference_json, arguments.config)
+        enter_reference(arguments.reference_json, arguments.config, motion=arguments.motion)
         return 0
     except (HostError, RecordError, ConfigError, ProcessError) as error:
         try:

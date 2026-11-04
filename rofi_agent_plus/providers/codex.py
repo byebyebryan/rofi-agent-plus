@@ -39,8 +39,13 @@ def status_argv(executable: str) -> tuple[str, ...]:
     return (executable, "app-server", "daemon", "version")
 
 
-def entry_argv(executable: str) -> tuple[str, ...]:
-    return (executable, *ENTRY_COMMAND)
+def entry_argv(executable: str, motion: str = "inherit") -> tuple[str, ...]:
+    if motion == "inherit":
+        return (executable, *ENTRY_COMMAND)
+    if motion not in {"normal", "reduced"}:
+        raise ValueError("unsupported motion policy")
+    animations = "true" if motion == "normal" else "false"
+    return (executable, "-c", f"tui.animations={animations}", *ENTRY_COMMAND)
 
 
 def launch_spec(executable: str | None, home: str, *, env: Mapping[str, str]) -> dict[str, object]:

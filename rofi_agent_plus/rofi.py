@@ -187,6 +187,7 @@ def build_context(
                 registry,
                 transport,
                 terminal=config.desktop.terminal,
+                motion=config.desktop.motion,
                 env=env,
             )
         except (ActionError, DesktopError, RegistryError) as error:
