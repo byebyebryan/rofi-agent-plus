@@ -4,35 +4,32 @@ This guide describes the repository owner's chezmoi-managed fleet. The
 selected immutable wheel, version, digest and hosts are recorded in
 [managed-direct-selection.json](../../artifacts/managed-direct-selection.json).
 Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
-Snap, Starship and Carbon select this build. Carbon discovers its native default
+The configured cohort is Snap, Starship and Carbon. Carbon discovers its native default
 without extra profile declarations; retired artifacts remain available for rollback.
 
-The source candidate `0.15.0a19` adds per-desktop seven-day frequency ordering
-with an all-zero recency fallback. Its new usage file starts empty and leaves
-existing selection hints intact. The managed immutable selection below remains
-the qualified a18 artifact until a new candidate is separately published and
-selected; editing source does not update installed pickers.
-
-The [0.15.0a18 release](https://github.com/byebyebryan/rofi-agent-plus/releases/tag/v0.15.0a18)
-adds viewer motion preferences while preserving the a17 native-home fix.
-Qualification covers 168 source tests, isolated installed-wheel byte/entrypoint
-checks and 123 direct-runtime tests against the installed Python 3.11 package.
-[Hosted CI](https://github.com/byebyebryan/rofi-agent-plus/actions/runs/41787739445)
-passed for runtime source `b39b05b5ee61874aa8f56b662207f75ce5512fd3`.
+The [0.15.0a19 release](https://github.com/byebyebryan/rofi-agent-plus/releases/tag/v0.15.0a19)
+adds per-desktop seven-day frequency ordering with an all-zero recency fallback.
+Its new usage file starts empty and leaves existing selection hints intact.
+Qualification covers 180 source tests, isolated installed-wheel byte/entrypoint
+checks, and 143 tests against the installed Python 3.11 package: 124 direct
+runtime cases, 10 usage cases and 9 launcher cases. Private Xvfb input proofs
+cover cached and cold opening, last-used selection and frozen weekly ordering
+through arrow/Tab navigation while another invocation changes usage history.
+[Hosted CI](https://github.com/byebyebryan/rofi-agent-plus/actions/runs/41936500274)
+passed for runtime source `d475795a90bceb1548352ef07d643841a0b6b9d1`.
 
 Snap and Starship select `normal` motion; Carbon selects `reduced`. A new Kitty
 window captures the viewer's setting for both local and SSH entry. Focus and
-request replay preserve its saved mode. Owned Snap probes verified independent
+request replay preserve its saved mode. Earlier owned Snap probes verified independent
 Codex off/on settings through native manager resume and conversation switching.
 Claude Agent View and newly dispatched sessions receive the setting; attaching
 an existing background session retains that session's original motion setting.
 The probes submitted no model turns and preserved ordinary settings and daemon
 generations. Other native input/appearance acceptance remains separate.
 
-Carbon completed deployment on 2026-11-04, bringing all three hosts onto the
-selected a18 artifact. Carbon's installed-byte/entrypoint checks and passive
-local/SSH inventory passed; its captured native process and previous prefix
-were preserved. Snap and Starship have no outbound Host Mesh route to Carbon.
+Publishing the artifact and its selection manifest does not apply a host update.
+The deployment owner separately stages, selects and verifies each host through
+the scoped procedure below. Snap and Starship have no outbound Host Mesh route to Carbon.
 Existing windows keep their launch-time policy; use New window to adopt a
 changed viewer preference.
 
