@@ -8,6 +8,7 @@ import signal
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from rofi_agent_plus import app, launcher
@@ -122,6 +123,65 @@ class LauncherTest(unittest.TestCase):
         self.assertNotIn("ROFI_AGENT_PLUS_REFRESH_STATUS", calls[0][1])
         self.assertTrue(rofi.waited)
         self.assertFalse(Path(calls[0][1][launcher.INITIAL_FRAME_ENV]).exists())
+
+    def test_real_weekly_frame_keeps_last_selection_independent_of_rank(self):
+        from rofi_agent_plus.config import DesktopConfig, DirectConfig
+        from rofi_agent_plus.rofi import PickerRow
+        from rofi_agent_plus.usage import UsageStore, now_ms
+        from rofi_agent_plus.view_preferences import ViewPreference
+
+        root = Path(self.temporary.name)
+        usage = UsageStore(root / "usage")
+        moment = now_ms()
+        for index, target in enumerate("acabac"):
+            self.assertTrue(usage.record(target * 64, f"{index:032x}", moment))
+        rows = tuple(
+            PickerRow(
+                "target", "t:" + target * 64, target, target, target_id=target * 64, selectable=True
+            )
+            for target in "abc"
+        )
+
+        def context(environment):
+            return SimpleNamespace(
+                env=environment,
+                config=DirectConfig(DesktopConfig(), ()),
+                config_error=None,
+                cache=SimpleNamespace(root=root / "cache", load=lambda: None),
+                preferences=SimpleNamespace(load=lambda: ViewPreference("b" * 64)),
+                desktop=None,
+                desktop_error=None,
+                registry=None,
+                transport=None,
+                actions=None,
+                usage=usage,
+            )
+
+        def launch(argv, *, env):
+            self.assertEqual("2", argv[argv.index("-selected-row") + 1])
+            frame = launcher.initial_frame(dict(env, ROFI_RETV="0"))
+            displayed = frame.split("\x00delim", 1)[1].split("\n", 1)[1]
+            self.assertEqual(
+                ["a", "c", "b"],
+                [line.split("\x00", 1)[0] for line in displayed.split("\x1e") if line],
+            )
+            return FakeProcess()
+
+        with (
+            mock.patch.object(launcher, "build_context", side_effect=context),
+            mock.patch.object(
+                launcher,
+                "StartupRefresh",
+                return_value=SimpleNamespace(active=False, close=lambda: None),
+            ),
+            mock.patch.object(
+                launcher, "_agent_executable", return_value=Path("/artifact/bin/rofi-agent-plus")
+            ),
+            mock.patch("rofi_agent_plus.rofi.build_rows", return_value=rows),
+            mock.patch("rofi_agent_plus.rofi.read_status", return_value=None),
+            mock.patch.object(launcher.subprocess, "Popen", side_effect=launch),
+        ):
+            self.assertEqual(0, launcher.main(["-show", "agent-plus"]))
 
     def test_keyboard_interrupt_cancels_only_the_rofi_child(self):
         class InterruptedProcess(FakeProcess):

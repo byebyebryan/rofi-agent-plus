@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offscreen Rofi input regression: drive OUTPUT cached|cold; callbacks are inert."""
+"""Offscreen Rofi input regression: drive OUTPUT cached|cold|weekly; inert actions."""
 
 import ctypes
 import json
@@ -21,12 +21,13 @@ from rofi_agent_plus.config import DesktopConfig, DirectConfig  # noqa: E402
 from rofi_agent_plus.desktop import Window  # noqa: E402
 from rofi_agent_plus.rofi import PickerRow, _parse_state, _status_row, run_rofi  # noqa: E402
 from rofi_agent_plus.startup_refresh import RefreshStatus  # noqa: E402
+from rofi_agent_plus.usage import SNAPSHOT_ENV, SNAPSHOT_NAME, UsageStore  # noqa: E402
 from rofi_agent_plus.view_preferences import ViewPreference  # noqa: E402
 from rofi_agent_plus.window_titles import TITLES_ENV, TITLES_NAME  # noqa: E402
 
 root = Path(sys.argv[2])
 variant = sys.argv[3]
-assert variant in {"cached", "cold"}
+assert variant in {"cached", "cold", "weekly"}
 if sys.argv[1] == "callback":
     started = time.monotonic()
     tick = (
@@ -58,7 +59,7 @@ if sys.argv[1] == "callback":
         return rows
 
     context = SimpleNamespace(
-        env={TITLES_ENV: str(root / TITLES_NAME)},
+        env={TITLES_ENV: str(root / TITLES_NAME), SNAPSHOT_ENV: str(root / SNAPSHOT_NAME)},
         config=DirectConfig(DesktopConfig(), ()),
         config_error=None,
         cache=SimpleNamespace(load=lambda: None),
@@ -68,6 +69,7 @@ if sys.argv[1] == "callback":
         desktop_error=None,
         transport=None,
         actions=None,
+        usage=UsageStore(root / "state") if variant == "weekly" else None,
     )
     frame = StringIO()
     with (
@@ -100,6 +102,11 @@ if sys.argv[1] == "callback":
         "new": json.loads(data)["selectedKey"],
         "restore": json.loads(data)["restoreSelection"],
         "selectableRows": sum(row.selectable for row in rendered_rows),
+        "order": [
+            json.loads(line.split("\x00info\x1f", 1)[1].split("\x1f", 1)[0])["targetId"][0]
+            for line in frame.getvalue().replace("\x1e", "\n").splitlines()
+            if "\x00info\x1f" in line
+        ],
         "select": next(
             (
                 line
@@ -118,6 +125,11 @@ if sys.argv[1] == "callback":
 
 assert sys.argv[1] == "drive"
 root.mkdir(mode=0o700)
+if variant == "weekly":
+    store = UsageStore(root / "state")
+    moment = time.time_ns() // 1_000_000
+    for index, target in enumerate("abcbcc"):
+        assert store.record(target * 64, f"{index:032x}", moment, at=moment)
 xvfb = subprocess.Popen(
     ["Xvfb", "-displayfd", "1", "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
     stdout=subprocess.PIPE,
@@ -241,6 +253,13 @@ try:
             )
         )
     probes = []
+    if variant == "weekly":
+        assert ready_event["order"] == list("cbadef"), ready_event
+        # A separate invocation changes live history. This dialog must retain
+        # its captured ranking through real arrow and Tab callbacks.
+        moment = time.time_ns() // 1_000_000
+        for index in range(5):
+            assert store.record("f" * 64, f"{index + 100:032x}", moment, at=moment)
     for index in range(3):
         time.sleep(0.9)
         sent = time.monotonic()
@@ -276,7 +295,7 @@ try:
         "desktopInput": 0,
         "providerActions": 0,
     }
-    expected = list("bcd" if variant == "cold" else "cde")
+    expected = list("bcd" if variant == "cold" else "ade" if variant == "weekly" else "cde")
     assert [p["selected"] for p in probes] == expected, receipt
     # This upper bound includes the deliberate 150ms before the inert Tab
     # probe. It catches blocked input without treating it as paint latency.
@@ -284,6 +303,10 @@ try:
     assert sum(e["retv"] == 28 for e in events()) == (1 if variant == "cold" else 0), receipt
     assert receipt["rowsLoadedByRetv"] == (28 if variant == "cold" else 0), receipt
     assert receipt["automaticCallbacksAfterRows"] == 0, receipt
+    if variant == "weekly":
+        assert all(event["order"] == list("cbadef") for event in events()), receipt
+        receipt["frozenFrequencyOrder"] = list("cbadef")
+        receipt["liveHistoryChangedDuringDialog"] = True
     (root / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt))
     key("Escape")

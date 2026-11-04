@@ -1047,13 +1047,18 @@ class PickerCallbackTests(unittest.TestCase):
         self.assertNotIn("<offline>", message)
 
     def test_enter_replay_reuses_request_id_and_registry_dispatch(self):
+        from rofi_agent_plus.usage import UsageStore, now_ms
+
         context, _transport, actions = self._context()
+        context.usage = UsageStore(self.root / "state")
         row = next(
             row
             for row in build_rows(self.snapshot)
             if row.kind == "target" and row.target_id == self.target_id
         )
-        data = _state_json(PickerState(selected_key=row.key, request_id="b" * 32))
+        data = _state_json(
+            PickerState(selected_key=row.key, request_id="b" * 32, requested_at=now_ms())
+        )
         env = {"ROFI_RETV": "1", "ROFI_DATA": data, "ROFI_INFO": json.dumps(row.info)}
         output = io.StringIO()
         import contextlib
@@ -1063,6 +1068,40 @@ class PickerCallbackTests(unittest.TestCase):
                 self.assertEqual(0, run_rofi(env, context=context))
         self.assertEqual(actions.dispatches, 1)
         self.assertEqual([item[1] for item in actions.additional], ["b" * 32])
+        self.assertEqual(1, context.usage.statistics()[self.target_id].count)
+
+    def test_rejected_action_and_passive_callbacks_do_not_count_usage(self):
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from rofi_agent_plus.actions import ActionError
+        from rofi_agent_plus.usage import UsageStore, now_ms
+
+        context, _transport, actions = self._context()
+        context.usage = UsageStore(self.root / "state")
+        row = next(row for row in build_rows(self.snapshot) if row.target_id == self.target_id)
+        state = _state_json(
+            PickerState(selected_key=row.key, request_id="b" * 32, requested_at=now_ms())
+        )
+        for retv in ("0", "16", "17", "28"):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    0, run_rofi({"ROFI_RETV": retv, "ROFI_DATA": state}, context=context)
+                )
+        with (
+            patch.object(
+                actions, "open_target", side_effect=ActionError("test_failure", "refused")
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                0,
+                run_rofi(
+                    {"ROFI_RETV": "1", "ROFI_DATA": state, "ROFI_INFO": json.dumps(row.info)},
+                    context=context,
+                ),
+            )
+        self.assertFalse(context.usage.path.exists())
 
     def test_tab_cycles_additional_and_refreshes_action_token(self):
         context, transport, _actions = self._context()

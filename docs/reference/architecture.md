@@ -51,6 +51,15 @@ Titles and reusable Window 1/2/3 ordinals are presentation, never action
 authority. Manually launched TUIs lack the owned registration and are not
 adopted by scanning titles or command lines.
 
+Picker usage is keyed by the durable environment target, independently of
+launch specifications, window titles and daemon generations. Environments
+rank by uses in `(now - 168 hours, now]`; equal counts retain the fixed target
+order. When every listed target has zero weekly uses, retained last-use times
+supply a recency fallback. Windows retain their numbered order inside each
+environment. The launcher captures private ranking metrics alongside its
+first frame and reuses them through all callbacks in that dialog. Selection
+restoration remains a separate hint.
+
 ## Passive discovery
 
 The headless helper discovers the owning account's `~/.codex` and `~/.claude`
@@ -158,6 +167,7 @@ validation still use current process/window identity.
 | --- | --- |
 | Catalog and finite startup ticket/lock | `$XDG_CACHE_HOME/rofi-agent-plus/direct-v1/` |
 | Last successful target/instance hint | `$XDG_STATE_HOME/rofi-agent-plus/direct-v1/view.json` |
+| Rolling picker uses and retained last-use times | `$XDG_STATE_HOME/rofi-agent-plus/direct-v1/usage.json` |
 | Desktop registrations and replay tombstones | `$XDG_RUNTIME_DIR/rofi-agent-plus/direct-v1/<desktop-generation>/` |
 | Per-instance Kitty socket | `$XDG_RUNTIME_DIR/rofi-agent-plus-sockets/<instance-id>.sock` |
 
@@ -165,6 +175,16 @@ Configuration is optional schema 1 `direct.toml`; the retired `config.toml`
 and conversation caches are not inputs. Files and directories are private,
 versioned and validated. The catalog is display/performance state, never launch
 authority. Tombstones preserve replay identity after an instance exits.
+
+Usage history is private schema 1, with an 8 MiB read/write limit, at most
+32,768 environment records and 65,536 retained action receipts. Writes take a
+bounded one-second file lock and replace atomically; reads never rewrite the
+file. Each accepted picker action records its existing request token once.
+Tokens carry their issuance time and cannot add usage after 168 hours, so an
+expired receipt cannot turn a delayed replay into a fresh event. Bookkeeping
+failure preserves existing history and does not block native actions. Future
+events do not contribute to a current ranking. Last-use timestamps survive
+weekly-event pruning for the inactivity fallback.
 
 | Work or record | Bound |
 | --- | --- |

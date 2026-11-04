@@ -79,7 +79,7 @@ artifact instead of the checkout. Output directories must be new.
 
 | Driver | Scope |
 | --- | --- |
-| `direct-rofi-input-proof drive OUTPUT cached` or `cold` | Private Xvfb, inert rows, idle-arrow navigation, automatic cold arrival and zero automatic callbacks after usable rows |
+| `direct-rofi-input-proof drive OUTPUT cached`, `cold` or `weekly` | Private Xvfb, inert rows, idle-arrow navigation, automatic cold arrival, frozen weekly ranking despite concurrent usage, and zero automatic callbacks after usable rows |
 | `direct-rofi-proof OUTPUT` | Real Rofi first-frame selection, Tab action changes and filter retention; takes desktop focus |
 | `direct-window-proof run OUTPUT` | Owned Niri/Kitty windows, real TTY, private layout validation, exact focus and independent client lifetime |
 | `check-native-entry ...` | One selected host/provider/home through the installed helper, with owned synthetic native sessions |
@@ -93,6 +93,7 @@ rows and waits for Rofi's idle callback without a key driving arrival.
 ```sh
 "$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$RUN/cached" cached
 "$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$RUN/cold" cold
+"$PREFIX/bin/python" -I -B scripts/direct-rofi-input-proof drive "$RUN/weekly" weekly
 ```
 
 The other GUI/native-entry proofs can change physical desktop focus. Run them

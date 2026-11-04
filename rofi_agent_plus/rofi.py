@@ -28,6 +28,7 @@ from .model import (
 from .registry import Instance, Registry, RegistryError, target_storage_key
 from .startup_refresh import POLL_SECONDS, RefreshStatus, read_status, wait_for_refresh
 from .transport import Transport, TransportError
+from .usage import Usage, UsageStore, frozen_statistics, now_ms
 from .view_preferences import ViewPreference, ViewPreferenceStore
 from .window_titles import freeze_titles
 
@@ -124,6 +125,7 @@ class PickerState:
     restore_selection: bool = False
     prefix_revision: str | None = None
     position_revision: str | None = None
+    requested_at: int = 0
 
 
 @dataclass
@@ -138,6 +140,7 @@ class PickerContext:
     desktop_error: str | None
     registry: Registry | None
     actions: Actions | None
+    usage: UsageStore | None = None
 
 
 def build_context(
@@ -203,6 +206,7 @@ def build_context(
         desktop_error,
         registry,
         actions,
+        UsageStore(preferences.root),
     )
 
 
@@ -455,6 +459,36 @@ def build_rows(
     return tuple(rows)
 
 
+def order_rows(rows: tuple[PickerRow, ...], usage: Mapping[str, Usage]) -> tuple[PickerRow, ...]:
+    """Rank environments globally, retaining numbered windows and diagnostics."""
+
+    selectable = [row for row in rows if row.selectable and row.target_id is not None]
+    weekly = any(usage.get(row.target_id, Usage()).count for row in selectable)
+    # Stable sorting retains the existing host/provider/home tie-break and
+    # numbered windows within each target. Diagnostics retain their slots.
+    ranked = iter(
+        sorted(
+            selectable,
+            key=lambda row: (
+                -(
+                    usage.get(row.target_id, Usage()).count
+                    if weekly
+                    else usage.get(row.target_id, Usage()).last_used
+                )
+            ),
+        )
+    )
+    return tuple(
+        next(ranked) if row.selectable and row.target_id is not None else row for row in rows
+    )
+
+
+def _ordered_rows(context: PickerContext, *args, **kwargs) -> tuple[PickerRow, ...]:
+    rows = build_rows(*args, **kwargs)
+    store = getattr(context, "usage", None)
+    return order_rows(rows, frozen_statistics(store, context.env)) if store is not None else rows
+
+
 def _parse_info(raw: object) -> dict[str, str] | None:
     if not isinstance(raw, str) or len(raw) > 1024:
         return None
@@ -515,6 +549,7 @@ def _state_json(state: PickerState) -> str:
         "restoreSelection": state.restore_selection,
         "prefixRevision": state.prefix_revision,
         "positionRevision": state.position_revision,
+        "requestedAt": state.requested_at,
     }
     encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_DATA_BYTES:
@@ -541,7 +576,7 @@ def _parse_state(raw: object) -> PickerState:
         or not expected <= set(value)
         or set(value)
         - expected
-        - {"rowRevision", "restoreSelection", "prefixRevision", "positionRevision"}
+        - {"rowRevision", "restoreSelection", "prefixRevision", "positionRevision", "requestedAt"}
         or type(value.get("schemaVersion")) is not int
         or value["schemaVersion"] != 1
     ):
@@ -566,7 +601,12 @@ def _parse_state(raw: object) -> PickerState:
     position = value.get("positionRevision")
     if not isinstance(position, str) or not _HEX_64.fullmatch(position):
         position = None
-    return PickerState(key, action, request_id, notice, revision, restore, prefix, position)
+    requested_at = value.get("requestedAt", 0)
+    if type(requested_at) is not int or not 0 <= requested_at <= 2**63 - 1:
+        requested_at = 0
+    return PickerState(
+        key, action, request_id, notice, revision, restore, prefix, position, requested_at
+    )
 
 
 def _local_view(context: PickerContext) -> tuple[tuple[Window, ...], str | None]:
@@ -744,7 +784,7 @@ def _request_for(state: PickerState) -> PickerState:
     # deliberate additional action gets a new token when Tab cycles the mode.
     if _HEX_32.fullmatch(state.request_id):
         return state
-    return replace(state, request_id=uuid.uuid4().hex)
+    return replace(state, request_id=uuid.uuid4().hex, requested_at=now_ms())
 
 
 def _handle_selection(
@@ -821,7 +861,7 @@ def run_rofi(
     polling = refresh is not None and refresh.pending
 
     if retv == 0:
-        state = PickerState(request_id=uuid.uuid4().hex)
+        state = PickerState(request_id=uuid.uuid4().hex, requested_at=now_ms())
         saved = context.preferences.load()
         snapshot, cache_error = _load_snapshot(context)
         notice = cache_error or ""
@@ -832,7 +872,8 @@ def run_rofi(
         ):
             notice = notice or "Showing saved inventory; use Alt+R to refresh"
         windows, window_error = _local_view(context)
-        rows = build_rows(
+        rows = _ordered_rows(
+            context,
             snapshot,
             registry=context.registry,
             desktop=context.desktop,
@@ -885,7 +926,9 @@ def run_rofi(
         )
     elif retv in {ROFI_RETV_CUSTOM_7, ROFI_RETV_CUSTOM_8}:
         action = ACTION_ADDITIONAL if state.action == ACTION_OPEN else ACTION_OPEN
-        state = replace(state, action=action, request_id=uuid.uuid4().hex, notice="")
+        state = replace(
+            state, action=action, request_id=uuid.uuid4().hex, requested_at=now_ms(), notice=""
+        )
     elif retv == ROFI_RETV_CUSTOM_19:
         # Only read published cache/status; polling never starts another probe.
         state = replace(state, notice=refresh.message if refresh is not None else "")
@@ -897,7 +940,8 @@ def run_rofi(
             )
         else:
             windows, window_error = _local_view(context)
-            rows = build_rows(
+            rows = _ordered_rows(
+                context,
                 snapshot,
                 registry=context.registry,
                 desktop=context.desktop,
@@ -917,6 +961,9 @@ def run_rofi(
             else:
                 did_action, state = _handle_selection(context, row, state)
                 if did_action:
+                    usage = getattr(context, "usage", None)
+                    if usage is not None and row.target_id is not None and state.requested_at:
+                        usage.record(row.target_id, state.request_id, state.requested_at)
                     result = _current_row(rows, state.selected_key)
                     record = None
                     if row.target_id is not None and context.registry is not None:
@@ -935,7 +982,8 @@ def run_rofi(
         state = replace(state, notice="Unsupported picker callback; use Open, Tab, or Alt+R")
 
     windows, window_error = _local_view(context)
-    rows = build_rows(
+    rows = _ordered_rows(
+        context,
         snapshot,
         registry=context.registry,
         desktop=context.desktop,

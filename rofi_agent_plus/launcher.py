@@ -17,6 +17,7 @@ from .cache import CacheError
 from .process import passive_probe_signals
 from .rofi import build_context, run_rofi
 from .startup_refresh import STATUS_ENV, StartupRefresh
+from .usage import SNAPSHOT_ENV, SNAPSHOT_NAME
 from .window_titles import TITLES_ENV, TITLES_NAME
 
 INITIAL_FRAME_ENV = "ROFI_AGENT_PLUS_INITIAL_FRAME"
@@ -136,6 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             directory = Path(temporary)
             frame_path = directory / "initial-frame"
             environment[TITLES_ENV] = str(directory / TITLES_NAME)
+            environment[SNAPSHOT_ENV] = str(directory / SNAPSHOT_NAME)
             context = build_context(environment)
             try:
                 snapshot = context.cache.load()

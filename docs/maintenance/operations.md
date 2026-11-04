@@ -7,6 +7,12 @@ Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
 Snap, Starship and Carbon select this build. Carbon discovers its native default
 without extra profile declarations; retired artifacts remain available for rollback.
 
+The source candidate `0.15.0a19` adds per-desktop seven-day frequency ordering
+with an all-zero recency fallback. Its new usage file starts empty and leaves
+existing selection hints intact. The managed immutable selection below remains
+the qualified a18 artifact until a new candidate is separately published and
+selected; editing source does not update installed pickers.
+
 The [0.15.0a18 release](https://github.com/byebyebryan/rofi-agent-plus/releases/tag/v0.15.0a18)
 adds viewer motion preferences while preserving the a17 native-home fix.
 Qualification covers 168 source tests, isolated installed-wheel byte/entrypoint
@@ -23,11 +29,12 @@ an existing background session retains that session's original motion setting.
 The probes submitted no model turns and preserved ordinary settings and daemon
 generations. Other native input/appearance acceptance remains separate.
 
-Carbon is offline during this delivery. Its next `chezmoi update` runs the public
-artifact staging hook, offline installer and selected links/configuration in
-order. Snap and Starship have no outbound Host Mesh route to Carbon, so their
-helper/configuration handover can proceed independently. Existing windows keep
-their launch-time policy; use New window to adopt a changed viewer preference.
+Carbon completed deployment on 2026-11-04, bringing all three hosts onto the
+selected a18 artifact. Carbon's installed-byte/entrypoint checks and passive
+local/SSH inventory passed; its captured native process and previous prefix
+were preserved. Snap and Starship have no outbound Host Mesh route to Carbon.
+Existing windows keep their launch-time policy; use New window to adopt a
+changed viewer preference.
 
 The wheel is staged on each selected host under
 `~/.local/share/rofi-agent-plus/artifacts/<wheel-sha256>/`. The managed
