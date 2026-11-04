@@ -7,13 +7,27 @@ Chezmoi owns installation, the four command links, `direct.toml` and Mod+A.
 Snap, Starship and Carbon select this build. Carbon discovers its native default
 without extra profile declarations; retired artifacts remain available for rollback.
 
-The [0.15.0a17 release](https://github.com/byebyebryan/rofi-agent-plus/releases/tag/v0.15.0a17)
-fixes Claude's native default-home configuration selection. Qualification covers
-160 source tests, isolated installed-wheel byte/entrypoint checks and 23 host
-tests against the installed package, including default/custom-home entry and
-probe environments. Its installed CLI gate includes both Codex and Claude.
-It supersedes a16's regression when inventory used the implicit process environment.
-Native desktop appearance/input acceptance remains separate.
+The [0.15.0a18 release](https://github.com/byebyebryan/rofi-agent-plus/releases/tag/v0.15.0a18)
+adds viewer motion preferences while preserving the a17 native-home fix.
+Qualification covers 168 source tests, isolated installed-wheel byte/entrypoint
+checks and 123 direct-runtime tests against the installed Python 3.11 package.
+[Hosted CI](https://github.com/byebyebryan/rofi-agent-plus/actions/runs/41787739445)
+passed for runtime source `b39b05b5ee61874aa8f56b662207f75ce5512fd3`.
+
+Snap and Starship select `normal` motion; Carbon selects `reduced`. A new Kitty
+window captures the viewer's setting for both local and SSH entry. Focus and
+request replay preserve its saved mode. Owned Snap probes verified independent
+Codex off/on settings through native manager resume and conversation switching.
+Claude Agent View and newly dispatched sessions receive the setting; attaching
+an existing background session retains that session's original motion setting.
+The probes submitted no model turns and preserved ordinary settings and daemon
+generations. Other native input/appearance acceptance remains separate.
+
+Carbon is offline during this delivery. Its next `chezmoi update` runs the public
+artifact staging hook, offline installer and selected links/configuration in
+order. Snap and Starship have no outbound Host Mesh route to Carbon, so their
+helper/configuration handover can proceed independently. Existing windows keep
+their launch-time policy; use New window to adopt a changed viewer preference.
 
 The wheel is staged on each selected host under
 `~/.local/share/rofi-agent-plus/artifacts/<wheel-sha256>/`. The managed
